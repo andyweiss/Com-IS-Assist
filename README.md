@@ -1,14 +1,16 @@
 # Com-IS-Assist
 
-A realtime broadcast automixer that ducks an International Sound "Bed" (2-6 channels) against a Dialogue "Com" (mono commentary) channel, based on a measured COM/IS loudness ratio. The concept follows Jonas Engel's bachelor thesis at Hochschule Darmstadt, and the reference implementation it grew out of is included under `Specs/Ressouces/Com-IS Plugin/` (a Reaper JSFX loudness meter, LGPL-licensed, Copyright Cockos Incorporated / Jonas Engel).
+[![Build Linux](https://github.com/andyweiss/Com-IS-Assist/actions/workflows/build-linux.yml/badge.svg)](https://github.com/andyweiss/Com-IS-Assist/actions/workflows/build-linux.yml)
+
+A realtime broadcast mix assist/ automixer that ducks an International Sound "Bed" (2-6 channels) against a Dialogue "Com" (mono commentary) channel, based on a measured COM/IS loudness ratio. The concept follows Jonas Engel's bachelor thesis at Hochschule Darmstadt, and the reference implementation it grew out of is included under `Specs/Ressouces/Com-IS Plugin/` (a Reaper JSFX loudness meter, LGPL-licensed, Copyright Cockos Incorporated / Jonas Engel).
 
 Ships as two thin wrappers around one shared Rust DSP core:
-- A **GStreamer element** (`comisassist`) — the primary broadcast/OB-van deployment target.
-- A **VST3 plugin** (`Com-IS-Assist`) — for DAW-based testing and validation against the original JSFX meter in Reaper.
+- A **GStreamer element** (`comisassist`) — the primary broadcast deployment target. Bed is 2-6ch, dynamically negotiated via caps.
+- A **VST3 plugin** (`Com-IS-Assist`) — for DAW-based testing and validation against the original JSFX meter in Reaper. Fixed 8-channel bus (6ch Bed + mono Dialogue + 1 unused), with a mix/duck-only toggle and a minimal live gain-reduction meter GUI.
 
 ## How it works
 
-Each ~100ms tick, the plugin measures the short-term BS.1770 loudness of both the Bed and the Dialogue signal, computes their ratio, and — if the ratio drifts outside a configurable tolerance band — smoothly reduces Bed gain (fast attack, hold, slow recovery) until the target ratio is restored. The Bed loudness meter observes the *already-gained* signal (a closed control loop), matching how the ratio behaves on-air. Dialogue is never gained — only measured and, optionally, mixed back in.
+Each ~100ms tick, the plugin measures the short-term BS.1770 loudness of both the Bed and the Dialogue signal, computes their ratio, and — if the ratio drifts outside a configurable tolerance band — smoothly reduces Bed gain (fast attack, hold, slow recovery) until the target ratio is restored. The Bed loudness meter observes the *already-gained* signal (a closed control loop), matching how the ratio behaves on-air. Dialogue is never gained — only measured and, optionally, mixed back into the Bed's Left/Center/Right channels via a "voice divergence" equal-power pan law (Center-only at 0% up to split-L/R at 100%), shared by both wrappers.
 
 ## Repository layout
 

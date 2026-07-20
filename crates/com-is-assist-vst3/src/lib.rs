@@ -17,9 +17,12 @@
 // inserting directly on a Bed/IS channel strip where the console sums in commentary separately
 // downstream). Channel 6 always carries the dry Dialogue passthrough regardless of this toggle.
 
+use atomic_float::AtomicF32;
 use com_is_assist_core::automix::{mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, GainComputerConfig};
 use nih_plug::prelude::*;
+use nih_plug_egui::{create_egui_editor, egui, resizable_window::ResizableWindow, EguiState};
 use std::num::NonZeroU32;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 const BED_CHANNELS: u32 = 6;
@@ -40,6 +43,12 @@ struct ComISAssist {
     /// `None` until `initialize()` supplies the host's sample rate - `AutomixProcessor` needs it
     /// at construction time (for the `ebur128` meters), which isn't known any earlier than that.
     processor: Option<AutomixProcessor>,
+    /// Live gain-reduction meter, shared between the audio thread (`process()`, writer) and the
+    /// GUI thread (`editor()`, reader). This is the one thing `nih-plug` genuinely requires a
+    /// custom GUI for - its parameter setter is deliberately private, so a plugin can't push a
+    /// live value into a host-visible parameter (see the `editor()` doc comment). A second step
+    /// will add a loudness-ratio meter alongside this the same way.
+    gain_reduction_db: Arc<AtomicF32>,
 }
 
 #[derive(Params)]
@@ -66,13 +75,10 @@ struct ComISAssistParams {
     #[id = "divergence"]
     pub divergence: FloatParam,
 
-    // Live gain-reduction/ratio meters are NOT exposed as parameters here - nih-plug's parameter
-    // setter trait (`ParamMut`) is deliberately `pub(crate)`, so a plugin cannot programmatically
-    // update its own parameter's displayed value from `process()`; live meters are only supported
-    // via a custom GUI reading shared atomic state directly, which conflicts with this project's
-    // "no custom GUI, parameters only" decision (see Specs/TechnicalConcept.md section 11's
-    // non-goal). Flagged to the user rather than silently faked - see the conversation this was
-    // discovered in for the open question on how to proceed.
+    /// Persisted together with the rest of the plugin's state so the GUI reopens at the same
+    /// size. Not a live-meter value itself - see `ComISAssist::gain_reduction_db` for that.
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for ComISAssist {
@@ -80,6 +86,7 @@ impl Default for ComISAssist {
         Self {
             params: Arc::new(ComISAssistParams::default()),
             processor: None,
+            gain_reduction_db: Arc::new(AtomicF32::new(0.0)),
         }
     }
 }
@@ -138,6 +145,7 @@ impl Default for ComISAssistParams {
             mix_dialogue: BoolParam::new("Mix Dialogue", true),
             divergence: FloatParam::new("Voice Divergence", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
+            editor_state: EguiState::from_size(260, 150),
         }
     }
 }
@@ -164,7 +172,7 @@ impl ComISAssistParams {
 impl Plugin for ComISAssist {
     const NAME: &'static str = "Com-IS-Assist";
     const VENDOR: &'static str = "Com-IS-Assist";
-    const URL: &'static str = "https://github.com/com-is-assist/com-is-assist";
+    const URL: &'static str = "https://github.com/andyweiss/Com-IS-Assist";
     const EMAIL: &'static str = "info@example.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
@@ -187,6 +195,34 @@ impl Plugin for ComISAssist {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    /// A minimal custom GUI, needed only because `nih-plug` has no way to push a live value into
+    /// a host-visible parameter from `process()` (see `gain_reduction_db`'s doc comment) - this is
+    /// the one thing that requires a real GUI rather than parameters alone. First step: gain
+    /// reduction only. A loudness-ratio meter can be added the same way in a second step.
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let gain_reduction_db = self.gain_reduction_db.clone();
+        let egui_state = self.params.editor_state.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, _setter, _state| {
+                ResizableWindow::new("com-is-assist-editor-window")
+                    .min_size(egui::Vec2::new(200.0, 100.0))
+                    .show(egui_ctx, egui_state.as_ref(), |ui| {
+                        ui.heading("Com-IS-Assist");
+
+                        let gain_reduction_db = gain_reduction_db.load(Ordering::Relaxed);
+                        ui.label(format!("Gain reduction: {gain_reduction_db:.1} dB"));
+                        // Reduction is always >= 0 (see AutomixProcessor); normalize against
+                        // max_gain_reduction_db's default range for the bar's full-scale point.
+                        let normalized = (gain_reduction_db / 24.0).clamp(0.0, 1.0);
+                        ui.add(egui::widgets::ProgressBar::new(normalized));
+                    });
+            },
+        )
     }
 
     fn initialize(
@@ -246,6 +282,12 @@ impl Plugin for ComISAssist {
         let _ = processor.feed_dialogue(&dialogue);
         processor.maybe_run_control_step(automix_enabled);
 
+        // Only bother publishing to the meter while the GUI is actually open - matches nih-plug's
+        // own guidance for keeping this off the hot path otherwise.
+        if self.params.editor_state.is_open() {
+            self.gain_reduction_db.store(processor.applied_gain_reduction_db() as f32, Ordering::Relaxed);
+        }
+
         if mix_dialogue {
             mix_dialogue_into_bed(
                 &mut interleaved_bed,
@@ -253,7 +295,7 @@ impl Plugin for ComISAssist {
                 BED_CHANNELS,
                 LEFT_CHANNEL,
                 RIGHT_CHANNEL,
-                CENTER_CHANNEL,
+                Some(CENTER_CHANNEL),
                 divergence,
             );
         }

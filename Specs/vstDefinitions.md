@@ -43,7 +43,14 @@ Channel 6 (Dialogue passthrough) is unaffected by this toggle either way.
 
 **Not exposed here, unlike the GStreamer element**: `max-tolerance`/`min-tolerance` (fixed at `AutomixEngineConfig::default()`'s values, not user-adjustable in this wrapper - a deliberate simplification of the VST3 parameter surface). VAD-related parameters (`UI.md`'s "voice detector comm/IS") are M3 scope, not yet implemented in either wrapper.
 
-**Known gap, not yet resolved**: live gain-reduction/ratio meters are *not* exposed as parameters. `nih-plug`'s parameter setter (`ParamMut`) is deliberately `pub(crate)` - a plugin cannot programmatically update its own parameter's displayed value from `process()`. Live meters are only supported via a custom GUI reading shared atomic state directly, which conflicts with this project's "no custom GUI, parameters only" decision (§11's non-goal). Open question for whoever picks this up next: add a minimal custom GUI just for meters, or accept no live meter display in the VST3 wrapper.
+## Meter display (minimal custom GUI)
+
+Resolved: `nih-plug`'s parameter setter (`ParamMut`) is deliberately `pub(crate)` - a plugin cannot programmatically update its own parameter's displayed value from `process()`, so live meters can only be shown via a custom GUI reading shared atomic state directly. This is a deliberate, scoped exception to the "no custom GUI, parameters only" non-goal (§11 of `TechnicalConcept.md`) - the GUI exists *only* to display live meters, not to duplicate parameter controls (those stay host-native).
+
+Implemented via `nih_plug_egui` (`create_egui_editor`), matching `nih-plug`'s own gain-with-GUI example pattern: an `Arc<AtomicF32>` field on the plugin struct is written from `process()` (only while the editor is actually open, to keep the audio thread's hot path clear the rest of the time) and read from the `editor()` closure each GUI frame.
+
+- **Step 1 (done)**: gain reduction, shown as a dB label + a progress bar normalized against a 24dB reference range.
+- **Step 2 (planned)**: add a second `Arc<AtomicF32>` for the COM/IS loudness ratio (`AutomixProcessor::applied_ratio_lu()`, already available) the same way, alongside the gain-reduction bar.
 
 ## Building
 

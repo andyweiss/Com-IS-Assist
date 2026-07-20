@@ -10,3 +10,5 @@ crate-type = ["cdylib"]
 [dependencies]
 com-is-assist-core = { path = "../com-is-assist-core" }
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+atomic_float = "1"

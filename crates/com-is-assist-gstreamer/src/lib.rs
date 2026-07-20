@@ -28,5 +28,5 @@ gst::plugin_define!(
     "GPL",
     "comisassist",
     "comisassist",
-    "https://github.com/com-is-assist/com-is-assist"
+    "https://github.com/andyweiss/Com-IS-Assist"
 );

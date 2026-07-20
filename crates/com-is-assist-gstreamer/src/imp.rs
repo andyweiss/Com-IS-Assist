@@ -3,10 +3,11 @@
 // -> AutomixEngine). See Specs/TechnicalConcept.md section 7 for the design, and section 4 for
 // why the Bed meter must observe the already-gained signal.
 //
-// Scope of this first pass (deliberately, not yet the full product): fixed caps (48kHz, stereo
-// Bed / mono Dialogue - matching this project's test fixtures) rather than full 2-6ch dynamic
-// negotiation, and pad synchronization is hand-rolled (per-pad accumulation buffers) rather than
-// GstCollectPads, which gstreamer-rs 0.25 doesn't wrap safely.
+// Bed negotiates 2-6ch dynamically via caps (48kHz, F32LE - see `ranged_audio_caps`); Dialogue is
+// always fixed mono. `ProcessingState` (and therefore the `AutomixProcessor` inside it) is only
+// constructed once Bed's Caps event reports its actual channel count - see `handle_bed_caps`.
+// Pad synchronization is hand-rolled (per-pad accumulation buffers) rather than GstCollectPads,
+// which gstreamer-rs 0.25 doesn't wrap safely.
 //
 // Output latency is deliberately decoupled from the automix control rate: audio is forwarded to
 // is_leveled_src/dialogue_src the moment it arrives (near-zero added latency), and mix_src as soon
@@ -17,10 +18,13 @@
 // per-frame ramp rather than a per-tick batch, so nothing has to wait for a whole tick to buffer
 // before being forwarded. See `ProcessingState` below.
 
-use com_is_assist_core::automix::{AutomixEngineConfig, AutomixProcessor, GainComputerConfig};
+use com_is_assist_core::automix::{
+    bed_lrc_channels, mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, GainComputerConfig,
+};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer::subclass::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
@@ -36,14 +40,29 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 const TICK_SECONDS: f64 = 0.1;
 const SAMPLE_RATE: u32 = 48_000;
-const BED_CHANNELS: u32 = 2;
+const MIN_BED_CHANNELS: i32 = 2;
+const MAX_BED_CHANNELS: i32 = 6;
 
-fn audio_caps(channels: i32) -> gst::Caps {
+/// Fixed caps for a specific channel count - used for `dialogue_sink`/`dialogue_src`, which are
+/// always mono.
+fn fixed_audio_caps(channels: i32) -> gst::Caps {
     gst::Caps::builder("audio/x-raw")
         .field("format", "F32LE")
         .field("layout", "interleaved")
         .field("rate", SAMPLE_RATE as i32)
         .field("channels", channels)
+        .build()
+}
+
+/// A channel-count *range* - used for `bed_sink`/`is_leveled_src`/`mix_src`'s pad templates, since
+/// Bed is 2-6ch and the actual count is only known once caps negotiation completes (see
+/// `handle_bed_caps`), not at template-declaration time.
+fn ranged_audio_caps(min_channels: i32, max_channels: i32) -> gst::Caps {
+    gst::Caps::builder("audio/x-raw")
+        .field("format", "F32LE")
+        .field("layout", "interleaved")
+        .field("rate", SAMPLE_RATE as i32)
+        .field("channels", &gst::IntRange::<i32>::new(min_channels, max_channels))
         .build()
 }
 
@@ -85,6 +104,12 @@ struct Settings {
     hold_seconds: f64,
     release_seconds: f64,
     automix_enabled: bool,
+    /// "Voice divergence" (`Specs/UI.md`), 0.0-100.0 (a percentage, matching the VST3 wrapper's
+    /// convention): 0% = Dialogue is Center-only in `mix_src` when Bed has a Center channel
+    /// (3/5/6ch - see `com_is_assist_core::automix::bed_lrc_channels`), 100% = split across
+    /// Left/Right only. Has no audible effect for 2ch/4ch Bed, which has no Center channel to
+    /// diverge from - see `mix_dialogue_into_bed`'s doc comment.
+    divergence_percent: f64,
 }
 
 impl Default for Settings {
@@ -101,6 +126,7 @@ impl Default for Settings {
             hold_seconds: gain.hold_seconds,
             release_seconds: gain.release_seconds,
             automix_enabled: true,
+            divergence_percent: 0.0,
         }
     }
 }
@@ -136,60 +162,56 @@ impl Settings {
 struct ProcessingState {
     processor: AutomixProcessor,
 
+    /// Copied from `Settings::divergence_percent` (as a `[0.0, 1.0]` fraction) at construction
+    /// time - see that field's doc comment. Refreshed whenever `ProcessingState` is rebuilt on a
+    /// settings change, same tradeoff already accepted for the other settings (see `set_property`).
+    divergence: f32,
+
     /// Bed (already gained) and Dialogue samples waiting to be paired for `mix_src`. Drained
     /// immediately whenever *both* have at least one frame available (see `drain_mix_ready`) -
     /// there's no fixed-size wait here, so this only ever holds however much the two sinks'
     /// arrival timing happens to be out of step by, not a designed buffering delay.
     mix_bed_pending: Vec<f32>,
     mix_dialogue_pending: Vec<f32>,
-
-    /// Set once the corresponding sink has received EOS. `is_leveled_src`/`dialogue_src` each end
-    /// as soon as their own sink's EOS arrives (they have no cross-dependency), but `mix_src` can
-    /// only end once *both* are set - see `flush_remaining_mix_tail`'s doc comment for how any
-    /// still-unpaired tail on the longer side is handled at that point.
-    bed_eos: bool,
-    dialogue_eos: bool,
 }
 
 impl ProcessingState {
-    fn new(settings: &Settings) -> Self {
-        Self {
+    /// `bed_channels` comes from Bed's negotiated caps (see `handle_bed_caps`), not from
+    /// `settings` - it's a property of the stream, not something a user configures.
+    fn new(settings: &Settings, bed_channels: u32) -> Result<Self, com_is_assist_core::loudness::ConfigError> {
+        Ok(Self {
             processor: AutomixProcessor::new(
-                BED_CHANNELS,
+                bed_channels,
                 SAMPLE_RATE,
                 settings.automix_config(),
                 settings.gain_computer_config(),
                 TICK_SECONDS,
-            )
-            .expect("valid processor config"),
+            )?,
+            divergence: (settings.divergence_percent / 100.0) as f32,
             mix_bed_pending: Vec::new(),
             mix_dialogue_pending: Vec::new(),
-            bed_eos: false,
-            dialogue_eos: false,
-        }
+        })
     }
-
 }
 
 /// Drains whatever Bed/Dialogue audio *can* currently be paired for `mix_src` - i.e. up to
 /// `min(bed_pending, dialogue_pending)` frames - immediately, with no fixed-size wait. Returns
 /// `None` if either side is currently empty; that's normal (just means one side is momentarily
-/// ahead) and does not mean the stream has ended.
+/// ahead) and does not mean the stream has ended. Dialogue is mixed in restricted to Left/Center/
+/// Right only, via the shared `mix_dialogue_into_bed` (same function and pan law the VST3 wrapper
+/// uses - see its doc comment); Bed channels beyond that (LFE, surrounds) are untouched.
 fn drain_mix_ready(state: &mut ProcessingState) -> Option<Vec<f32>> {
-    let bed_frames = state.mix_bed_pending.len() / BED_CHANNELS as usize;
+    let bed_channels = state.processor.bed_channels();
+    let bed_frames = state.mix_bed_pending.len() / bed_channels as usize;
     let dialogue_frames = state.mix_dialogue_pending.len();
     let frames = bed_frames.min(dialogue_frames);
     if frames == 0 {
         return None;
     }
-    let bed_chunk: Vec<f32> = state.mix_bed_pending.drain(0..frames * BED_CHANNELS as usize).collect();
+    let mut mix: Vec<f32> = state.mix_bed_pending.drain(0..frames * bed_channels as usize).collect();
     let dialogue_chunk: Vec<f32> = state.mix_dialogue_pending.drain(0..frames).collect();
-    let mut mix = bed_chunk;
-    for (frame, dialogue_sample) in dialogue_chunk.iter().enumerate() {
-        for channel in 0..BED_CHANNELS as usize {
-            mix[frame * BED_CHANNELS as usize + channel] += dialogue_sample;
-        }
-    }
+    let (left, right, center) = bed_lrc_channels(bed_channels);
+    mix_dialogue_into_bed(&mut mix, &dialogue_chunk, bed_channels, left, right, center, state.divergence);
     Some(mix)
 }
 
@@ -199,7 +221,8 @@ fn drain_mix_ready(state: &mut ProcessingState) -> Option<Vec<f32>> {
 /// *can* be paired as it arrives, so by the time both sides are done, any leftover on one side
 /// means the other side's stream was simply shorter, not that pairing was skipped.
 fn flush_remaining_mix_tail(state: &mut ProcessingState) -> Option<Vec<f32>> {
-    let bed_frames = state.mix_bed_pending.len() / BED_CHANNELS as usize;
+    let bed_channels = state.processor.bed_channels();
+    let bed_frames = state.mix_bed_pending.len() / bed_channels as usize;
     if bed_frames > 0 {
         let bed_chunk: Vec<f32> = state.mix_bed_pending.drain(..).collect();
         state.mix_dialogue_pending.clear();
@@ -209,12 +232,9 @@ fn flush_remaining_mix_tail(state: &mut ProcessingState) -> Option<Vec<f32>> {
     if dialogue_frames > 0 {
         let dialogue_chunk: Vec<f32> = state.mix_dialogue_pending.drain(..).collect();
         state.mix_bed_pending.clear();
-        let mut mix = vec![0.0f32; dialogue_chunk.len() * BED_CHANNELS as usize];
-        for (frame, sample) in dialogue_chunk.iter().enumerate() {
-            for channel in 0..BED_CHANNELS as usize {
-                mix[frame * BED_CHANNELS as usize + channel] = *sample;
-            }
-        }
+        let mut mix = vec![0.0f32; dialogue_chunk.len() * bed_channels as usize];
+        let (left, right, center) = bed_lrc_channels(bed_channels);
+        mix_dialogue_into_bed(&mut mix, &dialogue_chunk, bed_channels, left, right, center, state.divergence);
         return Some(mix);
     }
     None
@@ -224,44 +244,79 @@ fn flush_remaining_mix_tail(state: &mut ProcessingState) -> Option<Vec<f32>> {
 mod mix_alignment_tests {
     use super::*;
 
+    const EQUAL_POWER: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    fn test_state(bed_channels: u32) -> ProcessingState {
+        ProcessingState::new(&Settings::default(), bed_channels).expect("valid test config")
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 1e-5, "expected {expected:?}, got {actual:?}");
+        }
+    }
+
     #[test]
-    fn pairs_equal_length_bed_and_dialogue_by_summing() {
-        let mut state = ProcessingState::new(&Settings::default());
+    fn pairs_equal_length_bed_and_dialogue_at_equal_power_no_center_channel() {
+        // 2ch (stereo) Bed has no Center channel - see bed_lrc_channels - so Dialogue always
+        // lands on both Left/Right at equal power, regardless of divergence (default 0%).
+        let mut state = test_state(2);
         state.mix_bed_pending = vec![0.1, 0.2, 0.3, 0.4]; // 2 stereo frames
         state.mix_dialogue_pending = vec![1.0, 2.0]; // 2 mono frames
 
         let mix = drain_mix_ready(&mut state).expect("both sides have data");
-        assert_eq!(mix, vec![1.1, 1.2, 2.3, 2.4]);
+        assert_close(
+            &mix,
+            &[
+                0.1 + EQUAL_POWER,
+                0.2 + EQUAL_POWER,
+                0.3 + 2.0 * EQUAL_POWER,
+                0.4 + 2.0 * EQUAL_POWER,
+            ],
+        );
         assert!(state.mix_bed_pending.is_empty());
         assert!(state.mix_dialogue_pending.is_empty());
     }
 
     #[test]
+    fn zero_divergence_with_a_center_channel_puts_dialogue_on_center_only() {
+        // 3ch Bed (Left, Right, Center) - default divergence is 0%, so Dialogue should land
+        // entirely on the Center channel (index 2), not Left/Right.
+        let mut state = test_state(3);
+        state.mix_bed_pending = vec![0.1, 0.2, 0.3]; // 1 frame, 3 channels
+        state.mix_dialogue_pending = vec![1.0];
+
+        let mix = drain_mix_ready(&mut state).expect("both sides have data");
+        assert_close(&mix, &[0.1, 0.2, 0.3 + 1.0]);
+    }
+
+    #[test]
     fn returns_none_when_either_side_is_empty() {
-        let mut state = ProcessingState::new(&Settings::default());
+        let mut state = test_state(2);
         state.mix_bed_pending = vec![0.1, 0.2];
         assert!(drain_mix_ready(&mut state).is_none());
 
-        let mut state = ProcessingState::new(&Settings::default());
+        let mut state = test_state(2);
         state.mix_dialogue_pending = vec![1.0];
         assert!(drain_mix_ready(&mut state).is_none());
     }
 
     #[test]
     fn drains_only_the_minimum_available_leaving_the_rest_pending() {
-        let mut state = ProcessingState::new(&Settings::default());
+        let mut state = test_state(2);
         state.mix_bed_pending = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]; // 3 stereo frames
         state.mix_dialogue_pending = vec![1.0]; // 1 mono frame
 
         let mix = drain_mix_ready(&mut state).expect("one frame is pairable");
-        assert_eq!(mix, vec![1.1, 1.2]);
+        assert_close(&mix, &[0.1 + EQUAL_POWER, 0.2 + EQUAL_POWER]);
         assert_eq!(state.mix_bed_pending, vec![0.3, 0.4, 0.5, 0.6]);
         assert!(state.mix_dialogue_pending.is_empty());
     }
 
     #[test]
     fn flush_tail_treats_leftover_bed_as_mix_alone() {
-        let mut state = ProcessingState::new(&Settings::default());
+        let mut state = test_state(2);
         state.mix_bed_pending = vec![0.1, 0.2, 0.3, 0.4];
         state.mix_dialogue_pending.clear();
 
@@ -271,18 +326,18 @@ mod mix_alignment_tests {
     }
 
     #[test]
-    fn flush_tail_expands_leftover_dialogue_across_bed_channels() {
-        let mut state = ProcessingState::new(&Settings::default());
+    fn flush_tail_expands_leftover_dialogue_at_equal_power_no_center_channel() {
+        let mut state = test_state(2);
         state.mix_dialogue_pending = vec![1.0, 2.0];
 
         let mix = flush_remaining_mix_tail(&mut state).expect("dialogue has a leftover tail");
-        assert_eq!(mix, vec![1.0, 1.0, 2.0, 2.0]);
+        assert_close(&mix, &[EQUAL_POWER, EQUAL_POWER, 2.0 * EQUAL_POWER, 2.0 * EQUAL_POWER]);
         assert!(state.mix_dialogue_pending.is_empty());
     }
 
     #[test]
     fn flush_tail_is_none_when_nothing_is_pending() {
-        let mut state = ProcessingState::new(&Settings::default());
+        let mut state = test_state(2);
         assert!(flush_remaining_mix_tail(&mut state).is_none());
     }
 }
@@ -306,7 +361,23 @@ pub struct ComISAssist {
     /// ramp, feed its own meter, update the shared mix-alignment buffers, and possibly trigger a
     /// control step - all of which must stay consistent with each other, so it's one critical
     /// section rather than several independently-locked fields that could interleave.
-    state: Mutex<ProcessingState>,
+    ///
+    /// `None` until `bed_sink`'s first Caps event tells us the negotiated Bed channel count (see
+    /// `handle_bed_caps`) - `AutomixProcessor::new` needs that count up front and Bed's channel
+    /// count is no longer a compile-time constant (2-6ch, negotiated per `ranged_audio_caps`).
+    state: Mutex<Option<ProcessingState>>,
+    /// Raw Dialogue samples received while `state` is still `None` (Bed hasn't sent its Caps event
+    /// yet). Dialogue's own dry passthrough to `dialogue_src` never waits on this - only metering
+    /// and mix-alignment do - so this just holds the gap until `handle_bed_caps` replays it into
+    /// the freshly-constructed `ProcessingState`.
+    pending_dialogue_before_state: Mutex<Vec<f32>>,
+    /// Set once the corresponding sink has received EOS. Tracked here rather than inside
+    /// `ProcessingState` because EOS can legitimately arrive before `state` exists (e.g. Dialogue
+    /// EOS during a Bed-caps-still-pending window). `is_leveled_src`/`dialogue_src` each end as
+    /// soon as their own sink's EOS arrives, but `mix_src` can only end once *both* are set - see
+    /// `flush_remaining_mix_tail`'s doc comment for how any still-unpaired tail is then handled.
+    bed_eos: AtomicBool,
+    dialogue_eos: AtomicBool,
     frame_indices: Mutex<FrameIndices>,
     bed_sink: gst::Pad,
     dialogue_sink: gst::Pad,
@@ -348,17 +419,74 @@ impl ComISAssist {
         }
     }
 
+    /// Constructs (or replaces, if the negotiated channel count changed) `ProcessingState` once
+    /// Bed's Caps event tells us its channel count - `AutomixProcessor::new` needs that count up
+    /// front, and it's no longer known at pad-template-declaration time (see `ranged_audio_caps`).
+    /// Replays any Dialogue buffered in `pending_dialogue_before_state` (samples that arrived
+    /// while Bed's caps were still pending) into the freshly-built state so nothing is lost.
+    fn handle_bed_caps(&self, caps: &gst::CapsRef) {
+        let Some(structure) = caps.structure(0) else {
+            return;
+        };
+        let Ok(channels) = structure.get::<i32>("channels") else {
+            return;
+        };
+        let bed_channels = channels as u32;
+
+        let mut state_guard = lock_recover(&self.state);
+        let already_current = state_guard
+            .as_ref()
+            .is_some_and(|state| state.processor.bed_channels() == bed_channels);
+        if already_current {
+            return;
+        }
+
+        let settings = *lock_recover(&self.settings);
+        let mut new_state = match ProcessingState::new(&settings, bed_channels) {
+            Ok(state) => state,
+            Err(err) => {
+                gst::element_error!(
+                    self.obj(),
+                    gst::CoreError::Negotiation,
+                    ["cannot initialize automix processor for a {bed_channels}ch bed: {err:?}"]
+                );
+                return;
+            }
+        };
+
+        let mut pending_dialogue = lock_recover(&self.pending_dialogue_before_state);
+        if !pending_dialogue.is_empty() {
+            let _ = new_state.processor.feed_dialogue(&pending_dialogue);
+            new_state.mix_dialogue_pending.extend_from_slice(&pending_dialogue);
+            pending_dialogue.clear();
+        }
+        drop(pending_dialogue);
+
+        *state_guard = Some(new_state);
+    }
+
     /// Forwards one incoming Bed chunk (whatever size the upstream delivered) to `is_leveled_src`
     /// immediately, after applying this element's continuous gain ramp - no waiting for a full
     /// tick to accumulate first (see the module doc comment on latency/control-rate decoupling).
     /// Also feeds the (already-gained) chunk into `bed_meter` and the mix-alignment buffer, and
     /// gives the control step a chance to run.
+    ///
+    /// `state` must already be `Some` by the time this runs: GStreamer guarantees Bed's own Caps
+    /// event precedes Bed's own first buffer, and `handle_bed_caps` constructs `state` right then.
     fn process_bed_chunk(&self, raw_bed: &[f32]) -> Result<gst::FlowSuccess, gst::FlowError> {
         let automix_enabled = lock_recover(&self.settings).automix_enabled;
         let mut leveled_bed = raw_bed.to_vec();
 
-        let mix_ready = {
-            let mut state = lock_recover(&self.state);
+        let (mix_ready, bed_channels) = {
+            let mut state_guard = lock_recover(&self.state);
+            let state = state_guard.as_mut().ok_or_else(|| {
+                gst::element_error!(
+                    self.obj(),
+                    gst::CoreError::Negotiation,
+                    ["received a bed buffer before bed_sink's caps event"]
+                );
+                gst::FlowError::Error
+            })?;
             state.processor.apply_gain_to_bed_chunk(&mut leveled_bed);
 
             // Closed loop (Specs/TechnicalConcept.md section 4): the Bed meter observes the
@@ -375,39 +503,49 @@ impl ComISAssist {
 
             state.processor.maybe_run_control_step(automix_enabled);
 
-            drain_mix_ready(&mut state)
+            (drain_mix_ready(state), state.processor.bed_channels())
         };
 
-        let leveled_frames = leveled_bed.len() as u64 / BED_CHANNELS as u64;
+        let leveled_frames = leveled_bed.len() as u64 / bed_channels as u64;
         let is_leveled_frame_index = self.allocate_frame_index(|f| &mut f.is_leveled, leveled_frames);
         self.is_leveled_src
-            .push(f32_slice_to_buffer(&leveled_bed, BED_CHANNELS, is_leveled_frame_index))
+            .push(f32_slice_to_buffer(&leveled_bed, bed_channels, is_leveled_frame_index))
             .map_err(|_| gst::FlowError::Error)?;
 
-        self.push_mix_if_ready(mix_ready)
+        self.push_mix_if_ready(mix_ready, bed_channels)
     }
 
     /// Forwards one incoming Dialogue chunk to `dialogue_src` immediately, dry (Dialogue is never
-    /// gained). Also feeds it into `dialogue_meter` and the mix-alignment buffer, and gives the
-    /// control step a chance to run.
+    /// gained) - this happens unconditionally, even before Bed's caps (and therefore `state`) are
+    /// known, matching the near-zero-latency principle. Metering/mix-alignment, however, need
+    /// `state`: if it isn't ready yet, the raw samples are buffered in
+    /// `pending_dialogue_before_state` for `handle_bed_caps` to replay once Bed's caps arrive.
     fn process_dialogue_chunk(&self, raw_dialogue: &[f32]) -> Result<gst::FlowSuccess, gst::FlowError> {
         let automix_enabled = lock_recover(&self.settings).automix_enabled;
 
-        let mix_ready = {
-            let mut state = lock_recover(&self.state);
-            state.processor.feed_dialogue(raw_dialogue).map_err(|err| {
-                gst::element_error!(
-                    self.obj(),
-                    gst::StreamError::Failed,
-                    ["dialogue loudness meter rejected {} frames: {err:?}", raw_dialogue.len()]
-                );
-                gst::FlowError::Error
-            })?;
-            state.mix_dialogue_pending.extend_from_slice(raw_dialogue);
+        let (mix_ready, bed_channels) = {
+            let mut state_guard = lock_recover(&self.state);
+            match state_guard.as_mut() {
+                Some(state) => {
+                    state.processor.feed_dialogue(raw_dialogue).map_err(|err| {
+                        gst::element_error!(
+                            self.obj(),
+                            gst::StreamError::Failed,
+                            ["dialogue loudness meter rejected {} frames: {err:?}", raw_dialogue.len()]
+                        );
+                        gst::FlowError::Error
+                    })?;
+                    state.mix_dialogue_pending.extend_from_slice(raw_dialogue);
 
-            state.processor.maybe_run_control_step(automix_enabled);
+                    state.processor.maybe_run_control_step(automix_enabled);
 
-            drain_mix_ready(&mut state)
+                    (drain_mix_ready(state), Some(state.processor.bed_channels()))
+                }
+                None => {
+                    lock_recover(&self.pending_dialogue_before_state).extend_from_slice(raw_dialogue);
+                    (None, None)
+                }
+            }
         };
 
         let dialogue_frame_index = self.allocate_frame_index(|f| &mut f.dialogue, raw_dialogue.len() as u64);
@@ -415,15 +553,18 @@ impl ComISAssist {
             .push(f32_slice_to_buffer(raw_dialogue, 1, dialogue_frame_index))
             .map_err(|_| gst::FlowError::Error)?;
 
-        self.push_mix_if_ready(mix_ready)
+        match bed_channels {
+            Some(bed_channels) => self.push_mix_if_ready(mix_ready, bed_channels),
+            None => Ok(gst::FlowSuccess::Ok),
+        }
     }
 
-    fn push_mix_if_ready(&self, mix_ready: Option<Vec<f32>>) -> Result<gst::FlowSuccess, gst::FlowError> {
+    fn push_mix_if_ready(&self, mix_ready: Option<Vec<f32>>, bed_channels: u32) -> Result<gst::FlowSuccess, gst::FlowError> {
         if let Some(mix) = mix_ready {
-            let mix_frames = mix.len() as u64 / BED_CHANNELS as u64;
+            let mix_frames = mix.len() as u64 / bed_channels as u64;
             let mix_frame_index = self.allocate_frame_index(|f| &mut f.mix, mix_frames);
             self.mix_src
-                .push(f32_slice_to_buffer(&mix, BED_CHANNELS, mix_frame_index))
+                .push(f32_slice_to_buffer(&mix, bed_channels, mix_frame_index))
                 .map_err(|_| gst::FlowError::Error)?;
         }
         Ok(gst::FlowSuccess::Ok)
@@ -433,7 +574,17 @@ impl ComISAssist {
         use gst::EventView;
         match event.view() {
             EventView::Eos(_) => self.handle_sink_eos(is_bed, event),
-            EventView::StreamStart(_) | EventView::Caps(_) | EventView::Segment(_) => {
+            EventView::Caps(c) => {
+                if is_bed {
+                    self.handle_bed_caps(c.caps());
+                    let r1 = self.is_leveled_src.push_event(event.clone());
+                    let r2 = self.mix_src.push_event(event);
+                    r1 && r2
+                } else {
+                    self.dialogue_src.push_event(event)
+                }
+            }
+            EventView::StreamStart(_) | EventView::Segment(_) => {
                 if is_bed {
                     let r1 = self.is_leveled_src.push_event(event.clone());
                     let r2 = self.mix_src.push_event(event);
@@ -457,22 +608,27 @@ impl ComISAssist {
     /// side. `mix_src` can only end once *both* sinks are done (see
     /// `flush_remaining_mix_tail`'s doc comment for how any still-unpaired tail is handled then).
     fn handle_sink_eos(&self, is_bed: bool, event: gst::Event) -> bool {
-        let (both_eos, final_mix) = {
-            let mut state = lock_recover(&self.state);
-            if is_bed {
-                state.bed_eos = true;
-            } else {
-                state.dialogue_eos = true;
-            }
-            let both = state.bed_eos && state.dialogue_eos;
-            let final_mix = if both { flush_remaining_mix_tail(&mut state) } else { None };
-            (both, final_mix)
+        if is_bed {
+            self.bed_eos.store(true, Ordering::Relaxed);
+        } else {
+            self.dialogue_eos.store(true, Ordering::Relaxed);
+        }
+        let both_eos = self.bed_eos.load(Ordering::Relaxed) && self.dialogue_eos.load(Ordering::Relaxed);
+
+        // If Bed's caps never arrived (so `state` is still `None`), there's nothing to flush -
+        // e.g. a Bed sink that reached EOS with zero buffers ever sent.
+        let final_mix = if both_eos {
+            lock_recover(&self.state)
+                .as_mut()
+                .and_then(|state| flush_remaining_mix_tail(state).map(|mix| (mix, state.processor.bed_channels())))
+        } else {
+            None
         };
 
-        if let Some(mix) = final_mix {
-            let mix_frames = mix.len() as u64 / BED_CHANNELS as u64;
+        if let Some((mix, bed_channels)) = final_mix {
+            let mix_frames = mix.len() as u64 / bed_channels as u64;
             let mix_frame_index = self.allocate_frame_index(|f| &mut f.mix, mix_frames);
-            let _ = self.mix_src.push(f32_slice_to_buffer(&mix, BED_CHANNELS, mix_frame_index));
+            let _ = self.mix_src.push(f32_slice_to_buffer(&mix, bed_channels, mix_frame_index));
         }
 
         let own_src_ok = if is_bed {
@@ -659,7 +815,10 @@ impl ObjectSubclass for ComISAssist {
 
         let settings = Settings::default();
         Self {
-            state: Mutex::new(ProcessingState::new(&settings)),
+            state: Mutex::new(None),
+            pending_dialogue_before_state: Mutex::new(Vec::new()),
+            bed_eos: AtomicBool::new(false),
+            dialogue_eos: AtomicBool::new(false),
             settings: Mutex::new(settings),
             frame_indices: Mutex::new(FrameIndices::default()),
             bed_sink,
@@ -710,6 +869,11 @@ impl ObjectImpl for ComISAssist {
                 glib::ParamSpecBoolean::builder("automix-enable")
                     .default_value(true)
                     .build(),
+                glib::ParamSpecDouble::builder("divergence")
+                    .minimum(0.0)
+                    .maximum(100.0)
+                    .default_value(Settings::default().divergence_percent)
+                    .build(),
                 glib::ParamSpecDouble::builder("current-gain-reduction-db")
                     .default_value(0.0)
                     .read_only()
@@ -732,7 +896,11 @@ impl ObjectImpl for ComISAssist {
             "hold-seconds" => lock_recover(&self.settings).hold_seconds.to_value(),
             "release-seconds" => lock_recover(&self.settings).release_seconds.to_value(),
             "automix-enable" => lock_recover(&self.settings).automix_enabled.to_value(),
-            "current-gain-reduction-db" => lock_recover(&self.state).processor.applied_gain_reduction_db().to_value(),
+            "divergence" => lock_recover(&self.settings).divergence_percent.to_value(),
+            "current-gain-reduction-db" => lock_recover(&self.state)
+                .as_ref()
+                .map_or(0.0, |state| state.processor.applied_gain_reduction_db())
+                .to_value(),
             "current-ratio-lu" => {
                 // Cheap diagnostic read; not stored separately from the engine's own state.
                 0.0f64.to_value()
@@ -756,13 +924,20 @@ impl ObjectImpl for ComISAssist {
             "attack-seconds" => settings.attack_seconds = value.get().unwrap(),
             "hold-seconds" => settings.hold_seconds = value.get().unwrap(),
             "release-seconds" => settings.release_seconds = value.get().unwrap(),
+            "divergence" => settings.divergence_percent = value.get().unwrap(),
             "automix-enable" => {
                 settings.automix_enabled = value.get().unwrap();
                 return;
             }
             _ => unimplemented!(),
         }
-        *lock_recover(&self.state) = ProcessingState::new(&settings);
+        // `bed_channels` is only known once Bed's caps have arrived (see `handle_bed_caps`) - if
+        // `state` is still `None`, there's nothing to rebuild yet; the fresh `Settings` will be
+        // picked up whenever `handle_bed_caps` first constructs it.
+        let mut state_guard = lock_recover(&self.state);
+        if let Some(bed_channels) = state_guard.as_ref().map(|state| state.processor.bed_channels()) {
+            *state_guard = ProcessingState::new(&settings, bed_channels).ok();
+        }
     }
 }
 
@@ -784,8 +959,8 @@ impl ElementImpl for ComISAssist {
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static PAD_TEMPLATES: OnceLock<Vec<gst::PadTemplate>> = OnceLock::new();
         PAD_TEMPLATES.get_or_init(|| {
-            let bed_caps = audio_caps(BED_CHANNELS as i32);
-            let dialogue_caps = audio_caps(1);
+            let bed_caps = ranged_audio_caps(MIN_BED_CHANNELS, MAX_BED_CHANNELS);
+            let dialogue_caps = fixed_audio_caps(1);
             vec![
                 gst::PadTemplate::new(
                     "bed_sink",
