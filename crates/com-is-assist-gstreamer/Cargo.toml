@@ -1,0 +1,30 @@
+[package]
+name = "com-is-assist-gstreamer"
+version = "0.1.0"
+edition = "2021"
+
+# GStreamer's plugin scanner loads a shared library and looks for a `gst_plugin_desc` symbol -
+# cdylib is all that's needed at the Rust level. Built via `cargo cbuild`/`cargo cinstall`
+# (cargo-c), the same tooling the official gst-plugins-rs repo uses, which additionally produces
+# a correctly-versioned .so/.dylib and a .pc file (see Specs/TechnicalConcept.md section 9).
+[lib]
+name = "gstcomisassist"
+crate-type = ["cdylib"]
+
+[dependencies]
+com-is-assist-core = { path = "../com-is-assist-core" }
+gstreamer = "0.25"
+gstreamer-base = "0.25"
+gstreamer-audio = "0.25"
+glib = "0.22"
+
+[features]
+# cargo-c (`cargo cbuild`) expects a "capi" feature to exist even though this crate has no C ABI
+# functions to gate behind it (a GStreamer plugin is loaded via its `gst_plugin_desc` symbol, not
+# a hand-written C header) - an empty feature satisfies cargo-c without changing anything else.
+capi = []
+
+[package.metadata.capi.library]
+# This is a GStreamer plugin, not a general-purpose C library - no public C header is meaningful,
+# only the shared library itself (loaded dynamically by GStreamer's plugin scanner).
+name = "gstcomisassist"

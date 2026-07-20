@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/com-is-assist-core",
+    "crates/com-is-assist-offline",
+    "crates/com-is-assist-gstreamer",
+    "crates/com-is-assist-vst3",
+    "xtask",
+]

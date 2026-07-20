@@ -1,0 +1,7 @@
+[package]
+name = "com-is-assist-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ebur128 = "0.1"

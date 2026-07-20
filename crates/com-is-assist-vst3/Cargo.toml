@@ -1,0 +1,12 @@
+[package]
+name = "com-is-assist-vst3"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "com_is_assist_vst3"
+crate-type = ["cdylib"]
+
+[dependencies]
+com-is-assist-core = { path = "../com-is-assist-core" }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }

@@ -1,0 +1,12 @@
+[package]
+name = "com-is-assist-offline"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "com-is-assist-offline"
+path = "src/main.rs"
+
+[dependencies]
+com-is-assist-core = { path = "../com-is-assist-core" }
+hound = "3"

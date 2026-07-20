@@ -1,0 +1,5 @@
+# Metadata for `cargo xtask bundle <package>` (nih-plug's bundler). See
+# nih_plug_xtask's own bundler.toml for the format this mirrors.
+
+[com-is-assist-vst3]
+name = "Com-IS-Assist"
