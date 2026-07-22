@@ -7,8 +7,9 @@ Parameters (both wrappers unless noted; see `Specs/GSTdefinitions.md`/`Specs/vst
 - **Not yet implemented** (M3 scope): voice detector comm/IS (VAD), Reset loudness.
 
 Display:
-- **Implemented (VST3 only, minimal custom GUI — see `Specs/vstDefinitions.md`'s "Meter display" section)**: current Gain reduction in dB, shown as a progress bar rather than a red bar.
-- **Not yet implemented**: IS/Comm LUFS (momentary + integrated), the COM/IS ratio display itself, and both voice-activity LEDs — planned as the GUI's "second step" (loudness ratio) plus later additions, or as read-only GStreamer properties on that side.
+- **Implemented (VST3 only, custom GUI — see `Specs/vstDefinitions.md`'s "GUI (custom, meters + controls)" section)**: current Gain reduction in dB, shown as a vertical red bar filling top-down; IS LUFS momentary and Comm LUFS momentary, each shown as a vertical bar filling bottom-up (cyan/orange respectively); Ratio in LU.
+- **Deliberately not implemented**: IS/Comm LUFS-I (integrated) — tried, then dropped as an unneeded simplification (momentary is what both the control loop and this display care about; can be revisited if a concrete need comes up).
+- **Not yet implemented**: both voice-activity LEDs (blocked on M3's VAD work).
 
 ## PARAMETERS
 

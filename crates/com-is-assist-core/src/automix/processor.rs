@@ -19,6 +19,13 @@ use crate::ratio::RatioEngine;
 pub struct AutomixProcessor {
     bed_channels: u32,
     bed_meter: Ebur128Meter,
+    /// A second Bed meter, fed the *dry* (pre-gain) signal, purely for display (`Specs/UI.md`'s
+    /// "IS LUFS-M") - kept entirely separate from `bed_meter`, which must keep observing the
+    /// already-gained signal for the closed control loop (`Specs/TechnicalConcept.md` section 4)
+    /// to behave correctly. Showing the automix engine's own already-gained view of Bed would be
+    /// misleading as an "IS loudness" readout, since it'd already reflect this processor's own
+    /// gain reduction rather than the incoming program level.
+    bed_pre_gain_meter: Ebur128Meter,
     dialogue_meter: Ebur128Meter,
     ratio_engine: RatioEngine,
     automix_engine: AutomixEngine,
@@ -58,6 +65,7 @@ impl AutomixProcessor {
         Ok(Self {
             bed_channels,
             bed_meter: Ebur128Meter::new(&Ebur128Meter::bed_channel_map(bed_channels)?, sample_rate)?,
+            bed_pre_gain_meter: Ebur128Meter::new(&Ebur128Meter::bed_channel_map(bed_channels)?, sample_rate)?,
             dialogue_meter: Ebur128Meter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate)?,
             ratio_engine: RatioEngine::default(),
             automix_engine: AutomixEngine::new(automix_config, gain_config, tick_seconds),
@@ -86,8 +94,31 @@ impl AutomixProcessor {
         self.applied_ratio_lu
     }
 
+    /// Bed (IS), *pre-gain*, momentary R128 loudness - the incoming program level, not affected by
+    /// this processor's own gain reduction (see `bed_pre_gain_meter`'s doc comment). For display
+    /// only (`Specs/UI.md`'s "IS LUFS-M"); not used by the automix control loop itself, which
+    /// works from `bed_meter`'s (post-gain) *short-term* loudness (see `maybe_run_control_step`).
+    pub fn bed_momentary_lufs(&self) -> f64 {
+        self.bed_pre_gain_meter.momentary_loudness_db()
+    }
+
+    /// Dialogue (COM) momentary R128 loudness, for display only - see `bed_momentary_lufs`'s doc
+    /// comment (Dialogue is never gained, so there's no pre/post distinction on this side).
+    pub fn dialogue_momentary_lufs(&self) -> f64 {
+        self.dialogue_meter.momentary_loudness_db()
+    }
+
     fn current_ramp_gain(&self) -> f32 {
         ramp_value_at(self.ramp_start_gain, self.ramp_target_gain, self.ramp_position_frames, self.ramp_total_frames)
+    }
+
+    /// Feeds one chunk of *dry* (pre-gain) Bed audio into the display-only pre-gain meter (see
+    /// `bed_pre_gain_meter`'s doc comment) - call this before `apply_gain_to_bed_chunk`, which
+    /// mutates its argument in place, so the dry signal is no longer available afterward. Doesn't
+    /// touch the control-cadence counters - `feed_bed` (the post-gain, control-loop-facing meter)
+    /// is what those track.
+    pub fn feed_bed_pre_gain(&mut self, dry_bed: &[f32]) -> Result<(), Ebur128Error> {
+        self.bed_pre_gain_meter.push_frames(dry_bed)
     }
 
     /// Applies the continuous gain ramp to one chunk of interleaved Bed audio (any size) and
