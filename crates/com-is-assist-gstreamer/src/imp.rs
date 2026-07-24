@@ -910,33 +910,41 @@ impl ObjectImpl for ComISAssist {
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-        // Settings changes only take effect for state rebuilt from them; since M1-era engines
-        // (RatioEngine/AutomixEngine) don't yet support live-reconfiguration, this rebuilds the
-        // whole ProcessingState (losing accumulated loudness history and any in-flight mix
-        // alignment) - acceptable for this first pass, worth revisiting if live property changes
-        // need to preserve state.
-        let mut settings = lock_recover(&self.settings);
-        match pspec.name() {
-            "target-ratio" => settings.target_ratio_lu = value.get().unwrap(),
-            "max-tolerance" => settings.max_tolerance_lu = value.get().unwrap(),
-            "min-tolerance" => settings.min_tolerance_lu = value.get().unwrap(),
-            "max-gain-reduction-db" => settings.max_gain_reduction_db = value.get().unwrap(),
-            "attack-seconds" => settings.attack_seconds = value.get().unwrap(),
-            "hold-seconds" => settings.hold_seconds = value.get().unwrap(),
-            "release-seconds" => settings.release_seconds = value.get().unwrap(),
-            "divergence" => settings.divergence_percent = value.get().unwrap(),
-            "automix-enable" => {
-                settings.automix_enabled = value.get().unwrap();
-                return;
+        // Updates the running `AutomixProcessor` in place via `set_config` (added once
+        // `AutomixEngine`/`GainComputer` gained live-reconfiguration support) rather than
+        // rebuilding `ProcessingState` from scratch - preserves accumulated loudness-meter
+        // history, the in-progress gain ramp, and any pending mix-alignment buffers, none of
+        // which a full rebuild could keep.
+        //
+        // The `settings` lock is scoped to end before `state` is ever locked (never held
+        // together) - this must stay a *sequential* pair of locks, not nested, since
+        // `handle_bed_caps` (running concurrently on `bed_sink`'s streaming thread) locks `state`
+        // first and `settings` second; holding them in the opposite order here would be a classic
+        // lock-order-inversion deadlock risk.
+        let settings_snapshot = {
+            let mut settings = lock_recover(&self.settings);
+            match pspec.name() {
+                "target-ratio" => settings.target_ratio_lu = value.get().unwrap(),
+                "max-tolerance" => settings.max_tolerance_lu = value.get().unwrap(),
+                "min-tolerance" => settings.min_tolerance_lu = value.get().unwrap(),
+                "max-gain-reduction-db" => settings.max_gain_reduction_db = value.get().unwrap(),
+                "attack-seconds" => settings.attack_seconds = value.get().unwrap(),
+                "hold-seconds" => settings.hold_seconds = value.get().unwrap(),
+                "release-seconds" => settings.release_seconds = value.get().unwrap(),
+                "divergence" => settings.divergence_percent = value.get().unwrap(),
+                "automix-enable" => settings.automix_enabled = value.get().unwrap(),
+                _ => unimplemented!(),
             }
-            _ => unimplemented!(),
-        }
-        // `bed_channels` is only known once Bed's caps have arrived (see `handle_bed_caps`) - if
-        // `state` is still `None`, there's nothing to rebuild yet; the fresh `Settings` will be
-        // picked up whenever `handle_bed_caps` first constructs it.
-        let mut state_guard = lock_recover(&self.state);
-        if let Some(bed_channels) = state_guard.as_ref().map(|state| state.processor.bed_channels()) {
-            *state_guard = ProcessingState::new(&settings, bed_channels).ok();
+            *settings
+        };
+
+        // Nothing to update yet if Bed's caps haven't arrived (see `handle_bed_caps`) - the fresh
+        // `Settings` will be picked up whenever it first constructs `ProcessingState`.
+        if let Some(state) = lock_recover(&self.state).as_mut() {
+            state.processor.set_config(settings_snapshot.automix_config(), settings_snapshot.gain_computer_config());
+            // Not part of `AutomixEngineConfig`/`GainComputerConfig` (it's a GStreamer-wrapper-only
+            // concept, not shared core config), so `set_config` above doesn't touch it.
+            state.divergence = (settings_snapshot.divergence_percent / 100.0) as f32;
         }
     }
 }

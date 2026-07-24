@@ -90,6 +90,20 @@ impl AutomixEngine {
         }
     }
 
+    /// Replaces the target/tolerance/ceiling config and the gain computer's attack/hold/release
+    /// config, without resetting `target_reduction_db` or the gain computer's own in-progress
+    /// envelope state - so a live parameter change (a VST3 host's parameter automation, or a
+    /// dragged slider) actually takes effect on the next tick. Without this, a wrapper that only
+    /// reads its parameters once at construction time would keep using whatever values were
+    /// current back then forever after, no matter how the user later adjusts them.
+    /// `target_reduction_db` is re-clamped against the new `max_gain_reduction_db` in case the
+    /// ceiling was just lowered below the currently-applied reduction.
+    pub fn set_config(&mut self, config: AutomixEngineConfig, gain_computer_config: GainComputerConfig) {
+        self.config = config;
+        self.target_reduction_db = self.target_reduction_db.min(config.max_gain_reduction_db);
+        self.gain_computer.set_config(gain_computer_config);
+    }
+
     /// Directly seeds the raw target, bypassing the ratio-driven policy for one tick — used by
     /// the VAD-onset fast trigger and the interview-passthrough override (both M3). The
     /// smoothing envelope still governs how quickly the *applied* gain actually moves toward it.

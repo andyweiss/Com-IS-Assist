@@ -36,6 +36,13 @@ impl EnvelopeDetector {
         self.current = value;
     }
 
+    /// Replaces the attack/release time constants without touching `current` - so a config
+    /// change (e.g. a live parameter update in a host) takes effect on the *next* `process()`
+    /// call without any jump or reset of the envelope's in-progress value.
+    pub fn set_config(&mut self, config: EnvelopeDetectorConfig) {
+        self.config = config;
+    }
+
     /// Advances the envelope by one step toward `target`, returning the new current value.
     pub fn process(&mut self, target: f64) -> f64 {
         let time_constant = if target > self.current {

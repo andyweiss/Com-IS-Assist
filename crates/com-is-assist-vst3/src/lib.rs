@@ -58,7 +58,15 @@ struct ComISAssist {
 /// `AutomixProcessor` snapshot.
 struct Meters {
     gain_reduction_db: AtomicF32,
+    /// The actual control-loop ratio (`AutomixProcessor::applied_ratio_lu`, signed) - used only
+    /// to decide the ratio bar's red/green tolerance color (see `editor()`), not to draw the bar
+    /// itself. See `display_ratio_lu`'s doc comment for why these two are kept separate.
     ratio_lu: AtomicF32,
+    /// The ratio bar's actual drawn value (`AutomixProcessor::display_ratio_lu`) - consistent with
+    /// `bed_momentary_lufs`/`dialogue_momentary_lufs`, unlike `ratio_lu` above, which is computed
+    /// from different meters/time-constants entirely and so wouldn't visually line up with a bar
+    /// drawn between those two.
+    display_ratio_lu: AtomicF32,
     bed_momentary_lufs: AtomicF32,
     dialogue_momentary_lufs: AtomicF32,
 }
@@ -69,6 +77,7 @@ impl Meters {
         Self {
             gain_reduction_db: AtomicF32::new(0.0),
             ratio_lu: AtomicF32::new(0.0),
+            display_ratio_lu: AtomicF32::new(0.0),
             bed_momentary_lufs: AtomicF32::new(silence),
             dialogue_momentary_lufs: AtomicF32::new(silence),
         }
@@ -172,7 +181,7 @@ impl Default for ComISAssistParams {
             mix_dialogue_to_bed: BoolParam::new("Mix Dialogue to Bed", true),
             divergence: FloatParam::new("Voice Divergence", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
-            editor_state: EguiState::from_size(520, 480),
+            editor_state: EguiState::from_size(400, 480),
         }
     }
 }
@@ -209,47 +218,18 @@ fn fixed_width_column(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&
 }
 
 const METER_BAR_HEIGHT: f32 = 160.0;
-const GAIN_REDUCTION_COLUMN_WIDTH: f32 = 100.0;
 const LOUDNESS_COLUMN_WIDTH: f32 = 64.0;
 const RATIO_COLUMN_WIDTH: f32 = 60.0;
 const SCALE_COLUMN_WIDTH: f32 = 38.0;
-
-/// Fixed display range for `gain_reduction_meter`'s bar and scale - matches `max-gain-reduction-db`'s
-/// own hard ceiling (`FloatRange::Linear { max: 48.0, .. }`), rather than the live parameter value
-/// (which defaults to 24.0). Showing a fixed, generous range - rather than one that rescales to
-/// whatever the ceiling parameter is currently set to - keeps headroom visible at all times and
-/// makes the meter's ticks a stable reference, not something that redraws differently every time
-/// the parameter changes.
-const GAIN_REDUCTION_METER_MAX_DB: f32 = 48.0;
-
-/// A vertical gain-reduction meter that fills from the top down (the conventional orientation for
-/// a GR meter, as opposed to a level meter that fills from the bottom up), normalized against the
-/// fixed `GAIN_REDUCTION_METER_MAX_DB` range.
-fn gain_reduction_meter(ui: &mut egui::Ui, gain_reduction_db: f32) {
-    fixed_width_column(ui, GAIN_REDUCTION_COLUMN_WIDTH, |ui| {
-        ui.label("Gain reduction");
-        let (rect, _response) = ui.allocate_exact_size(egui::vec2(32.0, METER_BAR_HEIGHT), egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(25));
-
-        let normalized = (gain_reduction_db / GAIN_REDUCTION_METER_MAX_DB).clamp(0.0, 1.0);
-        let filled = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + rect.height() * normalized));
-        painter.rect_filled(filled, 3.0, egui::Color32::from_rgb(224, 32, 32));
-        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
-
-        ui.label(format!("{gain_reduction_db:.1} dB"));
-    });
-}
 
 const LOUDNESS_METER_MIN_LUFS: f32 = -60.0;
 const LOUDNESS_METER_MAX_LUFS: f32 = 0.0;
 
 /// A vertical momentary-loudness meter that fills from the bottom up (the conventional level-meter
-/// orientation - contrast `gain_reduction_meter`'s top-down fill), normalized against a fixed
-/// -60..0 LUFS display range chosen to comfortably cover typical Bed/Dialogue program levels down
-/// to near-silence. `Ebur128Meter::NEGATIVE_INFINITY_DB` (silence/insufficient data) is shown as
-/// "-inf" rather than a literal "-100.0", matching how the original JSFX reference meter displays
-/// it.
+/// orientation), normalized against a fixed -60..0 LUFS display range chosen to comfortably cover
+/// typical Bed/Dialogue program levels down to near-silence. `Ebur128Meter::NEGATIVE_INFINITY_DB`
+/// (silence/insufficient data) is shown as "-inf" rather than a literal "-100.0", matching how the
+/// original JSFX reference meter displays it.
 fn loudness_meter(ui: &mut egui::Ui, label: &str, lufs: f32, color: egui::Color32) {
     fixed_width_column(ui, LOUDNESS_COLUMN_WIDTH, |ui| {
         ui.label(label);
@@ -272,14 +252,61 @@ fn loudness_meter(ui: &mut egui::Ui, label: &str, lufs: f32, color: egui::Color3
     });
 }
 
+/// The IS (Bed) loudness meter: fills bottom-up to `pre_gain_lufs` like `loudness_meter`, but with
+/// the currently-applied gain reduction drawn as a highlighted (red) segment carved out of the
+/// *top* of that fill, extending down by `gain_reduction_db` - on the same LUFS-equivalent scale,
+/// since 1dB of reduction is exactly 1 LU. The bar therefore splits into "what's actually audible"
+/// (the cyan region, below) and "how much is being cut off the top" (red) of the full incoming
+/// level - replacing an earlier, separate standalone gain-reduction meter, since the whole point
+/// of gain reduction is "how much is being removed from *this* signal," which reads far more
+/// directly as part of the bar it acts on than as a side-by-side meter with its own scale.
+fn bed_loudness_meter(ui: &mut egui::Ui, pre_gain_lufs: f32, gain_reduction_db: f32, color: egui::Color32) {
+    fixed_width_column(ui, LOUDNESS_COLUMN_WIDTH, |ui| {
+        ui.label("IS");
+        let (rect, _response) = ui.allocate_exact_size(egui::vec2(32.0, METER_BAR_HEIGHT), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(25));
+
+        let range = LOUDNESS_METER_MAX_LUFS - LOUDNESS_METER_MIN_LUFS;
+        let total_normalized = ((pre_gain_lufs - LOUDNESS_METER_MIN_LUFS) / range).clamp(0.0, 1.0);
+        // Can't carve out more of the bar than is currently filled - a reduction bigger than the
+        // bar's own fill just means the whole visible bar is "cut" (audible portion is silence).
+        let reduction_normalized = (gain_reduction_db / range).clamp(0.0, total_normalized);
+        let effective_normalized = total_normalized - reduction_normalized;
+
+        let audible_fill_height = rect.height() * effective_normalized;
+        let audible_rect = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - audible_fill_height), rect.max);
+        painter.rect_filled(audible_rect, 3.0, color);
+
+        if reduction_normalized > 0.0 {
+            let reduction_top_y = rect.max.y - rect.height() * total_normalized;
+            let reduction_bottom_y = rect.max.y - rect.height() * effective_normalized;
+            let reduction_rect =
+                egui::Rect::from_min_max(egui::pos2(rect.min.x, reduction_top_y), egui::pos2(rect.max.x, reduction_bottom_y));
+            painter.rect_filled(reduction_rect, 3.0, egui::Color32::from_rgb(224, 32, 32));
+        }
+        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
+
+        if pre_gain_lufs <= Ebur128Meter::NEGATIVE_INFINITY_DB as f32 {
+            ui.label("-inf LUFS");
+        } else {
+            ui.label(format!("{pre_gain_lufs:.1} LUFS"));
+        }
+        ui.label(format!("-{gain_reduction_db:.1} dB"));
+    });
+}
+
 /// The COM/IS ratio, drawn as a bar spanning the gap between the IS momentary-loudness level and
-/// `ratio_lu` above/below it, on the *same* shared LUFS scale as `loudness_meter` (LU is literally
-/// a difference of LUFS values, so this is valid, not just visually convenient) - mirrors how the
+/// `ratio_lu` above it, on the *same* shared LUFS scale as `loudness_meter` (LU is literally a
+/// difference of LUFS values, so this is valid, not just visually convenient) - mirrors how the
 /// original JSFX reference meter draws its RATIO bar as the visible gap between the adjacent IS and
-/// COM bars, rather than as an independent meter with its own arbitrary range. `color` is the
-/// caller's call on whether the current ratio meets the configured target - see the `editor()`
-/// call site, which goes red outside the same tolerance band `AutomixEngine` itself uses to decide
-/// whether to adjust gain.
+/// COM bars, rather than as an independent meter with its own arbitrary range. `ratio_lu` should be
+/// `AutomixProcessor::display_ratio_lu` (already floored at 0, and computed from the same momentary
+/// meters the IS/COM bars show) - passing `applied_ratio_lu` here instead would make the bar's
+/// height inconsistent with what's actually drawn on either side of it (see that method's doc
+/// comment for why). `color` is the caller's call on whether the current ratio meets the
+/// configured target - see the `editor()` call site, which goes red outside the same tolerance
+/// band `AutomixEngine` itself uses to decide whether to adjust gain.
 fn ratio_meter(ui: &mut egui::Ui, is_lufs: f32, ratio_lu: f32, color: egui::Color32) {
     fixed_width_column(ui, RATIO_COLUMN_WIDTH, |ui| {
         ui.label("Ratio");
@@ -313,40 +340,26 @@ fn ratio_meter(ui: &mut egui::Ui, is_lufs: f32, ratio_lu: f32, color: egui::Colo
 fn loudness_scale_column(ui: &mut egui::Ui) {
     fixed_width_column(ui, SCALE_COLUMN_WIDTH, |ui| {
         ui.label(" ");
-        vertical_scale(ui, METER_BAR_HEIGHT, LOUDNESS_METER_MIN_LUFS, LOUDNESS_METER_MAX_LUFS, 10.0, false);
+        vertical_scale(ui, METER_BAR_HEIGHT, LOUDNESS_METER_MIN_LUFS, LOUDNESS_METER_MAX_LUFS, 10.0);
     });
 }
 
-/// Same idea as `loudness_scale_column`, for `gain_reduction_meter`'s fixed 0..48dB range.
-fn gain_reduction_scale_column(ui: &mut egui::Ui) {
-    fixed_width_column(ui, SCALE_COLUMN_WIDTH, |ui| {
-        ui.label(" ");
-        vertical_scale(ui, METER_BAR_HEIGHT, 0.0, GAIN_REDUCTION_METER_MAX_DB, 12.0, true);
-    });
-}
-
-/// A vertical scale (tick marks + numeric labels) for a bar meter spanning `[min, max]` over
-/// `height` pixels. `top_down` selects the fill/tick direction to match the bar it labels:
-/// `false` for `loudness_meter`'s bottom-up convention (`min` at the bottom, `max` at the top -
-/// e.g. -60 LUFS at bottom, 0 LUFS at top), `true` for `gain_reduction_meter`'s top-down
-/// convention (`min` i.e. 0dB at the top, `max` at the bottom). The allocated rect is wide enough
-/// to contain the tick text itself (not just the tick line), so egui's own layout system - which
-/// doesn't know about anything drawn via `Painter` outside the rect it was told about - correctly
-/// accounts for the scale's full visual footprint; otherwise neighboring widgets could crowd or
-/// overlap the numbers. The topmost/bottommost labels are also nudged inward (clamped half a
-/// line-height from the edge) so they stay fully visible rather than clipping.
-fn vertical_scale(ui: &mut egui::Ui, height: f32, min: f32, max: f32, step: f32, top_down: bool) {
+/// A vertical scale (tick marks + numeric labels) for a bottom-up bar meter (`min` at the bottom,
+/// `max` at the top - e.g. -60 LUFS at bottom, 0 LUFS at top) spanning `[min, max]` over `height`
+/// pixels. The allocated rect is wide enough to contain the tick text itself (not just the tick
+/// line), so egui's own layout system - which doesn't know about anything drawn via `Painter`
+/// outside the rect it was told about - correctly accounts for the scale's full visual footprint;
+/// otherwise neighboring widgets could crowd or overlap the numbers. The topmost/bottommost labels
+/// are also nudged inward (clamped half a line-height from the edge) so they stay fully visible
+/// rather than clipping.
+fn vertical_scale(ui: &mut egui::Ui, height: f32, min: f32, max: f32, step: f32) {
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(SCALE_COLUMN_WIDTH, height), egui::Sense::hover());
     let painter = ui.painter();
     let half_line = 5.0;
     let mut value = min;
     while value <= max + 0.001 {
         let normalized = ((value - min) / (max - min)).clamp(0.0, 1.0);
-        let y = if top_down {
-            rect.min.y + rect.height() * normalized
-        } else {
-            rect.max.y - rect.height() * normalized
-        };
+        let y = rect.max.y - rect.height() * normalized;
         let text_y = y.clamp(rect.min.y + half_line, rect.max.y - half_line);
         painter.hline(rect.min.x..=(rect.min.x + 4.0), y, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(140)));
         painter.text(
@@ -416,7 +429,7 @@ impl Plugin for ComISAssist {
             |_, _| {},
             move |egui_ctx, setter, _state| {
                 ResizableWindow::new("com-is-assist-editor-window")
-                    .min_size(egui::Vec2::new(480.0, 420.0))
+                    .min_size(egui::Vec2::new(360.0, 420.0))
                     .show(egui_ctx, egui_state.as_ref(), |ui| {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
@@ -426,18 +439,30 @@ impl Plugin for ComISAssist {
                         ui.add_space(8.0);
 
                         let gain_reduction_db = meters.gain_reduction_db.load(Ordering::Relaxed);
-                        let is_lufs = meters.bed_momentary_lufs.load(Ordering::Relaxed);
+                        let is_lufs = meters.bed_momentary_lufs.load(Ordering::Relaxed); // pre-gain
+                        // What's actually audible from Bed right now - the boundary between the
+                        // cyan and red portions of `bed_loudness_meter`'s bar below. Used to anchor
+                        // the ratio bar so it starts from the same point that bar visually ends at.
+                        let effective_is_lufs = is_lufs - gain_reduction_db;
                         let com_lufs = meters.dialogue_momentary_lufs.load(Ordering::Relaxed);
+                        // The bar's drawn height/label - consistent with `effective_is_lufs`/
+                        // `com_lufs` above (see `AutomixProcessor::display_ratio_lu`'s doc comment).
+                        let display_ratio_lu = meters.display_ratio_lu.load(Ordering::Relaxed);
+                        // The actual control-loop ratio - used only for the tolerance check below,
+                        // not for drawing (see `Meters::ratio_lu`'s doc comment).
                         let ratio_lu = meters.ratio_lu.load(Ordering::Relaxed);
 
                         // Red when the current ratio falls outside the same dead-band
                         // `AutomixEngine::process_tick` itself uses to decide whether Bed's gain
                         // needs adjusting - i.e. "the given COM/IS ratio isn't being met" means
                         // exactly what it means to the DSP, not an independently-invented
-                        // GUI-only threshold. `max-tolerance`/`min-tolerance` aren't exposed as
-                        // VST3 parameters (see `ComISAssistParams`'s doc comments), so this reads
-                        // them from the same `AutomixEngineConfig::default()` the processor itself
-                        // was built with.
+                        // GUI-only threshold. Deliberately checked against `ratio_lu` (the signed,
+                        // real control-loop value), not `display_ratio_lu` (floored at 0) - the
+                        // latter would make the lower bound of the tolerance band unreachable and
+                        // this indicator would almost never go red. `max-tolerance`/`min-tolerance`
+                        // aren't exposed as VST3 parameters (see `ComISAssistParams`'s doc
+                        // comments), so this reads them from the same `AutomixEngineConfig::default()`
+                        // the processor itself was built with.
                         let tolerance = AutomixEngineConfig::default();
                         let target_ratio_lu = params.target_ratio.value();
                         let ratio_in_tolerance = ratio_lu >= target_ratio_lu - tolerance.min_tolerance_lu as f32
@@ -455,15 +480,11 @@ impl Plugin for ComISAssist {
                             // requested.
                             ui.spacing_mut().item_spacing.x = 0.0;
                             ui.add_space(12.0);
-                            gain_reduction_meter(ui, gain_reduction_db);
-                            ui.add_space(2.0);
-                            gain_reduction_scale_column(ui);
-                            ui.add_space(18.0);
-                            loudness_meter(ui, "IS", is_lufs, egui::Color32::from_rgb(0x52, 0xFF, 0xFE));
+                            bed_loudness_meter(ui, is_lufs, gain_reduction_db, egui::Color32::from_rgb(0x52, 0xFF, 0xFE));
                             ui.add_space(2.0);
                             loudness_scale_column(ui);
                             ui.add_space(18.0);
-                            ratio_meter(ui, is_lufs, ratio_lu, ratio_color);
+                            ratio_meter(ui, effective_is_lufs, display_ratio_lu, ratio_color);
                             ui.add_space(18.0);
                             loudness_meter(ui, "COM", com_lufs, egui::Color32::from_rgb(0xEB, 0x9E, 0x34));
                             ui.add_space(2.0);
@@ -548,6 +569,15 @@ impl Plugin for ComISAssist {
             return ProcessStatus::Error("processor not initialized");
         };
 
+        // `initialize()` only reads these parameters once, at plugin load - without refreshing
+        // them here on every block, a live parameter change (e.g. raising `max-gain-reduction-db`
+        // from its 24dB default toward its 48dB ceiling mid-session) would silently have no
+        // effect, since `AutomixEngine`/`GainComputer` would keep using whatever values were
+        // current back at `initialize()` time forever after. Cheap - just a couple of struct
+        // copies - and preserves all accumulated state (loudness meters, the gain ramp, the
+        // in-progress reduction target), unlike rebuilding the processor would.
+        processor.set_config(self.params.automix_config(), self.params.gain_computer_config());
+
         let automix_enabled = !self.params.bypass.value();
         let mix_dialogue_to_bed = self.params.mix_dialogue_to_bed.value();
         let divergence = self.params.divergence.value() / 100.0;
@@ -593,6 +623,7 @@ impl Plugin for ComISAssist {
         if self.params.editor_state.is_open() {
             self.meters.gain_reduction_db.store(processor.applied_gain_reduction_db() as f32, Ordering::Relaxed);
             self.meters.ratio_lu.store(processor.applied_ratio_lu() as f32, Ordering::Relaxed);
+            self.meters.display_ratio_lu.store(processor.display_ratio_lu() as f32, Ordering::Relaxed);
             self.meters.bed_momentary_lufs.store(processor.bed_momentary_lufs() as f32, Ordering::Relaxed);
             self.meters
                 .dialogue_momentary_lufs

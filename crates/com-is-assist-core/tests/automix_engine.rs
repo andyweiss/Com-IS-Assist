@@ -167,6 +167,50 @@ fn gain_reduction_never_exceeds_the_configured_maximum() {
 }
 
 #[test]
+fn set_config_raises_the_ceiling_for_a_wrapper_that_only_reads_params_once_at_construction() {
+    // Regression test: a host raising `max-gain-reduction-db` past its 24dB default (e.g. to
+    // 40dB) mid-session had no effect, because VST3's `initialize()` only ever read the
+    // parameter once, at construction - `AutomixEngine` kept using the config it was built with
+    // forever after. `set_config` is what a wrapper now calls every tick to keep it current.
+    let mut engine = fast_engine();
+    let config = AutomixEngineConfig::default();
+    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
+
+    for _ in 0..500 {
+        engine.process_tick(RatioResult {
+            ratio_lu: com_lo_lim - 1000.0,
+            valid: true,
+            com_currently_silent: false,
+        });
+    }
+    assert!((engine.current_gain_reduction_db() - config.max_gain_reduction_db).abs() < 1e-6);
+
+    let raised_config = AutomixEngineConfig {
+        max_gain_reduction_db: 40.0,
+        ..config
+    };
+    engine.set_config(raised_config, GainComputerConfig {
+        attack_seconds: 0.05,
+        hold_seconds: 0.0,
+        release_seconds: 0.2,
+        max_rate_db_per_s: None,
+    });
+
+    for _ in 0..500 {
+        engine.process_tick(RatioResult {
+            ratio_lu: com_lo_lim - 1000.0,
+            valid: true,
+            com_currently_silent: false,
+        });
+    }
+    assert!(
+        (engine.current_gain_reduction_db() - 40.0).abs() < 1e-6,
+        "expected the raised 40dB ceiling to take effect, got {}dB",
+        engine.current_gain_reduction_db()
+    );
+}
+
+#[test]
 fn seed_target_reduction_db_lets_a_vad_onset_trigger_an_immediate_attack() {
     let mut engine = fast_engine();
     engine.seed_target_reduction_db(6.0);

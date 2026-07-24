@@ -72,6 +72,21 @@ impl GainComputer {
         self.hold_remaining_seconds = 0.0;
     }
 
+    /// Replaces the attack/hold/release/rate-limit config without resetting `previous_output_db`,
+    /// `hold_remaining_seconds`, or the envelope's in-progress value - so a live parameter change
+    /// (e.g. dragging the "Fade down time" slider mid-session) takes effect smoothly on the next
+    /// tick rather than causing a jump or restarting any in-progress attack/hold/release.
+    /// `tick_seconds` isn't part of `GainComputerConfig` - it's the fixed control-tick rate set at
+    /// construction, not something a settings change would ever need to alter.
+    pub fn set_config(&mut self, config: GainComputerConfig) {
+        self.envelope.set_config(EnvelopeDetectorConfig {
+            attack_seconds: config.attack_seconds,
+            release_seconds: config.release_seconds,
+        });
+        self.hold_seconds = config.hold_seconds;
+        self.max_rate_db_per_s = config.max_rate_db_per_s;
+    }
+
     /// Advances one tick toward `target_reduction_db` (dB of gain reduction; 0 = unity),
     /// returning this tick's smoothed reduction. Call once per ~100ms tick, same cadence as
     /// `RatioEngine::update`/`AutomixEngine::process_tick`.

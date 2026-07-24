@@ -35,7 +35,7 @@ pub struct AutomixProcessor {
     /// recent control step decided it should end up, and `ramp_position_frames`/`ramp_total_frames`
     /// track how far through that ramp the most recently processed Bed frame is. Each call to
     /// `apply_gain_to_bed_chunk` (with whatever chunk size the caller has) advances
-    /// `ramp_position_frames` by that chunk's frame count - see `apply_ramped_gain_at`'s doc
+    /// `ramp_position_frames` by tha1t chunk's frame count - see `apply_ramped_gain_at`'s doc
     /// comment for why this reproduces the same smooth ramp a whole-tick batch would.
     ramp_start_gain: f32,
     ramp_target_gain: f32,
@@ -89,9 +89,30 @@ impl AutomixProcessor {
         self.applied_gain_reduction_db
     }
 
-    /// The last computed COM/IS ratio, in LU. `0.0` until the first control step runs.
+    /// The last computed COM/IS ratio, in LU (signed - can be negative, e.g. when COM briefly
+    /// falls quieter than the already-gained Bed). This is the actual control-loop value: what
+    /// `maybe_run_control_step` feeds `AutomixEngine` to decide shortfall/excess. For a
+    /// display-only ratio consistent with `bed_momentary_lufs`/`dialogue_momentary_lufs`, see
+    /// `display_ratio_lu` instead - don't use this one to draw a bar between those two, since it's
+    /// computed from different meters/time-constants entirely (see that method's doc comment).
+    /// `0.0` until the first control step runs.
     pub fn applied_ratio_lu(&self) -> f64 {
         self.applied_ratio_lu
+    }
+
+    /// A display-only COM/IS ratio, matching what's actually audible rather than either the raw
+    /// incoming Bed level or the control loop's own (short-term) internals: `dialogue_meter`'s
+    /// momentary loudness against `bed_effective_momentary_lufs` (pre-gain Bed momentary, minus
+    /// the currently-applied reduction - see that method's doc comment for why this approximates
+    /// "what you actually hear" from Bed right now). Deliberately not `applied_ratio_lu` (the
+    /// short-term, post-gain value that actually drives automix decisions) - that's computed from
+    /// different meters/time-constants entirely, so a GUI drawing a bar between its displayed IS
+    /// and COM bars needs this one to stay visually consistent with both. Floored at `0.0`: a
+    /// negative "distance" isn't a meaningful quantity to show here (COM having brief natural gaps
+    /// below Bed's effective level is normal, not itself alarming) - `applied_ratio_lu` is what
+    /// still carries the signed shortfall/excess information the actual control loop needs.
+    pub fn display_ratio_lu(&self) -> f64 {
+        (self.dialogue_meter.momentary_loudness_db() - self.bed_effective_momentary_lufs()).max(0.0)
     }
 
     /// Bed (IS), *pre-gain*, momentary R128 loudness - the incoming program level, not affected by
@@ -102,10 +123,33 @@ impl AutomixProcessor {
         self.bed_pre_gain_meter.momentary_loudness_db()
     }
 
+    /// An approximation of Bed's *audible* (post-gain) momentary loudness: `bed_momentary_lufs`
+    /// minus `applied_gain_reduction_db`. Not a genuinely separate measurement - `bed_meter` (the
+    /// real post-gain meter, used for control) only tracks *short-term* loudness, not momentary
+    /// (see `maybe_run_control_step`), and adding a third full `Ebur128Meter` just for a display
+    /// value wasn't worth it when gain reduction is applied uniformly across the whole chunk: a
+    /// linear dB shift of the pre-gain momentary reading is exact for a constant gain, and a very
+    /// close approximation given how slowly the gain ramp moves relative to the momentary window.
+    /// For display only, alongside `display_ratio_lu` (which uses this as Bed's side of the gap,
+    /// not the raw pre-gain reading, so the shown ratio reflects what's actually audible).
+    pub fn bed_effective_momentary_lufs(&self) -> f64 {
+        self.bed_pre_gain_meter.momentary_loudness_db() - self.applied_gain_reduction_db
+    }
+
     /// Dialogue (COM) momentary R128 loudness, for display only - see `bed_momentary_lufs`'s doc
     /// comment (Dialogue is never gained, so there's no pre/post distinction on this side).
     pub fn dialogue_momentary_lufs(&self) -> f64 {
         self.dialogue_meter.momentary_loudness_db()
+    }
+
+    /// Refreshes the live-adjustable config (target ratio/tolerances/gain-reduction ceiling,
+    /// attack/hold/release) without resetting any accumulated state - see
+    /// `AutomixEngine::set_config`'s doc comment for why this matters (a wrapper that only reads
+    /// its parameters once at construction time would otherwise never see later changes take
+    /// effect). Safe to call every tick/every `process()` call - it's just a couple of struct
+    /// copies, not a rebuild.
+    pub fn set_config(&mut self, automix_config: AutomixEngineConfig, gain_config: GainComputerConfig) {
+        self.automix_engine.set_config(automix_config, gain_config);
     }
 
     fn current_ramp_gain(&self) -> f32 {
@@ -196,6 +240,20 @@ mod tests {
         .expect("valid processor config")
     }
 
+    /// A real oscillating tone, not a constant value - K-weighting's high-pass corner attenuates
+    /// near-DC content so heavily that a constant-valued buffer (e.g. `vec![0.9; N]`) reads as
+    /// very quiet regardless of its amplitude, which would make loudness-based test assertions
+    /// meaningless.
+    fn sine_tone_mono(frequency_hz: f64, amplitude: f32, sample_rate: u32, frame_count: usize) -> Vec<f32> {
+        (0..frame_count)
+            .map(|i| amplitude * (2.0 * std::f64::consts::PI * frequency_hz * i as f64 / sample_rate as f64).sin() as f32)
+            .collect()
+    }
+
+    fn interleave_stereo(mono: &[f32]) -> Vec<f32> {
+        mono.iter().flat_map(|&s| [s, s]).collect()
+    }
+
     #[test]
     fn starts_at_unity_gain_with_no_reduction() {
         let mut p = processor(2);
@@ -214,5 +272,85 @@ mod tests {
         let gain_before = p.current_ramp_gain();
         p.maybe_run_control_step(true);
         assert_eq!(p.current_ramp_gain(), gain_before, "target shouldn't move before a full tick accumulates");
+    }
+
+    #[test]
+    fn display_ratio_lu_is_floored_at_zero_when_com_is_silent_but_bed_is_loud() {
+        let mut p = processor(2);
+        let loud_bed_mono = sine_tone_mono(400.0, 0.9, 48_000, 48_000); // 1s, well above the momentary window
+        p.feed_bed_pre_gain(&interleave_stereo(&loud_bed_mono)).unwrap();
+        // Real (not just never-fed) silence - matches `Ebur128Meter`'s own silence-sentinel test.
+        p.feed_dialogue(&vec![0.0_f32; 48_000]).unwrap();
+        // Without the floor, this would be a large negative number (dialogue's -inf sentinel
+        // minus bed's real, loud reading) rather than the "no measurable lead" 0.0 it should show.
+        assert_eq!(p.display_ratio_lu(), 0.0);
+    }
+
+    #[test]
+    fn display_ratio_lu_reflects_the_gap_when_dialogue_is_louder_than_bed() {
+        let mut p = processor(2);
+        let quiet_bed_mono = sine_tone_mono(400.0, 0.01, 48_000, 48_000);
+        let loud_dialogue = sine_tone_mono(400.0, 0.9, 48_000, 48_000);
+        p.feed_bed_pre_gain(&interleave_stereo(&quiet_bed_mono)).unwrap();
+        p.feed_dialogue(&loud_dialogue).unwrap();
+        assert!(p.display_ratio_lu() > 0.0, "dialogue louder than bed should give a positive display ratio");
+    }
+
+    #[test]
+    fn bed_effective_momentary_lufs_matches_pre_gain_when_nothing_has_been_reduced_yet() {
+        let mut p = processor(2);
+        let bed_mono = sine_tone_mono(400.0, 0.5, 48_000, 48_000);
+        p.feed_bed_pre_gain(&interleave_stereo(&bed_mono)).unwrap();
+        assert_eq!(p.bed_effective_momentary_lufs(), p.bed_momentary_lufs());
+    }
+
+    #[test]
+    fn bed_effective_momentary_lufs_subtracts_the_currently_applied_reduction() {
+        let mut p = processor(1);
+        // Build up some real reduction via the actual control loop first (see
+        // `set_config_does_not_reset_already_accumulated_gain_reduction` for why these
+        // levels/tick counts).
+        let loud_bed = sine_tone_mono(400.0, 0.9, 48_000, 4_800);
+        let quiet_dialogue = sine_tone_mono(400.0, 0.05, 48_000, 4_800);
+        for _ in 0..80 {
+            p.feed_bed(&loud_bed).unwrap();
+            p.feed_dialogue(&quiet_dialogue).unwrap();
+            p.maybe_run_control_step(true);
+        }
+        let reduction = p.applied_gain_reduction_db();
+        assert!(reduction > 0.0, "expected some reduction to have accumulated by now, got {reduction}dB");
+
+        // Feed the same loud tone into the *pre-gain* meter too (a real wrapper feeds both every
+        // block - see e.g. the VST3 `process()` call site) so `bed_momentary_lufs` has a real
+        // reading to subtract the reduction from.
+        p.feed_bed_pre_gain(&loud_bed).unwrap();
+
+        let expected = p.bed_momentary_lufs() - reduction;
+        assert!(
+            (p.bed_effective_momentary_lufs() - expected).abs() < 1e-9,
+            "expected {expected}, got {}",
+            p.bed_effective_momentary_lufs()
+        );
+    }
+
+    #[test]
+    fn set_config_does_not_reset_already_accumulated_gain_reduction() {
+        let mut p = processor(1);
+        // A loud bed against a quiet-but-present dialogue (above the "currently silent" floor)
+        // should build up some real reduction over a number of ticks (4800 frames = one 100ms
+        // tick at 48kHz; RatioEngine also needs ~20 consecutive non-silent ticks before it
+        // considers the ratio valid, so run comfortably more than that).
+        let loud_bed = sine_tone_mono(400.0, 0.9, 48_000, 4_800);
+        let quiet_dialogue = sine_tone_mono(400.0, 0.05, 48_000, 4_800);
+        for _ in 0..80 {
+            p.feed_bed(&loud_bed).unwrap();
+            p.feed_dialogue(&quiet_dialogue).unwrap();
+            p.maybe_run_control_step(true);
+        }
+        let before = p.applied_gain_reduction_db();
+        assert!(before > 0.0, "expected some reduction to have accumulated by now, got {before}dB");
+
+        p.set_config(AutomixEngineConfig::default(), GainComputerConfig::default());
+        assert_eq!(p.applied_gain_reduction_db(), before, "set_config shouldn't reset already-applied reduction");
     }
 }
