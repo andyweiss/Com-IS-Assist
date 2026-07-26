@@ -61,11 +61,12 @@ impl AutomixEngine {
     /// Call once per ~100ms tick with the latest `RatioEngine::update` result.
     pub fn process_tick(&mut self, ratio: RatioResult) -> AutomixResult {
         // `ratio.valid` is a one-way latch (meter-appropriate: never un-shows a value once
-        // shown) so it doesn't mean "COM has signal right now" — during a long silence after the
+        // shown) so it doesn't mean "COM has signal right now" — during a long gap after the
         // first-ever speech burst, `valid` stays true but `ratio_lu` is a frozen, increasingly
-        // stale number. React to it only when COM isn't currently silent, so a quiet gap between
-        // dialogue bursts holds the current gain instead of chasing a stale ratio.
-        if ratio.valid && !ratio.com_currently_silent {
+        // stale number. React to it only when real voice-activity detection reports speech on
+        // COM right now, so a quiet gap between dialogue bursts holds the current gain instead of
+        // chasing a stale ratio.
+        if ratio.valid && ratio.voice_active {
             let com_hi_lim = self.config.target_ratio_lu + self.config.max_tolerance_lu;
             let com_lo_lim = self.config.target_ratio_lu - self.config.min_tolerance_lu;
 

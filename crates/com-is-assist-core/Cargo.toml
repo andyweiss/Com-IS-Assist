@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 ebur128 = "0.1"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-rustls"] }
+rubato = "0.15"

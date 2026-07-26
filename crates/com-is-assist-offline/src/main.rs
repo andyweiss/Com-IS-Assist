@@ -7,6 +7,7 @@
 use com_is_assist_core::automix::{apply_ramped_gain, AutomixEngine, AutomixEngineConfig, GainComputerConfig};
 use com_is_assist_core::loudness::Ebur128Meter;
 use com_is_assist_core::ratio::RatioEngine;
+use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::env;
 use std::fs;
@@ -108,6 +109,16 @@ fn main() -> ExitCode {
         Ebur128Meter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate).expect("dialogue meter config");
 
     let mut ratio_engine = RatioEngine::default();
+    // Real voice-activity detection on Dialogue - see `com_is_assist_core::voice_activity`'s doc
+    // comment for why this replaced the old LUFS-floor "is COM currently silent?" stand-in. Fails
+    // open (always voice-active) if construction fails, matching both wrappers' fallback.
+    let mut voice_activity = match SileroVad::new(sample_rate, VoiceActivityConfig::default()) {
+        Ok(vad) => Some(vad),
+        Err(e) => {
+            eprintln!("voice-activity detection unavailable, failing open: {e}");
+            None
+        }
+    };
 
     // 100ms tick, matching the JSFX's LOUD_METER_UPDATE and RatioEngine/AutomixEngine's cadence.
     let tick_seconds = 0.1;
@@ -136,7 +147,7 @@ fn main() -> ExitCode {
         (leveled_bed, mix)
     });
 
-    println!("tick,time_s,bed_lufs_m,bed_lufs_s,com_lufs_m,com_lufs_s,ratio_lu,ratio_valid,gain_reduction_db");
+    println!("tick,time_s,bed_lufs_m,bed_lufs_s,com_lufs_m,com_lufs_s,voice_active,ratio_lu,ratio_valid,gain_reduction_db");
 
     // The gain applied to *this* tick's Bed audio ramps from `ramp_start_gain` (the value the
     // previous tick's ramp ended on) to `applied_gain_linear` (whatever AutomixEngine computed at
@@ -189,16 +200,25 @@ fn main() -> ExitCode {
         let bed_s = bed_meter.short_term_loudness_db();
         let com_m = dialogue_meter.momentary_loudness_db();
         let com_s = dialogue_meter.short_term_loudness_db();
-        let ratio = ratio_engine.update(bed_s, com_s);
+
+        let voice_active = match voice_activity.as_mut() {
+            Some(vad) => {
+                vad.feed(&dialogue_block[..frames_read]).expect("feed voice-activity detector");
+                vad.voice_active()
+            }
+            None => true,
+        };
+        let ratio = ratio_engine.update(bed_s, com_s, voice_active);
 
         println!(
-            "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.2}",
+            "{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.2},{},{:.2}",
             tick,
             tick as f64 * tick_seconds,
             bed_m,
             bed_s,
             com_m,
             com_s,
+            if voice_active { 1 } else { 0 },
             ratio.ratio_lu,
             if ratio.valid { 1 } else { 0 },
             applied_gain_reduction_db,

@@ -28,13 +28,17 @@ Independent of the VST3 question, the non-VST3 parts of the stack are predominan
 - `ebur128` — MIT
 - `gstreamer-rs`/`gst-plugins-rs` — dual MIT/Apache-2.0
 - `hound` — Apache-2.0
-- `rubato`, `nnnoiseless` — permissive (verify exact license file before quoting precisely in any distribution notice)
+- `rubato` — MIT (verified directly against its `Cargo.toml`)
+- `ort` (ONNX Runtime bindings, used for `com_is_assist_core::voice_activity::SileroVad`) — dual MIT/Apache-2.0 (verified directly against its `Cargo.toml`). Downloads a prebuilt ONNX Runtime shared library at build time (the `download-binaries` feature) - ONNX Runtime itself is Microsoft's, MIT-licensed.
+- `nnnoiseless` — permissive (verify exact license file before quoting precisely in any distribution notice) - not yet a dependency; planned for the not-yet-built denoise path (`Specs/TechnicalConcept.md` section 6)
 
 If there's ever a reason to split licensing (e.g. distribute the GStreamer element and core library under a permissive license while keeping only the VST3 crate under GPLv3), that's architecturally possible since `com-is-assist-gstreamer`/`com-is-assist-offline` don't depend on anything VST3-related. Not being pursued now — keeping one project-wide GPLv3 license is simpler and was already the plan's default before this migration.
 
 ## Third-party reference material
 
 `Specs/Ressouces/Com-IS Plugin/` contains the original Reaper JSFX loudness meter this project's concept is based on (see `Specs/TechnicalConcept.md` section 2). It carries its own license header directly in the file (`COM_IS_RATIO_Meter_5.1_V7.2.txt`): Copyright (C) 2021 and later Cockos Incorporated, author Cockos+Jonas Engel, licensed under the LGPL (<https://www.gnu.org/licenses/lgpl.html>). It's included here for reference/attribution, not redistributed as part of this project's own licensed code.
+
+`crates/com-is-assist-core/assets/silero_vad.onnx` is Silero VAD's exported ONNX model, vendored directly (via `include_bytes!`, not fetched at build/runtime) from <https://github.com/snakers4/silero-vad> - Copyright (c) 2020-present Silero Team, MIT-licensed (verified directly against that repository's `LICENSE` file). Used as-is, not modified.
 
 ## What to do when actually distributing
 

@@ -25,13 +25,13 @@ fn holds_at_unity_when_ratio_is_within_the_tolerance_band() {
     let mut result = engine.process_tick(RatioResult {
         ratio_lu: config.target_ratio_lu,
         valid: true,
-        com_currently_silent: false,
+        voice_active: true,
     });
     for _ in 0..50 {
         result = engine.process_tick(RatioResult {
             ratio_lu: config.target_ratio_lu,
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
     }
 
@@ -51,7 +51,7 @@ fn increases_reduction_when_ratio_is_below_the_lower_limit() {
         let result = engine.process_tick(RatioResult {
             ratio_lu: very_low_ratio,
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
         assert!(
             result.gain_reduction_db >= last - 1e-9,
@@ -75,7 +75,7 @@ fn releases_back_toward_unity_when_ratio_is_above_the_upper_limit() {
         engine.process_tick(RatioResult {
             ratio_lu: com_lo_lim - 10.0,
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
     }
     let reduced = engine.current_gain_reduction_db();
@@ -86,7 +86,7 @@ fn releases_back_toward_unity_when_ratio_is_above_the_upper_limit() {
         engine.process_tick(RatioResult {
             ratio_lu: com_hi_lim + 10.0,
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
     }
     assert!(
@@ -106,7 +106,7 @@ fn invalid_ratio_holds_the_last_gain() {
         engine.process_tick(RatioResult {
             ratio_lu: com_lo_lim - 10.0,
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
     }
     let converged = engine.current_gain_reduction_db();
@@ -115,18 +115,18 @@ fn invalid_ratio_holds_the_last_gain() {
         let result = engine.process_tick(RatioResult {
             ratio_lu: -100.0, // would otherwise look like an even bigger shortfall
             valid: false,
-            com_currently_silent: true,
+            voice_active: false,
         });
         assert_eq!(result.gain_reduction_db, converged);
     }
 }
 
 #[test]
-fn currently_silent_holds_the_last_gain_even_when_valid_latch_is_still_true() {
+fn voice_inactive_holds_the_last_gain_even_when_valid_latch_is_still_true() {
     // Regression test for the bug found while listening-testing M2: `valid` is a one-way latch
-    // (never reverts once true), so during a long silence after the first-ever speech burst it
-    // stays true while `ratio_lu` is a frozen, increasingly stale number. AutomixEngine must not
-    // react to it - it should hold, the same as the `!valid` case.
+    // (never reverts once true), so during a long gap after the first-ever speech burst it stays
+    // true while `ratio_lu` is a frozen, increasingly stale number. AutomixEngine must not react
+    // to it - it should hold, the same as the `!valid` case.
     let mut engine = fast_engine();
     let config = AutomixEngineConfig::default();
     let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
@@ -135,7 +135,7 @@ fn currently_silent_holds_the_last_gain_even_when_valid_latch_is_still_true() {
         engine.process_tick(RatioResult {
             ratio_lu: com_lo_lim - 10.0,
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
     }
     let converged = engine.current_gain_reduction_db();
@@ -143,8 +143,8 @@ fn currently_silent_holds_the_last_gain_even_when_valid_latch_is_still_true() {
     for _ in 0..50 {
         let result = engine.process_tick(RatioResult {
             ratio_lu: com_lo_lim - 1000.0, // a stale, wildly-out-of-range held value
-            valid: true,                  // latch is still true...
-            com_currently_silent: true,   // ...but COM has no signal right now
+            valid: true,                   // latch is still true...
+            voice_active: false,           // ...but no voice is detected right now
         });
         assert_eq!(result.gain_reduction_db, converged);
     }
@@ -160,7 +160,7 @@ fn gain_reduction_never_exceeds_the_configured_maximum() {
         let result = engine.process_tick(RatioResult {
             ratio_lu: com_lo_lim - 1000.0, // absurdly large, persistent shortfall
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
         assert!(result.gain_reduction_db <= config.max_gain_reduction_db + 1e-9);
     }
@@ -180,7 +180,7 @@ fn set_config_raises_the_ceiling_for_a_wrapper_that_only_reads_params_once_at_co
         engine.process_tick(RatioResult {
             ratio_lu: com_lo_lim - 1000.0,
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
     }
     assert!((engine.current_gain_reduction_db() - config.max_gain_reduction_db).abs() < 1e-6);
@@ -200,7 +200,7 @@ fn set_config_raises_the_ceiling_for_a_wrapper_that_only_reads_params_once_at_co
         engine.process_tick(RatioResult {
             ratio_lu: com_lo_lim - 1000.0,
             valid: true,
-            com_currently_silent: false,
+            voice_active: true,
         });
     }
     assert!(
@@ -220,7 +220,7 @@ fn seed_target_reduction_db_lets_a_vad_onset_trigger_an_immediate_attack() {
         engine.process_tick(RatioResult {
             ratio_lu: 0.0,
             valid: false,
-            com_currently_silent: true,
+            voice_active: false,
         });
     }
 

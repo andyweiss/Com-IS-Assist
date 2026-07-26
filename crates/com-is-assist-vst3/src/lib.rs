@@ -21,11 +21,12 @@
 use atomic_float::AtomicF32;
 use com_is_assist_core::automix::{mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, GainComputerConfig};
 use com_is_assist_core::loudness::Ebur128Meter;
+use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use nih_plug::prelude::*;
 use nih_plug_egui::widgets::ParamSlider;
 use nih_plug_egui::{create_egui_editor, egui, resizable_window::ResizableWindow, EguiState};
 use std::num::NonZeroU32;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const BED_CHANNELS: u32 = 6;
@@ -46,6 +47,14 @@ struct ComISAssist {
     /// `None` until `initialize()` supplies the host's sample rate - `AutomixProcessor` needs it
     /// at construction time (for the `ebur128` meters), which isn't known any earlier than that.
     processor: Option<AutomixProcessor>,
+    /// Real voice-activity detection on the Dialogue (COM) sidechain - see
+    /// `com_is_assist_core::voice_activity`'s doc comment for why this replaced the old LUFS-floor
+    /// "is COM currently silent?" stand-in. `None` for the same reason `processor` is: it also
+    /// needs the host's sample rate, only known once `initialize()` runs - and, separately, if
+    /// construction ever fails (e.g. the ONNX Runtime binary couldn't be obtained), so `process()`
+    /// can fail open (treat COM as always voice-active, matching the old pre-VAD behavior) rather
+    /// than silently never ducking at all.
+    voice_activity: Option<SileroVad>,
     /// Live R128/gain-reduction readouts, shared between the audio thread (`process()`, writer)
     /// and the GUI thread (`editor()`, reader). This is the one thing `nih-plug` genuinely
     /// requires a custom GUI for - its parameter setter is deliberately private, so a plugin
@@ -69,6 +78,9 @@ struct Meters {
     display_ratio_lu: AtomicF32,
     bed_momentary_lufs: AtomicF32,
     dialogue_momentary_lufs: AtomicF32,
+    /// Real voice-activity-detection state, for the GUI's "Voice activity Comm" indicator
+    /// (`Specs/UI.md`'s originally-planned LED, blocked until real VAD existed).
+    voice_active: AtomicBool,
 }
 
 impl Meters {
@@ -80,6 +92,7 @@ impl Meters {
             display_ratio_lu: AtomicF32::new(0.0),
             bed_momentary_lufs: AtomicF32::new(silence),
             dialogue_momentary_lufs: AtomicF32::new(silence),
+            voice_active: AtomicBool::new(false),
         }
     }
 }
@@ -122,6 +135,7 @@ impl Default for ComISAssist {
         Self {
             params: Arc::new(ComISAssistParams::default()),
             processor: None,
+            voice_activity: None,
             meters: Arc::new(Meters::new()),
         }
     }
@@ -373,6 +387,22 @@ fn vertical_scale(ui: &mut egui::Ui, height: f32, min: f32, max: f32, step: f32)
     }
 }
 
+/// A small filled circle + label, green when `active` else dark gray - `Specs/UI.md`'s originally
+/// planned "Voice activity Comm (green LED)", blocked until real voice-activity detection existed
+/// (`com_is_assist_core::voice_activity::SileroVad`).
+fn voice_activity_led(ui: &mut egui::Ui, active: bool) {
+    ui.horizontal(|ui| {
+        let (rect, _response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        let color = if active {
+            egui::Color32::from_rgb(0x39, 0xC8, 0x39)
+        } else {
+            egui::Color32::from_gray(60)
+        };
+        ui.painter().circle_filled(rect.center(), rect.width() / 2.0, color);
+        ui.label("Voice activity (COM)");
+    });
+}
+
 /// `nih_plug_egui` has no built-in bool-parameter widget (`ParamSlider` treats everything as a
 /// continuous/stepped slider) - a checkbox reads far more naturally for a two-state toggle like
 /// `bypass`/`mix-dialogue-to-bed`, so this drives one directly through `ParamSetter`, the same
@@ -491,6 +521,12 @@ impl Plugin for ComISAssist {
                             loudness_scale_column(ui);
                         });
 
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            voice_activity_led(ui, meters.voice_active.load(Ordering::Relaxed));
+                        });
+
                         ui.add_space(12.0);
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -556,6 +592,10 @@ impl Plugin for ComISAssist {
             TICK_SECONDS,
         )
         .ok();
+        // `.ok()`, not `.expect(...)`: if this fails (e.g. the ONNX Runtime binary couldn't be
+        // obtained), `process()` fails open rather than the whole plugin refusing to initialize
+        // over what's ultimately just a display/gating refinement, not the core automix path.
+        self.voice_activity = SileroVad::new(buffer_config.sample_rate as u32, VoiceActivityConfig::default()).ok();
         self.processor.is_some()
     }
 
@@ -616,7 +656,17 @@ impl Plugin for ComISAssist {
         // rather than crashing the audio thread over it.
         let _ = processor.feed_bed(&interleaved_bed);
         let _ = processor.feed_dialogue(&dialogue);
-        processor.maybe_run_control_step(automix_enabled);
+
+        // Fails open (treats COM as always voice-active) if VAD couldn't be constructed at
+        // `initialize()` time - see `voice_activity`'s doc comment.
+        let voice_active = match self.voice_activity.as_mut() {
+            Some(vad) => {
+                let _ = vad.feed(&dialogue);
+                vad.voice_active()
+            }
+            None => true,
+        };
+        processor.maybe_run_control_step(automix_enabled, voice_active);
 
         // Only bother publishing to the meters while the GUI is actually open - matches
         // nih-plug's own guidance for keeping this off the hot path otherwise.
@@ -628,6 +678,7 @@ impl Plugin for ComISAssist {
             self.meters
                 .dialogue_momentary_lufs
                 .store(processor.dialogue_momentary_lufs() as f32, Ordering::Relaxed);
+            self.meters.voice_active.store(voice_active, Ordering::Relaxed);
         }
 
         if mix_dialogue_to_bed {

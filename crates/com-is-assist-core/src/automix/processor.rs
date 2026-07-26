@@ -204,7 +204,16 @@ impl AutomixProcessor {
     /// the last control step (see the `bed_frames_since_control`/`dialogue_frames_since_control`
     /// doc comment), and starts a fresh ramp from the current instantaneous gain toward it. A
     /// no-op otherwise, so it's safe to call after every single chunk fed from either side.
-    pub fn maybe_run_control_step(&mut self, automix_enabled: bool) {
+    ///
+    /// `voice_active` is whether real voice-activity detection (a `voice_activity::SileroVad`,
+    /// owned and run by the *caller* - see that module's doc comment) currently reports speech on
+    /// COM. Not owned by `AutomixProcessor` itself: VAD needs its own ONNX Runtime session, which
+    /// is heavier machinery than anything else here, and keeping it external means tests (and
+    /// anything else that wants to drive the ratio/gain logic directly) can just pass a plain
+    /// bool rather than needing real speech audio to exercise `AutomixEngine`'s behavior. Every
+    /// wrapper still shares the exact same `SileroVad` implementation, so there's no risk of the
+    /// *detection* diverging between them, even though each owns its own instance.
+    pub fn maybe_run_control_step(&mut self, automix_enabled: bool, voice_active: bool) {
         if self.bed_frames_since_control < self.tick_frames || self.dialogue_frames_since_control < self.tick_frames {
             return;
         }
@@ -213,7 +222,7 @@ impl AutomixProcessor {
 
         let bed_s = self.bed_meter.short_term_loudness_db();
         let com_s = self.dialogue_meter.short_term_loudness_db();
-        let ratio = self.ratio_engine.update(bed_s, com_s);
+        let ratio = self.ratio_engine.update(bed_s, com_s, voice_active);
         self.applied_ratio_lu = ratio.ratio_lu;
         let automix_result = self.automix_engine.process_tick(ratio);
         self.applied_gain_reduction_db = automix_result.gain_reduction_db;
@@ -270,7 +279,7 @@ mod tests {
         p.feed_bed(&vec![0.9_f32; 1000]).unwrap();
         p.feed_dialogue(&vec![0.01_f32; 1000]).unwrap();
         let gain_before = p.current_ramp_gain();
-        p.maybe_run_control_step(true);
+        p.maybe_run_control_step(true, true);
         assert_eq!(p.current_ramp_gain(), gain_before, "target shouldn't move before a full tick accumulates");
     }
 
@@ -315,7 +324,7 @@ mod tests {
         for _ in 0..80 {
             p.feed_bed(&loud_bed).unwrap();
             p.feed_dialogue(&quiet_dialogue).unwrap();
-            p.maybe_run_control_step(true);
+            p.maybe_run_control_step(true, true);
         }
         let reduction = p.applied_gain_reduction_db();
         assert!(reduction > 0.0, "expected some reduction to have accumulated by now, got {reduction}dB");
@@ -336,16 +345,18 @@ mod tests {
     #[test]
     fn set_config_does_not_reset_already_accumulated_gain_reduction() {
         let mut p = processor(1);
-        // A loud bed against a quiet-but-present dialogue (above the "currently silent" floor)
-        // should build up some real reduction over a number of ticks (4800 frames = one 100ms
-        // tick at 48kHz; RatioEngine also needs ~20 consecutive non-silent ticks before it
-        // considers the ratio valid, so run comfortably more than that).
+        // A loud bed against a quiet-but-present dialogue, with `voice_active` asserted `true`
+        // (simulating what a real VAD would report for actual speech - this test isn't about VAD
+        // itself, just that `AutomixEngine` reacts to a genuinely-valid ratio), should build up
+        // some real reduction over a number of ticks (4800 frames = one 100ms tick at 48kHz;
+        // `RatioEngine` also needs ~20 consecutive voice-active ticks before it considers the
+        // ratio valid, so run comfortably more than that).
         let loud_bed = sine_tone_mono(400.0, 0.9, 48_000, 4_800);
         let quiet_dialogue = sine_tone_mono(400.0, 0.05, 48_000, 4_800);
         for _ in 0..80 {
             p.feed_bed(&loud_bed).unwrap();
             p.feed_dialogue(&quiet_dialogue).unwrap();
-            p.maybe_run_control_step(true);
+            p.maybe_run_control_step(true, true);
         }
         let before = p.applied_gain_reduction_db();
         assert!(before > 0.0, "expected some reduction to have accumulated by now, got {before}dB");

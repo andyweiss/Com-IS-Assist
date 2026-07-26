@@ -21,6 +21,7 @@
 use com_is_assist_core::automix::{
     bed_lrc_channels, mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, GainComputerConfig,
 };
+use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer::subclass::prelude::*;
@@ -378,6 +379,16 @@ pub struct ComISAssist {
     /// `flush_remaining_mix_tail`'s doc comment for how any still-unpaired tail is then handled.
     bed_eos: AtomicBool,
     dialogue_eos: AtomicBool,
+    /// Real voice-activity detection on Dialogue (COM) - see
+    /// `com_is_assist_core::voice_activity`'s doc comment for why this replaced the old LUFS-floor
+    /// "is COM currently silent?" stand-in. Independent of `state`/`ProcessingState`: unlike Bed,
+    /// Dialogue's sample rate is always the fixed `SAMPLE_RATE` constant, so this doesn't need to
+    /// wait on caps negotiation the way `AutomixProcessor` does, and it's fed unconditionally in
+    /// `process_dialogue_chunk` even before `state` exists (matching that method's existing
+    /// near-zero-latency, no-waiting-on-Bed-caps principle). `None` if construction ever failed
+    /// (e.g. the ONNX Runtime binary couldn't be obtained) - callers then fail open (treat COM as
+    /// always voice-active, matching the old pre-VAD behavior) rather than silently never ducking.
+    voice_activity: Mutex<Option<SileroVad>>,
     frame_indices: Mutex<FrameIndices>,
     bed_sink: gst::Pad,
     dialogue_sink: gst::Pad,
@@ -395,6 +406,28 @@ impl ComISAssist {
         let current = *counter;
         *counter += frame_count;
         current
+    }
+
+    /// Feeds one chunk of Dialogue audio into `voice_activity` and returns its (possibly just
+    /// updated) voice-active state. Fails open (`true`) if VAD wasn't constructed - see
+    /// `voice_activity`'s doc comment. Always locks `voice_activity` *before* `state` is ever
+    /// locked in the same call chain (see `process_bed_chunk`/`process_dialogue_chunk`) - the two
+    /// are never held together, so there's no ordering hazard to maintain beyond that.
+    fn feed_voice_activity(&self, dialogue: &[f32]) -> bool {
+        match lock_recover(&self.voice_activity).as_mut() {
+            Some(vad) => {
+                let _ = vad.feed(dialogue);
+                vad.voice_active()
+            }
+            None => true,
+        }
+    }
+
+    /// Reads the current voice-active state without feeding new audio - for call sites (Bed's own
+    /// chunk processing) that need the latest reading but have no Dialogue audio of their own to
+    /// feed this call. Fails open (`true`) if VAD wasn't constructed, same as `feed_voice_activity`.
+    fn voice_active(&self) -> bool {
+        lock_recover(&self.voice_activity).as_ref().map_or(true, |vad| vad.voice_active())
     }
 
     fn sink_chain(&self, is_bed: bool, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
@@ -475,6 +508,10 @@ impl ComISAssist {
     /// event precedes Bed's own first buffer, and `handle_bed_caps` constructs `state` right then.
     fn process_bed_chunk(&self, raw_bed: &[f32]) -> Result<gst::FlowSuccess, gst::FlowError> {
         let automix_enabled = lock_recover(&self.settings).automix_enabled;
+        // No new Dialogue audio arrived in this call - just read whatever `voice_activity` last
+        // settled on (see `voice_active`'s doc comment for the locking-order reason this is read
+        // *before* `state` is locked below, not while it's held).
+        let voice_active = self.voice_active();
         let mut leveled_bed = raw_bed.to_vec();
 
         let (mix_ready, bed_channels) = {
@@ -501,7 +538,7 @@ impl ComISAssist {
             })?;
             state.mix_bed_pending.extend_from_slice(&leveled_bed);
 
-            state.processor.maybe_run_control_step(automix_enabled);
+            state.processor.maybe_run_control_step(automix_enabled, voice_active);
 
             (drain_mix_ready(state), state.processor.bed_channels())
         };
@@ -520,8 +557,12 @@ impl ComISAssist {
     /// known, matching the near-zero-latency principle. Metering/mix-alignment, however, need
     /// `state`: if it isn't ready yet, the raw samples are buffered in
     /// `pending_dialogue_before_state` for `handle_bed_caps` to replay once Bed's caps arrive.
+    /// Voice-activity detection, unlike metering, is fed unconditionally too, `state` or not (see
+    /// `voice_activity`'s doc comment) - Dialogue's sample rate is fixed, so there's nothing to
+    /// wait on there.
     fn process_dialogue_chunk(&self, raw_dialogue: &[f32]) -> Result<gst::FlowSuccess, gst::FlowError> {
         let automix_enabled = lock_recover(&self.settings).automix_enabled;
+        let voice_active = self.feed_voice_activity(raw_dialogue);
 
         let (mix_ready, bed_channels) = {
             let mut state_guard = lock_recover(&self.state);
@@ -537,7 +578,7 @@ impl ComISAssist {
                     })?;
                     state.mix_dialogue_pending.extend_from_slice(raw_dialogue);
 
-                    state.processor.maybe_run_control_step(automix_enabled);
+                    state.processor.maybe_run_control_step(automix_enabled, voice_active);
 
                     (drain_mix_ready(state), Some(state.processor.bed_channels()))
                 }
@@ -814,11 +855,18 @@ impl ObjectSubclass for ComISAssist {
             .build();
 
         let settings = Settings::default();
+        // `.ok()`, not `.expect(...)`: if this fails (e.g. the ONNX Runtime binary couldn't be
+        // obtained), the element still comes up and falls back to always-voice-active (see
+        // `voice_active`'s doc comment) rather than refusing to load entirely.
+        let voice_activity = SileroVad::new(SAMPLE_RATE, VoiceActivityConfig::default())
+            .inspect_err(|err| eprintln!("[comisassist] voice-activity detection unavailable, failing open: {err}"))
+            .ok();
         Self {
             state: Mutex::new(None),
             pending_dialogue_before_state: Mutex::new(Vec::new()),
             bed_eos: AtomicBool::new(false),
             dialogue_eos: AtomicBool::new(false),
+            voice_activity: Mutex::new(voice_activity),
             settings: Mutex::new(settings),
             frame_indices: Mutex::new(FrameIndices::default()),
             bed_sink,
@@ -882,6 +930,10 @@ impl ObjectImpl for ComISAssist {
                     .default_value(0.0)
                     .read_only()
                     .build(),
+                glib::ParamSpecBoolean::builder("voice-active")
+                    .default_value(false)
+                    .read_only()
+                    .build(),
             ]
         })
     }
@@ -905,6 +957,7 @@ impl ObjectImpl for ComISAssist {
                 // Cheap diagnostic read; not stored separately from the engine's own state.
                 0.0f64.to_value()
             }
+            "voice-active" => self.voice_active().to_value(),
             _ => unimplemented!(),
         }
     }
