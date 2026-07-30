@@ -10,7 +10,7 @@ Ships as two thin wrappers around one shared Rust DSP core:
 
 ## How it works
 
-Each ~100ms tick, the plugin measures the short-term BS.1770 loudness of both the Bed and the Dialogue signal, computes their ratio, and — if the ratio drifts outside a configurable tolerance band — smoothly reduces Bed gain (fast attack, hold, slow recovery) until the target ratio is restored. The Bed loudness meter observes the *already-gained* signal (a closed control loop), matching how the ratio behaves on-air. Dialogue is never gained — only measured and, optionally, mixed back into the Bed's Left/Center/Right channels via a "voice divergence" equal-power pan law (Center-only at 0% up to split-L/R at 100%), shared by both wrappers.
+The plugin measures the short-term BS.1770 loudness of both the Bed and the Dialogue signal, computes their ratio, and — if the ratio drifts outside a configurable tolerance band — smoothly reduces Bed gain (fast attack, hold, slow recovery) until the target ratio is restored. The Bed loudness meter observes the *already-gained* signal (a closed control loop), matching how the ratio behaves on-air. Dialogue is never gained — only measured and, optionally, mixed back into the Bed's Left/Center/Right channels via a "voice divergence" equal-power pan law (Center-only at 0% up to split-L/R at 100%), shared by both wrappers.
 
 ## Repository layout
 

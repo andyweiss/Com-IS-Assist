@@ -8,7 +8,7 @@ Parameters (both wrappers unless noted; see `Specs/GSTdefinitions.md`/`Specs/vst
 - **Not yet implemented** (M3 scope): "voice detector IS" (the Bed-side VAD + interview-passthrough override described below - a separate feature from the COM-side gate above), Reset loudness.
 
 Display:
-- **Implemented (VST3 only, custom GUI — see `Specs/vstDefinitions.md`'s "GUI (custom, meters + controls)" section)**: current Gain reduction in dB, shown as a red segment carved out of the top of the IS bar (not a separate meter) down to the effective/audible Bed level; IS LUFS momentary (pre-gain) and Comm LUFS momentary, each shown as a vertical bar filling bottom-up (cyan/orange respectively); Ratio in LU, computed against Bed's effective (post-reduction) level so it reflects what's actually audible; Voice activity Comm (green LED, both wrappers - VST3 as a GUI indicator, GStreamer as a read-only `voice-active` property).
+- **Implemented (VST3 only, custom GUI — see `Specs/vstDefinitions.md`'s "GUI (custom, meters + controls)" section)**: a tall, professional-bargraph-style meter bank (left side of the window, parameters on the right) with current Gain reduction in dB as its own standalone vertical bar (top-down fill, own 0-48dB scale) next to IS LUFS momentary (pre-gain) and Comm LUFS momentary, each shown as a vertical bar filling bottom-up (cyan/orange respectively); Ratio in LU, computed against Bed's effective (post-reduction) level so it reflects what's actually audible; Voice activity Comm (green LED, both wrappers - VST3 as a GUI indicator below the meter bank, GStreamer as a read-only `voice-active` property).
 - **Deliberately not implemented**: IS/Comm LUFS-I (integrated) — tried, then dropped as an unneeded simplification (momentary is what both the control loop and this display care about; can be revisited if a concrete need comes up).
 - **Not yet implemented**: Voice activity IS LED (blocked on the Bed-side VAD/interview-passthrough work above, which hasn't been built).
 
@@ -32,8 +32,6 @@ on/off is set to on and voice is detected and no voice is detected on hei comm t
 # Voice divergence
 0% = Center only up to 100% = LR only
 
-# Reset loudness
-reset the integrated LUFS
 
 ## Display
 
@@ -41,8 +39,6 @@ reset the integrated LUFS
 - Comm LUFS- for the IS ratio
 - Ratio in LUFS between top of IS and top of Comm (see reaper 
 implementation)
-- IS LUFS-I Integrated
-- Com LUFS-I
 
 - Voice activity Comm (green LED)
 - Voice activity IS (green LED)

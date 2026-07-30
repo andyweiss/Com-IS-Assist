@@ -22,17 +22,28 @@ pub struct RatioResult {
 /// Configuration for [`RatioEngine`]'s "hold until sustained" gate.
 #[derive(Debug, Clone, Copy)]
 pub struct RatioEngineConfig {
-    /// How many consecutive voice-active ticks are required before `ratio_lu` is trusted for the
-    /// first time (and updated going forward). Distinct from the VAD's own internal
-    /// hangover/smoothing (`voice_activity::VoiceActivityConfig::hangover_seconds`), which governs
-    /// moment-to-moment flicker on a much shorter timescale - this is a slower, one-time
-    /// "have we seen enough sustained speech to bootstrap a non-garbage ratio" gate.
+    /// How many consecutive voice-active ticks are required before `ratio_lu` is (re)trusted -
+    /// both the very first time ever, *and* every time voice activity resumes after a gap (since
+    /// `consecutive_valid_ticks` resets to 0 on every `!voice_active` tick - see `update`). Kept
+    /// deliberately small now that `voice_active` is real voice-activity detection
+    /// (`voice_activity::SileroVad`), which already smooths moment-to-moment flicker via its own
+    /// `hangover_seconds` - this is just a final debounce against a single stray VAD tick, not a
+    /// second, redundant "wait for sustained speech" gate. It used to default to 20 (2 full
+    /// seconds at the ~100ms tick rate) back when `voice_active` was a crude LUFS-floor proxy that
+    /// genuinely needed a long sustain requirement to avoid trusting noise blips - once real VAD
+    /// existed, that same 20-tick wait became a **pure, unnecessary latency tax paid on every
+    /// single utterance**, not just once at session start: every pause-then-resume in speech
+    /// re-zeroed `consecutive_valid_ticks`, so `held_ratio_lu` sat frozen at its pre-pause value
+    /// for a further 2 seconds after each resumption before it would even start reflecting the new
+    /// audio - see `Specs/TechnicalConcept.md` section 5 for the full latency-chain writeup (this
+    /// gate was one of several contributors, alongside `AutomixEngine`'s VAD-onset fast-trigger,
+    /// now implemented, which addresses the rest).
     pub valid_signal_hold_ticks: i32,
 }
 
 impl Default for RatioEngineConfig {
     fn default() -> Self {
-        Self { valid_signal_hold_ticks: 20 }
+        Self { valid_signal_hold_ticks: 2 }
     }
 }
 

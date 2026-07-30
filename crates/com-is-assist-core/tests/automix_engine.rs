@@ -1,4 +1,4 @@
-use com_is_assist_core::automix::{AutomixEngine, AutomixEngineConfig, GainComputerConfig};
+use com_is_assist_core::automix::{AutomixEngine, AutomixEngineConfig, AutomixResult, GainComputerConfig};
 use com_is_assist_core::ratio::RatioResult;
 
 const TICK_SECONDS: f64 = 0.1;
@@ -98,6 +98,12 @@ fn releases_back_toward_unity_when_ratio_is_above_the_upper_limit() {
 
 #[test]
 fn invalid_ratio_holds_the_last_gain() {
+    // Isolates the "insufficient COM history to trust ratio_lu yet" gate (`valid == false`) from
+    // the separate "no voice detected at all" gate (`voice_active == false`, which now *releases*
+    // rather than holds - see `voice_inactive_releases_toward_unity_even_when_valid_latch_is_still_true`)
+    // by keeping `voice_active` true throughout: this is the realistic shape of that scenario -
+    // someone is actively talking, but not yet for the `valid_signal_hold_ticks` consecutive ticks
+    // required to trust the computed ratio number.
     let mut engine = fast_engine();
     let config = AutomixEngineConfig::default();
     let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
@@ -115,18 +121,20 @@ fn invalid_ratio_holds_the_last_gain() {
         let result = engine.process_tick(RatioResult {
             ratio_lu: -100.0, // would otherwise look like an even bigger shortfall
             valid: false,
-            voice_active: false,
+            voice_active: true,
         });
         assert_eq!(result.gain_reduction_db, converged);
     }
 }
 
 #[test]
-fn voice_inactive_holds_the_last_gain_even_when_valid_latch_is_still_true() {
-    // Regression test for the bug found while listening-testing M2: `valid` is a one-way latch
-    // (never reverts once true), so during a long gap after the first-ever speech burst it stays
-    // true while `ratio_lu` is a frozen, increasingly stale number. AutomixEngine must not react
-    // to it - it should hold, the same as the `!valid` case.
+fn voice_inactive_releases_toward_unity_even_when_valid_latch_is_still_true() {
+    // `valid` is a one-way latch (never reverts once true), so on its own it doesn't mean "COM
+    // has signal right now" - during a long gap after the first-ever speech burst it stays true
+    // while `ratio_lu` is a frozen, increasingly stale number. There's nothing to duck Bed *for*
+    // once COM stops talking, so `AutomixEngine` should release back toward unity (at the
+    // configured Recovery Time) rather than holding whatever reduction was applied when COM went
+    // quiet - and it should do so regardless of `valid` still being latched true.
     let mut engine = fast_engine();
     let config = AutomixEngineConfig::default();
     let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
@@ -139,15 +147,66 @@ fn voice_inactive_holds_the_last_gain_even_when_valid_latch_is_still_true() {
         });
     }
     let converged = engine.current_gain_reduction_db();
+    assert!(converged > 1.0, "expected meaningful reduction to have built up, got {converged}dB");
 
+    let mut result = AutomixResult { gain_reduction_db: converged, gain_linear: 1.0 };
     for _ in 0..50 {
-        let result = engine.process_tick(RatioResult {
+        result = engine.process_tick(RatioResult {
             ratio_lu: com_lo_lim - 1000.0, // a stale, wildly-out-of-range held value
             valid: true,                   // latch is still true...
             voice_active: false,           // ...but no voice is detected right now
         });
-        assert_eq!(result.gain_reduction_db, converged);
     }
+    assert!(
+        result.gain_reduction_db < 1.0,
+        "expected reduction to release back toward unity, was {converged}dB, now {}dB",
+        result.gain_reduction_db
+    );
+}
+
+#[test]
+fn voice_onset_after_a_gap_immediately_resumes_the_pre_gap_reduction() {
+    // Regression test for real-world latency: without the fast trigger, RatioEngine needs several
+    // ticks after voice resumes before `held_ratio_lu` reflects fresh audio (on top of its own
+    // small hold-ticks debounce, short-term loudness has real integration time) - which meant Bed
+    // sat un-ducked for a noticeable stretch after *every* resumed utterance, not just the first
+    // one in a session. The fast trigger closes that gap: the instant voice comes back, the raw
+    // target should jump straight back to whatever it was converging to before the gap, not
+    // restart the "nudge, don't jump" ramp from 0.
+    let mut engine = fast_engine();
+    let config = AutomixEngineConfig::default();
+    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
+
+    // Converge to a real reduction while voice is active...
+    for _ in 0..100 {
+        engine.process_tick(RatioResult {
+            ratio_lu: com_lo_lim - 10.0,
+            valid: true,
+            voice_active: true,
+        });
+    }
+    let converged = engine.current_gain_reduction_db();
+    assert!(converged > 5.0, "expected meaningful reduction to have built up, got {converged}dB");
+
+    // ...then voice stops for a while (releases, per the test above)...
+    for _ in 0..50 {
+        engine.process_tick(RatioResult { ratio_lu: 0.0, valid: true, voice_active: false });
+    }
+    assert!(engine.current_gain_reduction_db() < 1.0, "expected a release to have happened during the gap");
+
+    // ...then voice resumes. Even on this very first tick back - before any fresh ratio reading
+    // could possibly have arrived - reduction should already be most of the way back to where it
+    // was, not starting over from unity.
+    let result = engine.process_tick(RatioResult {
+        ratio_lu: 0.0, // not yet refreshed with fresh audio - shouldn't matter for this tick
+        valid: true,
+        voice_active: true,
+    });
+    assert!(
+        result.gain_reduction_db > converged * 0.5,
+        "expected the fast trigger to resume close to the pre-gap {converged}dB immediately, got {}dB",
+        result.gain_reduction_db
+    );
 }
 
 #[test]
@@ -213,14 +272,24 @@ fn set_config_raises_the_ceiling_for_a_wrapper_that_only_reads_params_once_at_co
 #[test]
 fn seed_target_reduction_db_lets_a_vad_onset_trigger_an_immediate_attack() {
     let mut engine = fast_engine();
+
+    // Prime `was_voice_active` first, so the seed below doesn't itself land on a fresh
+    // false→true onset tick - `process_tick`'s own automatic fast-trigger would otherwise
+    // immediately overwrite the seeded value with `last_active_target_reduction_db` (0.0, since
+    // none has ever been recorded yet), defeating the seed before it can be exercised.
+    engine.process_tick(RatioResult { ratio_lu: 0.0, valid: false, voice_active: true });
+
     engine.seed_target_reduction_db(6.0);
 
-    // No valid ratio ticks needed - the envelope should still chase the seeded target.
+    // No *valid* ratio ticks needed - the envelope should still chase the seeded target. But
+    // `voice_active` must stay true here: `voice_active == false` now unconditionally releases
+    // the raw target back to 0 (see `process_tick`'s doc comment), which would immediately erase
+    // the seeded value rather than exercising it.
     for _ in 0..50 {
         engine.process_tick(RatioResult {
             ratio_lu: 0.0,
             valid: false,
-            voice_active: false,
+            voice_active: true,
         });
     }
 

@@ -124,9 +124,12 @@ struct ComISAssistParams {
     #[id = "divergence"]
     pub divergence: FloatParam,
 
-    /// Persisted together with the rest of the plugin's state so the GUI reopens at the same
-    /// size. Not a live-meter value itself - see `ComISAssist::gain_reduction_db` for that.
-    #[persist = "editor-state"]
+    /// Deliberately *not* `#[persist]` - the window is meant to always open at the size the GUI
+    /// layout actually needs (see `ComISAssistParams::default()`), not whatever a host happened to
+    /// save from a previous, differently-sized layout (which silently overrode every attempt to fix
+    /// the window's size while this was still marked persistent - a real bug hit during development,
+    /// not a hypothetical one). The user can still drag the resize corner within a session; that
+    /// resize just won't be remembered across a host reload/reopen anymore.
     editor_state: Arc<EguiState>,
 }
 
@@ -149,14 +152,18 @@ impl Default for ComISAssistParams {
             target_ratio: FloatParam::new(
                 "Target Ratio",
                 automix.target_ratio_lu as f32,
-                FloatRange::Linear { min: -12.0, max: 12.0 },
+                // Positive only - COM is meant to sit *on top of* IS by this many LU, never below
+                // it, so a negative target never made sense to expose here.
+                FloatRange::Linear { min: 0.0, max: 12.0 },
             )
+            .with_step_size(0.1)
             .with_unit(" LU"),
             max_gain_reduction_db: FloatParam::new(
                 "Max Gain Reduction",
                 automix.max_gain_reduction_db as f32,
                 FloatRange::Linear { min: 0.0, max: 48.0 },
             )
+            .with_step_size(0.1)
             .with_unit(" dB"),
             attack_ms: FloatParam::new(
                 "Fade Down Time",
@@ -195,7 +202,7 @@ impl Default for ComISAssistParams {
             mix_dialogue_to_bed: BoolParam::new("Mix Dialogue to Bed", true),
             divergence: FloatParam::new("Voice Divergence", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
-            editor_state: EguiState::from_size(400, 480),
+            editor_state: EguiState::from_size(820, 600),
         }
     }
 }
@@ -231,82 +238,102 @@ fn fixed_width_column(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&
     });
 }
 
-const METER_BAR_HEIGHT: f32 = 160.0;
-const LOUDNESS_COLUMN_WIDTH: f32 = 64.0;
-const RATIO_COLUMN_WIDTH: f32 = 60.0;
-const SCALE_COLUMN_WIDTH: f32 = 38.0;
+// Professional-meter proportions (IEC 60268-18-style bargraph: tall, narrow, segmented) rather
+// than the earlier compact/solid-fill bars - purely a look-and-feel change, no DSP/value meaning
+// changed here. `METER_BAR_HEIGHT` in particular is the main "make it long" lever.
+const METER_BAR_HEIGHT: f32 = 420.0;
+const METER_BAR_WIDTH: f32 = 20.0;
+const GR_COLUMN_WIDTH: f32 = 58.0;
+const LOUDNESS_COLUMN_WIDTH: f32 = 62.0;
+const RATIO_COLUMN_WIDTH: f32 = 58.0;
+const SCALE_COLUMN_WIDTH: f32 = 32.0;
 
 const LOUDNESS_METER_MIN_LUFS: f32 = -60.0;
 const LOUDNESS_METER_MAX_LUFS: f32 = 0.0;
+/// Fixed display range for `gain_reduction_meter`'s bar and scale - matches `max-gain-reduction-db`'s
+/// own hard ceiling (`FloatRange::Linear { max: 48.0, .. }`), rather than the live parameter value
+/// (which defaults to 24), so headroom stays visible and the ticks stay a stable reference
+/// regardless of the configured ceiling.
+const GAIN_REDUCTION_METER_MAX_DB: f32 = 48.0;
+
+/// Meter background - shared by every bar's unfilled portion.
+const METER_BACKGROUND: egui::Color32 = egui::Color32::from_gray(22);
 
 /// A vertical momentary-loudness meter that fills from the bottom up (the conventional level-meter
 /// orientation), normalized against a fixed -60..0 LUFS display range chosen to comfortably cover
 /// typical Bed/Dialogue program levels down to near-silence. `Ebur128Meter::NEGATIVE_INFINITY_DB`
 /// (silence/insufficient data) is shown as "-inf" rather than a literal "-100.0", matching how the
-/// original JSFX reference meter displays it.
-fn loudness_meter(ui: &mut egui::Ui, label: &str, lufs: f32, color: egui::Color32) {
+/// original JSFX reference meter displays it. `gain_reduction_db`, when `Some` (the IS bar only),
+/// carves the currently-applied reduction out as a red segment at the *top* of the fill, extending
+/// down by the reduction amount (1dB of reduction = 1 LU on this same scale, so this is exact) - the
+/// boundary between the bar's own color and red is Bed's effective, audible level. `voice_active`,
+/// when `Some` (the COM bar only), draws the voice-activity LED directly under this bar - COM is
+/// what the VAD actually listens to, so the indicator reads most naturally right under it rather
+/// than off in its own row spanning the whole meter bank.
+fn loudness_meter(
+    ui: &mut egui::Ui,
+    label: &str,
+    lufs: f32,
+    color: egui::Color32,
+    gain_reduction_db: Option<f32>,
+    voice_active: Option<bool>,
+) {
     fixed_width_column(ui, LOUDNESS_COLUMN_WIDTH, |ui| {
         ui.label(label);
-        let (rect, _response) = ui.allocate_exact_size(egui::vec2(32.0, METER_BAR_HEIGHT), egui::Sense::hover());
+        let (rect, _response) = ui.allocate_exact_size(egui::vec2(METER_BAR_WIDTH, METER_BAR_HEIGHT), egui::Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(25));
+        painter.rect_filled(rect, 2.0, METER_BACKGROUND);
 
         let normalized = ((lufs - LOUDNESS_METER_MIN_LUFS) / (LOUDNESS_METER_MAX_LUFS - LOUDNESS_METER_MIN_LUFS))
             .clamp(0.0, 1.0);
         let fill_height = rect.height() * normalized;
         let filled = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - fill_height), rect.max);
-        painter.rect_filled(filled, 3.0, color);
-        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
+        painter.rect_filled(filled, 2.0, color);
+
+        if let Some(reduction_db) = gain_reduction_db {
+            let reduction_height = (rect.height()
+                * (reduction_db / (LOUDNESS_METER_MAX_LUFS - LOUDNESS_METER_MIN_LUFS)))
+                .clamp(0.0, fill_height);
+            let reduced = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, filled.min.y),
+                egui::pos2(rect.max.x, filled.min.y + reduction_height),
+            );
+            painter.rect_filled(reduced, 2.0, egui::Color32::from_rgb(224, 32, 32));
+        }
+
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
 
         if lufs <= Ebur128Meter::NEGATIVE_INFINITY_DB as f32 {
             ui.label("-inf LUFS");
         } else {
             ui.label(format!("{lufs:.1} LUFS"));
         }
+
+        if let Some(active) = voice_active {
+            ui.add_space(4.0);
+            voice_activity_led(ui, active);
+        }
     });
 }
 
-/// The IS (Bed) loudness meter: fills bottom-up to `pre_gain_lufs` like `loudness_meter`, but with
-/// the currently-applied gain reduction drawn as a highlighted (red) segment carved out of the
-/// *top* of that fill, extending down by `gain_reduction_db` - on the same LUFS-equivalent scale,
-/// since 1dB of reduction is exactly 1 LU. The bar therefore splits into "what's actually audible"
-/// (the cyan region, below) and "how much is being cut off the top" (red) of the full incoming
-/// level - replacing an earlier, separate standalone gain-reduction meter, since the whole point
-/// of gain reduction is "how much is being removed from *this* signal," which reads far more
-/// directly as part of the bar it acts on than as a side-by-side meter with its own scale.
-fn bed_loudness_meter(ui: &mut egui::Ui, pre_gain_lufs: f32, gain_reduction_db: f32, color: egui::Color32) {
-    fixed_width_column(ui, LOUDNESS_COLUMN_WIDTH, |ui| {
-        ui.label("IS");
-        let (rect, _response) = ui.allocate_exact_size(egui::vec2(32.0, METER_BAR_HEIGHT), egui::Sense::hover());
+/// A vertical gain-reduction meter that fills top-down (0dB at top, increasing downward - the
+/// conventional GR-meter orientation, opposite of `loudness_meter`'s bottom-up convention),
+/// normalized against the fixed `GAIN_REDUCTION_METER_MAX_DB` range. Standalone (in addition to the
+/// carve-out on the IS bar above) so gain reduction and ratio can both be read clearly at a glance,
+/// over a wider range than the IS bar's carve-out alone would show, while tuning attack/hold/release.
+fn gain_reduction_meter(ui: &mut egui::Ui, gain_reduction_db: f32) {
+    fixed_width_column(ui, GR_COLUMN_WIDTH, |ui| {
+        ui.label("GR");
+        let (rect, _response) = ui.allocate_exact_size(egui::vec2(METER_BAR_WIDTH, METER_BAR_HEIGHT), egui::Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(25));
+        painter.rect_filled(rect, 2.0, METER_BACKGROUND);
 
-        let range = LOUDNESS_METER_MAX_LUFS - LOUDNESS_METER_MIN_LUFS;
-        let total_normalized = ((pre_gain_lufs - LOUDNESS_METER_MIN_LUFS) / range).clamp(0.0, 1.0);
-        // Can't carve out more of the bar than is currently filled - a reduction bigger than the
-        // bar's own fill just means the whole visible bar is "cut" (audible portion is silence).
-        let reduction_normalized = (gain_reduction_db / range).clamp(0.0, total_normalized);
-        let effective_normalized = total_normalized - reduction_normalized;
+        let normalized = (gain_reduction_db / GAIN_REDUCTION_METER_MAX_DB).clamp(0.0, 1.0);
+        let filled = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + rect.height() * normalized));
+        painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(224, 32, 32));
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
 
-        let audible_fill_height = rect.height() * effective_normalized;
-        let audible_rect = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - audible_fill_height), rect.max);
-        painter.rect_filled(audible_rect, 3.0, color);
-
-        if reduction_normalized > 0.0 {
-            let reduction_top_y = rect.max.y - rect.height() * total_normalized;
-            let reduction_bottom_y = rect.max.y - rect.height() * effective_normalized;
-            let reduction_rect =
-                egui::Rect::from_min_max(egui::pos2(rect.min.x, reduction_top_y), egui::pos2(rect.max.x, reduction_bottom_y));
-            painter.rect_filled(reduction_rect, 3.0, egui::Color32::from_rgb(224, 32, 32));
-        }
-        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
-
-        if pre_gain_lufs <= Ebur128Meter::NEGATIVE_INFINITY_DB as f32 {
-            ui.label("-inf LUFS");
-        } else {
-            ui.label(format!("{pre_gain_lufs:.1} LUFS"));
-        }
-        ui.label(format!("-{gain_reduction_db:.1} dB"));
+        ui.label(format!("{gain_reduction_db:.1} dB"));
     });
 }
 
@@ -324,9 +351,9 @@ fn bed_loudness_meter(ui: &mut egui::Ui, pre_gain_lufs: f32, gain_reduction_db: 
 fn ratio_meter(ui: &mut egui::Ui, is_lufs: f32, ratio_lu: f32, color: egui::Color32) {
     fixed_width_column(ui, RATIO_COLUMN_WIDTH, |ui| {
         ui.label("Ratio");
-        let (rect, _response) = ui.allocate_exact_size(egui::vec2(32.0, METER_BAR_HEIGHT), egui::Sense::hover());
+        let (rect, _response) = ui.allocate_exact_size(egui::vec2(METER_BAR_WIDTH, METER_BAR_HEIGHT), egui::Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(25));
+        painter.rect_filled(rect, 2.0, METER_BACKGROUND);
 
         let normalize = |lufs: f32| {
             ((lufs - LOUDNESS_METER_MIN_LUFS) / (LOUDNESS_METER_MAX_LUFS - LOUDNESS_METER_MIN_LUFS)).clamp(0.0, 1.0)
@@ -339,8 +366,8 @@ fn ratio_meter(ui: &mut egui::Ui, is_lufs: f32, ratio_lu: f32, color: egui::Colo
             egui::pos2(rect.min.x, rect.max.y - rect.height() * high),
             egui::pos2(rect.max.x, rect.max.y - rect.height() * low),
         );
-        painter.rect_filled(filled, 3.0, color);
-        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
+        painter.rect_filled(filled, 2.0, color);
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
 
         ui.label(format!("{ratio_lu:+.1} LU"));
     });
@@ -348,32 +375,45 @@ fn ratio_meter(ui: &mut egui::Ui, is_lufs: f32, ratio_lu: f32, color: egui::Colo
 
 /// A column pairing a name-label-height spacer with `vertical_scale`, so the ticks line up with
 /// the bars' drawn area (which sits below each bar's own name label). Placed immediately to the
-/// right of both the IS bar and the COM bar (see `editor()`), as close as the label/tick text
-/// allows, so each bar reads against its own nearby axis rather than one shared scale off to a
-/// single side.
+/// right of the IS bar and the COM bar (see `editor()`), as close as the label/tick text allows, so
+/// each bar reads against its own nearby axis rather than one shared scale off to a single side.
 fn loudness_scale_column(ui: &mut egui::Ui) {
     fixed_width_column(ui, SCALE_COLUMN_WIDTH, |ui| {
         ui.label(" ");
-        vertical_scale(ui, METER_BAR_HEIGHT, LOUDNESS_METER_MIN_LUFS, LOUDNESS_METER_MAX_LUFS, 10.0);
+        vertical_scale(ui, METER_BAR_HEIGHT, LOUDNESS_METER_MIN_LUFS, LOUDNESS_METER_MAX_LUFS, 5.0, false);
     });
 }
 
-/// A vertical scale (tick marks + numeric labels) for a bottom-up bar meter (`min` at the bottom,
-/// `max` at the top - e.g. -60 LUFS at bottom, 0 LUFS at top) spanning `[min, max]` over `height`
-/// pixels. The allocated rect is wide enough to contain the tick text itself (not just the tick
-/// line), so egui's own layout system - which doesn't know about anything drawn via `Painter`
-/// outside the rect it was told about - correctly accounts for the scale's full visual footprint;
-/// otherwise neighboring widgets could crowd or overlap the numbers. The topmost/bottommost labels
-/// are also nudged inward (clamped half a line-height from the edge) so they stay fully visible
-/// rather than clipping.
-fn vertical_scale(ui: &mut egui::Ui, height: f32, min: f32, max: f32, step: f32) {
+/// Same idea as `loudness_scale_column`, for `gain_reduction_meter`'s fixed 0..48dB range.
+fn gain_reduction_scale_column(ui: &mut egui::Ui) {
+    fixed_width_column(ui, SCALE_COLUMN_WIDTH, |ui| {
+        ui.label(" ");
+        vertical_scale(ui, METER_BAR_HEIGHT, 0.0, GAIN_REDUCTION_METER_MAX_DB, 6.0, true);
+    });
+}
+
+/// A vertical scale (tick marks + numeric labels) spanning `[min, max]` over `height` pixels.
+/// `top_down` selects the tick direction to match the bar it labels: `false` for the bottom-up
+/// loudness/ratio convention (`min` at the bottom, `max` at the top - e.g. -60 LUFS at bottom, 0
+/// LUFS at top), `true` for `gain_reduction_meter`'s top-down convention (`min` i.e. 0dB at the
+/// top, `max` at the bottom). The allocated rect is wide enough to contain the tick text itself
+/// (not just the tick line), so egui's own layout system - which doesn't know about anything drawn
+/// via `Painter` outside the rect it was told about - correctly accounts for the scale's full
+/// visual footprint; otherwise neighboring widgets could crowd or overlap the numbers. The
+/// topmost/bottommost labels are also nudged inward (clamped half a line-height from the edge) so
+/// they stay fully visible rather than clipping.
+fn vertical_scale(ui: &mut egui::Ui, height: f32, min: f32, max: f32, step: f32, top_down: bool) {
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(SCALE_COLUMN_WIDTH, height), egui::Sense::hover());
     let painter = ui.painter();
     let half_line = 5.0;
     let mut value = min;
     while value <= max + 0.001 {
         let normalized = ((value - min) / (max - min)).clamp(0.0, 1.0);
-        let y = rect.max.y - rect.height() * normalized;
+        let y = if top_down {
+            rect.min.y + rect.height() * normalized
+        } else {
+            rect.max.y - rect.height() * normalized
+        };
         let text_y = y.clamp(rect.min.y + half_line, rect.max.y - half_line);
         painter.hline(rect.min.x..=(rect.min.x + 4.0), y, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(140)));
         painter.text(
@@ -387,11 +427,14 @@ fn vertical_scale(ui: &mut egui::Ui, height: f32, min: f32, max: f32, step: f32)
     }
 }
 
-/// A small filled circle + label, green when `active` else dark gray - `Specs/UI.md`'s originally
-/// planned "Voice activity Comm (green LED)", blocked until real voice-activity detection existed
-/// (`com_is_assist_core::voice_activity::SileroVad`).
+/// A small filled circle + short label, green when `active` else dark gray - `Specs/UI.md`'s
+/// originally planned "Voice activity Comm (green LED)", blocked until real voice-activity
+/// detection existed (`com_is_assist_core::voice_activity::SileroVad`). Stacked vertically
+/// (dot above label) rather than side by side, so it fits inside the narrow COM meter column it's
+/// drawn under (see `loudness_meter`'s `voice_active` parameter) instead of needing a whole row's
+/// width for a longer horizontal label.
 fn voice_activity_led(ui: &mut egui::Ui, active: bool) {
-    ui.horizontal(|ui| {
+    ui.vertical_centered(|ui| {
         let (rect, _response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
         let color = if active {
             egui::Color32::from_rgb(0x39, 0xC8, 0x39)
@@ -399,7 +442,7 @@ fn voice_activity_led(ui: &mut egui::Ui, active: bool) {
             egui::Color32::from_gray(60)
         };
         ui.painter().circle_filled(rect.center(), rect.width() / 2.0, color);
-        ui.label("Voice activity (COM)");
+        ui.label("Voice");
     });
 }
 
@@ -459,20 +502,21 @@ impl Plugin for ComISAssist {
             |_, _| {},
             move |egui_ctx, setter, _state| {
                 ResizableWindow::new("com-is-assist-editor-window")
-                    .min_size(egui::Vec2::new(360.0, 420.0))
+                    .min_size(egui::Vec2::new(760.0, 560.0))
                     .show(egui_ctx, egui_state.as_ref(), |ui| {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.add_space(12.0);
                             ui.heading("Com-IS-Assist");
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
 
                         let gain_reduction_db = meters.gain_reduction_db.load(Ordering::Relaxed);
                         let is_lufs = meters.bed_momentary_lufs.load(Ordering::Relaxed); // pre-gain
-                        // What's actually audible from Bed right now - the boundary between the
-                        // cyan and red portions of `bed_loudness_meter`'s bar below. Used to anchor
-                        // the ratio bar so it starts from the same point that bar visually ends at.
+                        // What's actually audible from Bed right now - not shown directly on the
+                        // (now standalone) IS bar, but still the right anchor for the ratio bar,
+                        // matching `AutomixProcessor::display_ratio_lu`'s own definition of "the
+                        // gap that's actually audible."
                         let effective_is_lufs = is_lufs - gain_reduction_db;
                         let com_lufs = meters.dialogue_momentary_lufs.load(Ordering::Relaxed);
                         // The bar's drawn height/label - consistent with `effective_is_lufs`/
@@ -504,40 +548,53 @@ impl Plugin for ComISAssist {
                         };
 
                         ui.horizontal(|ui| {
-                            // Precise control over gaps: egui's automatic `item_spacing` would
-                            // otherwise stack on top of every explicit `add_space` below, making
-                            // the intended-to-be-tight bar/scale gaps look much bigger than
-                            // requested.
-                            ui.spacing_mut().item_spacing.x = 0.0;
                             ui.add_space(12.0);
-                            bed_loudness_meter(ui, is_lufs, gain_reduction_db, egui::Color32::from_rgb(0x52, 0xFF, 0xFE));
-                            ui.add_space(2.0);
-                            loudness_scale_column(ui);
-                            ui.add_space(18.0);
-                            ratio_meter(ui, effective_is_lufs, display_ratio_lu, ratio_color);
-                            ui.add_space(18.0);
-                            loudness_meter(ui, "COM", com_lufs, egui::Color32::from_rgb(0xEB, 0x9E, 0x34));
-                            ui.add_space(2.0);
-                            loudness_scale_column(ui);
-                        });
 
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            voice_activity_led(ui, meters.voice_active.load(Ordering::Relaxed));
-                        });
+                            // Meter bank (left): a tall, segmented professional bargraph panel -
+                            // gain reduction and ratio sit right next to each other so the two are
+                            // easy to read together while tuning. The voice-activity LED is drawn
+                            // as part of the COM column itself (see `loudness_meter`'s
+                            // `voice_active` parameter), directly under the bar it actually reflects.
+                            ui.horizontal(|ui| {
+                                // Precise control over gaps: egui's automatic `item_spacing` would
+                                // otherwise stack on top of every explicit `add_space` below,
+                                // making the intended-to-be-tight bar/scale gaps look much bigger
+                                // than requested.
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                gain_reduction_meter(ui, gain_reduction_db);
+                                ui.add_space(2.0);
+                                gain_reduction_scale_column(ui);
+                                ui.add_space(18.0);
+                                loudness_meter(ui, "IS", is_lufs, egui::Color32::from_rgb(0x52, 0xFF, 0xFE), Some(gain_reduction_db), None);
+                                ui.add_space(2.0);
+                                loudness_scale_column(ui);
+                                ui.add_space(18.0);
+                                ratio_meter(ui, effective_is_lufs, display_ratio_lu, ratio_color);
+                                ui.add_space(18.0);
+                                loudness_meter(
+                                    ui,
+                                    "COM",
+                                    com_lufs,
+                                    egui::Color32::from_rgb(0xEB, 0x9E, 0x34),
+                                    None,
+                                    Some(meters.voice_active.load(Ordering::Relaxed)),
+                                );
+                                ui.add_space(2.0);
+                                loudness_scale_column(ui);
+                            });
 
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
+                            ui.add_space(20.0);
+                            ui.separator();
+                            ui.add_space(20.0);
+
+                            // Parameters (right).
                             ui.vertical(|ui| {
                                 ui.label("Controls");
-                                ui.add_space(4.0);
+                                ui.add_space(6.0);
 
                                 egui::Grid::new("com-is-assist-controls")
                                     .num_columns(2)
-                                    .spacing([12.0, 6.0])
+                                    .spacing([12.0, 10.0])
                                     .show(ui, |ui| {
                                         ui.label("Target ratio");
                                         ui.add(ParamSlider::for_param(&params.target_ratio, setter));
@@ -564,12 +621,10 @@ impl Plugin for ComISAssist {
                                         ui.end_row();
                                     });
 
-                                ui.add_space(8.0);
-                                ui.horizontal(|ui| {
-                                    bool_param_checkbox(ui, setter, &params.bypass, "Bypass");
-                                    ui.add_space(16.0);
-                                    bool_param_checkbox(ui, setter, &params.mix_dialogue_to_bed, "Mix dialogue to bed");
-                                });
+                                ui.add_space(20.0);
+                                bool_param_checkbox(ui, setter, &params.bypass, "Bypass");
+                                ui.add_space(10.0);
+                                bool_param_checkbox(ui, setter, &params.mix_dialogue_to_bed, "Mix dialogue to bed");
                             });
                         });
                         ui.add_space(14.0);

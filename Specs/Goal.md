@@ -19,7 +19,7 @@ and three outputs:
 
 ## Automixer Concept
 
-According to the Work ov Jonas Egel I want to measure the R128 Loudness of the Bed and the Dialogue and calculate a Ratio. Based on the Ratio the level of the bed is reduced until the desired ratio is met.
+According to the Work ov Jonas Egel the goal is to measure the R128 Loudness of the Bed and the Dialogue and calculate a Ratio. Based on the Ratio the level of the bed is reduced until the desired ratio is met.
 
 The voice is usually very dirty with IS spill on it hence a voice cleaner is needet on the measurig path in front of the r128 meter section. A AI assisted Voice recocnition tool could also help just to measure the loudness of the dialog when it conains acutal voice.
 
