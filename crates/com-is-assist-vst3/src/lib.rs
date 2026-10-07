@@ -270,8 +270,7 @@ const LOUDNESS_METER_MAX_LUFS: f32 = 0.0;
 const GAIN_REDUCTION_METER_MAX_DB: f32 = 48.0;
 
 /// Half-width of the ratio meter's "on target" green band, in LU - a GUI-only readability
-/// threshold, deliberately independent of `AutomixEngineConfig`'s `tolerance_lu` (which governs
-/// the DSP's actual correction decisions, not what this indicator shows).
+/// threshold - a readability band for the eye, governing nothing in the DSP.
 const RATIO_METER_GREEN_BAND_LU: f32 = 2.0;
 
 /// Meter background - shared by every bar's unfilled portion.

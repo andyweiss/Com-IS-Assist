@@ -22,15 +22,32 @@ const MID: Ballistics = Ballistics { attack_seconds: 0.15, release_seconds: 0.6 
 /// let go slowly, so that what it responds to is *onsets* rather than the shape of every vowel.
 const FAST: Ballistics = Ballistics { attack_seconds: 0.005, release_seconds: 0.4 };
 
-/// How long the whole cascade holds its current reduction before any release is allowed to begin.
+/// Over how long the release eases in after ducking stops.
 ///
-/// Measured, not guessed: real commentary pauses run ~1.2s, and with no hold at all the Bed audibly
-/// swells in every inter-sentence gap and re-ducks on the next phrase (see
-/// `Specs/TechnicalConcept.md` section 5.3). This sits on top of the COM detector's own
-/// `hangover_seconds`, and the two together have to span a natural pause. It is deliberately fixed
-/// rather than exposed: it is a property of speech, not a matter of taste, and the previous design
-/// having it as a user control ("Hold time") is part of what made that surface unmanageable.
+/// Real commentary pauses run ~1.2s, and with no resistance at all the Bed audibly swells in every
+/// inter-sentence gap and re-ducks on the next phrase (see `Specs/TechnicalConcept.md` section
+/// 5.3). This sits on top of the COM detector's own `hangover_seconds`, and the two together have
+/// to span a natural pause. Fixed rather than exposed: it is a property of speech, not a matter of
+/// taste, and having it as a user control ("Hold time") was part of what made the old surface
+/// unmanageable.
 const RELEASE_HOLD_SECONDS: f64 = 0.8;
+
+/// How much the release time constant is stretched at the very start of a release, easing back to
+/// 1x over `RELEASE_HOLD_SECONDS`.
+///
+/// This replaced a hard freeze, and the reason is worth recording. Freezing the cascade outright
+/// for the hold window and then releasing normally is trivially simple and sounds wrong: it puts a
+/// corner in the gain curve. Measured on real commentary, the gain sat at exactly +0.000 dB/tick
+/// for 0.8s and then stepped straight to -0.48 dB/tick — and a discontinuity in the *rate* of
+/// change is audible as "nothing happens, then it moves", which is precisely the hold people
+/// notice. (Freezing the stages *more* completely made it more obvious, not less: an earlier leak
+/// in the fast stage had been smearing the corner by accident.)
+///
+/// Stretching the time constant instead means recovery begins immediately but imperceptibly
+/// slowly, then accelerates smoothly to the normal rate. Short gaps still recover almost nothing,
+/// because the early rate is tiny — but there is no instant at which the behaviour switches.
+/// Interpolation is geometric rather than linear, which is the natural spacing for time constants.
+const HOLD_RELEASE_STRETCH: f64 = 60.0;
 
 /// How much faster `MixState::InterviewPassthrough` recovers than an ordinary release. Replaces the
 /// former `interview-release-ms` parameter — one fixed ratio is easier to reason about than a free
@@ -105,12 +122,8 @@ pub struct LoopBank {
     /// Set by the most recent update so the fast stage, which steps between control ticks, knows
     /// whether it should be driving toward a target or toward unity.
     releasing: bool,
-    /// Whether the release hold is currently blocking recovery. The fast stage has to consult this
-    /// too: it steps from `process_bed` rather than from `update_release`, so without it the hold
-    /// froze only the slow and mid stages while the fast stage carried on decaying - measured as
-    /// 0.35-1.25dB of unintended recovery inside the hold window on real commentary, and up to its
-    /// full 4dB authority in the worst case. "Hold" has to mean the whole cascade holds.
-    hold_blocks_release: bool,
+    /// Whether the interview state is driving this release (it skips the ease-in entirely).
+    interview_release: bool,
     release_speedup: f64,
 }
 
@@ -123,7 +136,7 @@ impl LoopBank {
             fast: EnvelopeDetector::new(0.0),
             hold_remaining_seconds: 0.0,
             releasing: false,
-            hold_blocks_release: false,
+            interview_release: false,
             release_speedup: 1.0,
         }
     }
@@ -136,8 +149,20 @@ impl LoopBank {
         let speed = self.config.speed.max(0.01);
         (
             ballistics.attack_seconds / speed,
-            ballistics.release_seconds / (speed * self.release_speedup),
+            ballistics.release_seconds * self.release_stretch() / (speed * self.release_speedup),
         )
+    }
+
+    /// The release ease-in factor: `HOLD_RELEASE_STRETCH` at the instant ducking stops, easing
+    /// geometrically to `1.0` over `RELEASE_HOLD_SECONDS`. See `HOLD_RELEASE_STRETCH` for why this
+    /// is a continuous stretch rather than a freeze. Interview passthrough skips it - getting back
+    /// to unity promptly is that state's entire purpose.
+    fn release_stretch(&self) -> f64 {
+        if !self.releasing || self.interview_release {
+            return 1.0;
+        }
+        let remaining = (self.hold_remaining_seconds / RELEASE_HOLD_SECONDS).clamp(0.0, 1.0);
+        HOLD_RELEASE_STRETCH.powf(remaining)
     }
 
     fn clamp_authority(value: f64, authority_db: f64) -> f64 {
@@ -157,7 +182,7 @@ impl LoopBank {
         dt_seconds: f64,
     ) {
         self.releasing = false;
-        self.hold_blocks_release = false;
+        self.interview_release = false;
         self.release_speedup = 1.0;
         self.hold_remaining_seconds = RELEASE_HOLD_SECONDS;
 
@@ -178,9 +203,8 @@ impl LoopBank {
     /// detector. Trims whatever slow+mid currently contribute, within `fast_authority_db`.
     pub fn update_fast(&mut self, required_fast_db: Option<f64>, dt_seconds: f64) {
         let target = match (self.releasing, required_fast_db) {
-            // Releasing, but the hold is still blocking recovery: freeze, exactly as the slow and
-            // mid stages do. See `hold_blocks_release`.
-            (true, _) if self.hold_blocks_release => self.fast.value(),
+            // Releasing: head for unity. The ease-in is applied through `scaled`, exactly as it is
+            // for the slow and mid stages, so the whole cascade shares one release curve.
             (true, _) => 0.0,
             (false, None) => self.fast.value(), // unusable reading: hold
             (false, Some(required)) => {
@@ -203,22 +227,33 @@ impl LoopBank {
     /// progressive: the fast stage lets go first and the slow stage last, which is the shape a
     /// single-envelope design could only approximate.
     pub fn update_release(&mut self, interview: bool, dt_seconds: f64) {
+        if !self.releasing {
+            // First tick of a release: collapse the cascade into the slow stage, preserving the
+            // total exactly (so the gain does not move at this instant), and release that single
+            // value from here on.
+            //
+            // This is not tidiness - it fixes a real defect. The mid stage is a *signed* trim, so
+            // it is frequently negative while ducking. Driving each stage independently toward
+            // zero therefore drove a negative mid stage *upward*, which **adds** reduction: the
+            // Bed audibly ducked harder at the exact moment the commentator stopped (measured at
+            // +0.6 dB on real commentary before this). Releasing one combined value instead makes
+            // recovery monotonic by construction, and removes any possibility of the stages
+            // pulling against each other on the way back to unity.
+            let total = self.contributions().total_db;
+            self.slow.reset(total);
+            self.mid.reset(0.0);
+            self.fast.reset(0.0);
+        }
         self.releasing = true;
+        self.interview_release = interview;
         self.release_speedup = if interview { INTERVIEW_RELEASE_SPEEDUP } else { 1.0 };
 
-        // Hold the current reduction through short gaps before letting go at all. Interview
-        // passthrough deliberately skips the hold - its whole purpose is to get back to unity
-        // quickly.
-        self.hold_blocks_release = self.hold_remaining_seconds > 0.0 && !interview;
-        if self.hold_blocks_release {
-            self.hold_remaining_seconds -= dt_seconds;
-            return;
-        }
+        // Advance the ease-in. Recovery is never blocked outright; it simply starts far too slowly
+        // to hear and accelerates from there (see `HOLD_RELEASE_STRETCH`).
+        self.hold_remaining_seconds = (self.hold_remaining_seconds - dt_seconds).max(0.0);
 
         let (attack, release) = self.scaled(SLOW);
         self.slow.process(0.0, attack, release, dt_seconds);
-        let (attack, release) = self.scaled(MID);
-        self.mid.process(0.0, attack, release, dt_seconds);
     }
 
     /// Current per-stage and total reduction in dB. The total is clamped to the configured ceiling
@@ -245,7 +280,7 @@ impl LoopBank {
         self.fast.reset(0.0);
         self.hold_remaining_seconds = 0.0;
         self.releasing = false;
-        self.hold_blocks_release = false;
+        self.interview_release = false;
         self.release_speedup = 1.0;
     }
 }

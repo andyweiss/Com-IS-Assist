@@ -31,7 +31,7 @@ How *fast* each of those happens is set by **Speed**, not by per-state times.
 0 -12 dB defines how many LUFS the com has to be on top of the IS
 
 # Speed
-How quickly the mixer responds, as a single control. There are no separate attack/release times any more: the leveling is built from three control loops at different speeds (a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges), and the resulting attack and release behaviour emerges from how they interact. Long and gentle when the programme is steady, very quick when something jumps. Speed scales all three together: raise it if the mix feels sluggish, lower it if it breathes.
+How quickly the mixer responds, as a single control. There are no separate attack/release times: the leveling is built from three control loops at different speeds (a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges), and the resulting attack and release behaviour emerges from how they interact. Long and gentle when the programme is steady, very quick when something jumps. Speed scales all three together: raise it if the mix feels sluggish, lower it if it breathes.
 
 # Over-voice ratio
 The distance required when Comm *and* IS both have voice (a possible over-voice situation, e.g. commentary over an interview or a speaking crowd mic). An absolute value, not an offset on Com/IS distance, and normally set higher than it so the commentator stays intelligible over the competing voice.

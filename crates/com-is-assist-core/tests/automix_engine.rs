@@ -218,49 +218,106 @@ fn no_voice_anywhere_releases_toward_unity() {
     assert!(released < 1.0, "expected release toward unity, was {established}dB, now {released}dB");
 }
 
-/// Short gaps must not swell the Bed: measured commentary pauses run ~1.2s, and the cascade holds
-/// before releasing at all (see `LoopBank`'s RELEASE_HOLD_SECONDS).
+/// Short gaps must not swell the Bed: measured commentary pauses run ~1.2s. Recovery is no longer
+/// blocked outright (a hard freeze put an audible corner in the gain curve - see
+/// `LoopBank::HOLD_RELEASE_STRETCH`); it simply begins far too slowly to hear.
 #[test]
-fn a_short_gap_does_not_start_releasing() {
+fn a_short_gap_recovers_only_negligibly() {
     let mut engine = engine_with(AutomixEngineConfig::default());
     let established = run(&mut engine, 400, snapshot(-20.0, -26.0), true, false);
 
-    // 500ms of silence - inside the hold.
+    // 500ms of silence.
     let after_gap = run(&mut engine, 5, snapshot(-20.0, -100.0), false, false);
+    let recovered_fraction = (established - after_gap) / established;
     assert!(
-        (after_gap - established).abs() < 0.01,
-        "a 500ms gap released from {established}dB to {after_gap}dB"
+        recovered_fraction < 0.05,
+        "a 500ms gap recovered {:.1}% of the reduction ({established}dB -> {after_gap}dB)",
+        recovered_fraction * 100.0
     );
 }
 
-/// The hold must freeze the **whole** cascade, not just the stages that happen to be stepped from
-/// the control tick. The fast stage steps from the audio path instead, and originally carried on
-/// decaying through the hold - measured as up to 1.25dB of unintended recovery inside the hold
-/// window on real commentary, and up to its full authority in the worst case.
+/// Release must **never** increase the reduction. The cascade's mid stage is a *signed* trim and is
+/// frequently negative while ducking, so releasing each stage independently toward zero drove a
+/// negative mid stage upward - which adds reduction, ducking the Bed harder at the exact moment the
+/// commentator stopped (+0.6dB on real commentary). Release now collapses the cascade into one
+/// value first, making recovery monotonic by construction.
 #[test]
-fn the_release_hold_freezes_the_fast_stage_too() {
+fn release_never_adds_reduction_even_with_a_negative_mid_stage() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+
+    // Bed momentary far quieter than its short-term reading drives the mid stage negative.
+    let negative_mid = LoudnessSnapshot {
+        bed_short_term_lufs: -20.0,
+        bed_momentary_lufs: -30.0,
+        dialogue_short_term_lufs: -26.0,
+    };
+    run(&mut engine, 400, negative_mid, true, false);
+    assert!(
+        engine.contributions().mid_db < -0.5,
+        "setup failed: expected a negative mid stage, got {:?}",
+        engine.contributions()
+    );
+
+    // Now release, watching every tick.
+    let mut previous = engine.current_gain_reduction_db();
+    for _ in 0..200 {
+        let value = engine
+            .process_tick(snapshot(-20.0, -100.0), false, false, TICK)
+            .gain_reduction_db;
+        assert!(
+            value <= previous + 1e-9,
+            "reduction rose during release: {previous}dB -> {value}dB"
+        );
+        previous = value;
+    }
+}
+
+/// Release must ease in rather than step. A hard freeze followed by a normal release produced a
+/// discontinuity in the *rate* of change - measured as exactly 0.000dB/tick for 0.8s and then
+/// -0.48dB/tick - which is audible as "nothing happens, then it moves".
+#[test]
+fn release_eases_in_rather_than_starting_abruptly() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    run(&mut engine, 400, snapshot(-20.0, -26.0), true, false);
+
+    let quiet = snapshot(-20.0, -100.0);
+    let mut values = vec![engine.current_gain_reduction_db()];
+    for _ in 0..25 {
+        values.push(engine.process_tick(quiet, false, false, TICK).gain_reduction_db);
+    }
+    let step = |i: usize| values[i] - values[i + 1];
+
+    let first = step(0);
+    let later = step(15);
+    assert!(first > 0.0, "release must actually begin, not freeze: first step {first}dB");
+    assert!(
+        first < later * 0.25,
+        "release should start far slower than it ends - first step {first}dB vs {later}dB later"
+    );
+}
+
+/// Collapsing the cascade at the start of a release must preserve the gain exactly - the fold is
+/// a bookkeeping change, not an audible one.
+#[test]
+fn collapsing_the_cascade_into_one_stage_does_not_move_the_gain() {
     let mut engine = engine_with(AutomixEngineConfig::default());
     let snap = snapshot(-20.0, -26.0);
     run(&mut engine, 400, snap, true, false);
-
-    // Drive the fast stage up with a Bed surge, so it has something to leak.
     for _ in 0..200 {
         engine.process_fast(0.0, -26.0, 0.0013);
     }
-    let fast_before = engine.contributions().fast_db;
-    assert!(fast_before > 0.5, "sanity: fast stage should have engaged, got {fast_before}dB");
+    let before = engine.current_gain_reduction_db();
+    let contributions = engine.contributions();
+    assert!(contributions.fast_db > 0.5, "setup: expected an engaged fast stage, got {contributions:?}");
 
-    // COM goes quiet. Inside the hold, nothing may move - including the fast stage, even though it
-    // is stepped from the audio path many times per control tick.
-    engine.process_tick(snapshot(-20.0, -100.0), false, false, TICK);
-    for _ in 0..200 {
-        engine.process_fast(0.0, -100.0, 0.0013);
-    }
-
+    // First release tick: the stages fold into one, but the total must be unchanged beyond the
+    // tiny amount this tick's own (heavily eased-in) release accounts for.
+    let after = engine
+        .process_tick(snapshot(-20.0, -100.0), false, false, TICK)
+        .gain_reduction_db;
     assert!(
-        (engine.contributions().fast_db - fast_before).abs() < 1e-9,
-        "fast stage leaked from {fast_before}dB to {}dB during the hold",
-        engine.contributions().fast_db
+        (before - after) < 0.05,
+        "the fold moved the gain: {before}dB -> {after}dB"
     );
 }
 

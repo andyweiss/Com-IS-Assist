@@ -1,13 +1,11 @@
-/// Applies a linearly-interpolated gain across one tick's interleaved audio, instead of a single
-/// flat scalar for the whole block.
+/// Applies a linearly-interpolated gain across one chunk of interleaved audio, instead of a single
+/// flat scalar.
 ///
-/// `AutomixEngine`/`GainComputer` only decide one gain value per ~100ms tick, but multiplying an
-/// entire tick's samples by a single constant produces a hard step in amplitude at every tick
-/// boundary whenever the gain is changing between ticks (i.e. during essentially any attack or
-/// release) - audible as a "zipper"/clicking artifact repeating every tick. Ramping linearly from
-/// `gain_start` (the value the previous tick's ramp ended on) to `gain_end` (this tick's newly
-/// computed target) removes the discontinuity while still reaching exactly `gain_end` by the last
-/// frame, so the next tick can continue the ramp from there with no seam.
+/// The gain is recomputed once per audio sub-chunk (see `AutomixProcessor::process_bed`), and
+/// multiplying a whole chunk by one constant would produce a hard step in amplitude at every chunk
+/// boundary whenever the gain is moving - audible as a "zipper"/clicking artifact. Ramping linearly
+/// from `gain_start` (where the previous chunk ended) to `gain_end` removes the discontinuity while
+/// still arriving at exactly `gain_end` on the last frame, so the next chunk continues with no seam.
 pub fn apply_ramped_gain(samples: &mut [f32], channels: u32, gain_start: f32, gain_end: f32) {
     let channels = channels as usize;
     if channels == 0 || samples.is_empty() {
@@ -30,86 +28,9 @@ pub fn apply_ramped_gain(samples: &mut [f32], channels: u32, gain_start: f32, ga
     }
 }
 
-/// The instantaneous gain at `frame` frames into an overall ramp from `start_gain` (at frame 0)
-/// to `end_gain` (at frame `total_frames`). `frame` is clamped to `total_frames`, so querying past
-/// the ramp's end just holds at `end_gain` - callers don't need to special-case "ramp already
-/// finished."
-///
-/// Unlike [`apply_ramped_gain`] (which always ramps across exactly the one block it's given),
-/// this lets a single logical ramp span many smaller, independently-sized chunks as they arrive
-/// (a streaming/low-latency caller doesn't get to choose "the whole tick" as one block) - each
-/// chunk just needs to know its own starting offset into the overall ramp.
-pub fn ramp_value_at(start_gain: f32, end_gain: f32, frame: u64, total_frames: u64) -> f32 {
-    if total_frames == 0 {
-        return end_gain;
-    }
-    let t = frame.min(total_frames) as f32 / total_frames as f32;
-    start_gain + (end_gain - start_gain) * t
-}
-
-/// Applies part of an overall ramp (see [`ramp_value_at`]) to one chunk of interleaved audio,
-/// where `chunk_start_frame` is this chunk's own offset into that ramp. Advancing
-/// `chunk_start_frame` by each chunk's frame count across successive calls reproduces the same
-/// smooth ramp [`apply_ramped_gain`] would produce for one whole block, without requiring the
-/// caller to buffer a full tick before applying any gain at all.
-pub fn apply_ramped_gain_at(
-    samples: &mut [f32],
-    channels: u32,
-    start_gain: f32,
-    end_gain: f32,
-    chunk_start_frame: u64,
-    total_frames: u64,
-) {
-    let channels = channels as usize;
-    if channels == 0 || samples.is_empty() {
-        return;
-    }
-    let frame_count = samples.len() / channels;
-    for frame in 0..frame_count {
-        let gain = ramp_value_at(start_gain, end_gain, chunk_start_frame + frame as u64, total_frames);
-        for channel in 0..channels {
-            samples[frame * channels + channel] *= gain;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ramp_value_matches_a_whole_block_ramp_at_the_endpoints() {
-        assert_eq!(ramp_value_at(0.0, 1.0, 0, 10), 0.0);
-        assert_eq!(ramp_value_at(0.0, 1.0, 10, 10), 1.0);
-        assert_eq!(ramp_value_at(0.0, 1.0, 5, 10), 0.5);
-    }
-
-    #[test]
-    fn ramp_value_holds_at_end_gain_past_the_ramp() {
-        assert_eq!(ramp_value_at(0.0, 1.0, 15, 10), 1.0);
-    }
-
-    #[test]
-    fn ramp_value_with_zero_total_frames_uses_end_gain() {
-        assert_eq!(ramp_value_at(0.0, 1.0, 0, 0), 1.0);
-    }
-
-    #[test]
-    fn chunked_ramp_matches_a_single_whole_block_ramp() {
-        let mut whole = vec![1.0_f32; 10]; // mono, 10 frames, one call
-        apply_ramped_gain_at(&mut whole, 1, 0.0, 1.0, 0, 10);
-
-        // Same overall ramp, split across three independently-sized chunks arriving separately.
-        let mut chunk_a = vec![1.0_f32; 3];
-        let mut chunk_b = vec![1.0_f32; 4];
-        let mut chunk_c = vec![1.0_f32; 3];
-        apply_ramped_gain_at(&mut chunk_a, 1, 0.0, 1.0, 0, 10);
-        apply_ramped_gain_at(&mut chunk_b, 1, 0.0, 1.0, 3, 10);
-        apply_ramped_gain_at(&mut chunk_c, 1, 0.0, 1.0, 7, 10);
-        let chunked: Vec<f32> = chunk_a.into_iter().chain(chunk_b).chain(chunk_c).collect();
-
-        assert_eq!(whole, chunked);
-    }
 
     #[test]
     fn ramps_linearly_from_start_to_end_across_the_block() {

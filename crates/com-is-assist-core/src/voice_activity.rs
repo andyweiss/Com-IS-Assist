@@ -102,8 +102,8 @@ impl Default for VoiceActivityConfig {
 
 /// Real voice-activity detection on a mono audio stream, via Silero VAD (a small recurrent ONNX
 /// model) run through `ort`. Replaces the LUFS-floor "is COM currently silent?" stand-in
-/// `RatioEngine` used before this existed (`Specs/TechnicalConcept.md` section 5 always flagged
-/// that as temporary) - a loud non-speech noise (room tone, static, another open mic) no longer
+/// the automix control loop used before this existed (`Specs/TechnicalConcept.md` section 5 always
+/// flagged that as temporary) - a loud non-speech noise (room tone, static, another open mic) no longer
 /// gets treated as "the target dialogue is present," which the LUFS floor couldn't distinguish.
 pub struct SileroVad {
     session: Session,

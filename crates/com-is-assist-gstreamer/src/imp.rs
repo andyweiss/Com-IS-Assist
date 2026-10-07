@@ -63,7 +63,7 @@ fn ranged_audio_caps(min_channels: i32, max_channels: i32) -> gst::Caps {
         .field("format", "F32LE")
         .field("layout", "interleaved")
         .field("rate", SAMPLE_RATE as i32)
-        .field("channels", &gst::IntRange::<i32>::new(min_channels, max_channels))
+        .field("channels", gst::IntRange::<i32>::new(min_channels, max_channels))
         .build()
 }
 
@@ -423,7 +423,7 @@ impl ComISAssist {
     /// chunk processing) that need the latest reading but have no Dialogue audio of their own to
     /// feed this call. Fails open (`true`) if VAD wasn't constructed, same as `feed_voice_activity`.
     fn voice_active(&self) -> bool {
-        lock_recover(&self.voice_activity).as_ref().map_or(true, |vad| vad.voice_active())
+        lock_recover(&self.voice_activity).as_ref().is_none_or(|vad| vad.voice_active())
     }
 
     /// Feeds one chunk of *dry* Bed audio into `is_voice_activity`, downmixed to mono (Silero is a
@@ -527,8 +527,9 @@ impl ComISAssist {
     /// Forwards one incoming Bed chunk (whatever size the upstream delivered) to `is_leveled_src`
     /// immediately, after applying this element's continuous gain ramp - no waiting for a full
     /// tick to accumulate first (see the module doc comment on latency/control-rate decoupling).
-    /// Also feeds the (already-gained) chunk into `bed_meter` and the mix-alignment buffer, and
-    /// gives the control step a chance to run.
+    /// `process_bed` measures the *dry* chunk before gaining it (feed-forward - see
+    /// `Specs/TechnicalConcept.md` section 4), and the gained result goes on to the mix-alignment
+    /// buffer. Also gives the control step a chance to run.
     ///
     /// `state` must already be `Some` by the time this runs: GStreamer guarantees Bed's own Caps
     /// event precedes Bed's own first buffer, and `handle_bed_caps` constructs `state` right then.

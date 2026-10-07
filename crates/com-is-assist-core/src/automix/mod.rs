@@ -13,5 +13,5 @@ pub use loop_bank::{LoopBank, LoopBankConfig, LoopContributions};
 pub use mix_state::MixState;
 pub use dialogue_mix::{bed_lrc_channels, mix_dialogue_into_bed};
 pub use envelope_detector::EnvelopeDetector;
-pub use gain_ramp::{apply_ramped_gain, apply_ramped_gain_at, ramp_value_at};
+pub use gain_ramp::apply_ramped_gain;
 pub use processor::AutomixProcessor;

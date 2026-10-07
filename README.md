@@ -6,17 +6,31 @@ A realtime broadcast mix assist/ automixer that ducks an International Sound "Be
 
 Ships as two thin wrappers around one shared Rust DSP core:
 - A **GStreamer element** (`comisassist`) — the primary broadcast deployment target. Bed is 2-6ch, dynamically negotiated via caps.
-- A **VST3 plugin** (`Com-IS-Assist`) — for DAW-based testing and validation against the original JSFX meter in Reaper. Fixed 8-channel bus (6ch Bed + mono Dialogue + 1 unused), with a mix/duck-only toggle and a minimal live gain-reduction meter GUI.
+- A **VST3 plugin** (`Com-IS-Assist`) — for DAW-based testing and validation against the original JSFX meter in Reaper. Fixed 8-channel bus (6ch Bed + mono Dialogue + 1 unused), with a mix/duck-only toggle and a live meter GUI (gain reduction, IS/COM loudness, ratio, both voice LEDs, current state and per-stage loop contributions).
 
 ## How it works
 
-The plugin measures the short-term BS.1770 loudness of both the Bed and the Dialogue signal, computes their ratio, and — if the ratio drifts outside a configurable tolerance band — smoothly reduces Bed gain (fast attack, hold, slow recovery) until the target ratio is restored. The Bed loudness meter observes the *already-gained* signal (a closed control loop), matching how the ratio behaves on-air. Dialogue is never gained — only measured and, optionally, mixed back into the Bed's Left/Center/Right channels via a "voice divergence" equal-power pan law (Center-only at 0% up to split-L/R at 100%), shared by both wrappers.
+Two voice-activity detectors — one on the Dialogue (COM), one on the Bed (IS) — select one of four states, and that state alone decides what the mixer does:
+
+| Voice on COM | Voice on IS | What happens |
+|---|---|---|
+| no | no | Bed recovers to unity |
+| yes | no | Bed is ducked until the **target ratio** is met |
+| no | yes | Bed recovers to unity *faster* (something on the Bed is worth hearing) |
+| yes | yes | Bed is ducked until the higher **over-voice ratio** is met |
+
+How much to duck is computed **feed-forward** from the dry signals. Because reducing the Bed by 1 dB raises the COM/IS ratio by exactly 1 LU, the required reduction is simply `target − (COM − BED)` — no feedback loop, so no windup and no pumping.
+
+That reduction is applied by three cascaded gain stages whose detectors see the Bed at different speeds (3 s short-term, 400 ms momentary, and a ~50 ms K-weighted detector run at audio-block rate), their reductions adding in dB. Attack and release are not configured but **emerge** from how the stages interact: long and gentle when the programme is steady, very fast when the Bed surges. A single **Speed** control scales them together.
+
+Dialogue is never gained or delayed — only measured and, optionally, mixed back into the Bed's Left/Center/Right channels via a "voice divergence" equal-power pan law (Center-only at 0% up to split-L/R at 100%). Neither wrapper adds any latency.
 
 ## Repository layout
 
 ```
 crates/
-  com-is-assist-core/        # shared DSP: loudness metering (ebur128), ratio engine, gain computer
+  com-is-assist-core/        # shared DSP: loudness metering (ebur128), voice activity (Silero),
+                             #   the 4-state machine and the multi-loop gain cascade
   com-is-assist-gstreamer/   # GStreamer element (cdylib, built via cargo-c)
   com-is-assist-vst3/        # VST3 plugin (nih-plug)
   com-is-assist-offline/     # CLI tool: WAV(bed) + WAV(dialogue) -> CSV metrics + rendered WAVs
