@@ -1,297 +1,317 @@
-use com_is_assist_core::automix::{AutomixEngine, AutomixEngineConfig, AutomixResult, GainComputerConfig};
-use com_is_assist_core::ratio::RatioResult;
+use com_is_assist_core::automix::{AutomixEngine, AutomixEngineConfig, LoudnessSnapshot, MixState};
 
-const TICK_SECONDS: f64 = 0.1;
+const TICK: f64 = 0.1;
 
-fn fast_engine() -> AutomixEngine {
-    // Fast attack/release so tests converge in a small, bounded number of ticks.
-    AutomixEngine::new(
-        AutomixEngineConfig::default(),
-        GainComputerConfig {
-            attack_seconds: 0.05,
-            hold_seconds: 0.0,
-            release_seconds: 0.2,
-            max_rate_db_per_s: None,
-        },
-        TICK_SECONDS,
-    )
+fn engine_with(config: AutomixEngineConfig) -> AutomixEngine {
+    AutomixEngine::new(config)
 }
 
-#[test]
-fn holds_at_unity_when_ratio_is_within_the_tolerance_band() {
-    let mut engine = fast_engine();
-    let config = AutomixEngineConfig::default();
-
-    let mut result = engine.process_tick(RatioResult {
-        ratio_lu: config.target_ratio_lu,
-        valid: true,
-        voice_active: true,
-    });
-    for _ in 0..50 {
-        result = engine.process_tick(RatioResult {
-            ratio_lu: config.target_ratio_lu,
-            valid: true,
-            voice_active: true,
-        });
+/// A dry-signal snapshot where both Bed windows agree - the steady-state case.
+fn snapshot(bed_lufs: f64, dialogue_lufs: f64) -> LoudnessSnapshot {
+    LoudnessSnapshot {
+        bed_short_term_lufs: bed_lufs,
+        bed_momentary_lufs: bed_lufs,
+        dialogue_short_term_lufs: dialogue_lufs,
     }
-
-    assert_eq!(result.gain_reduction_db, 0.0);
-    assert_eq!(result.gain_linear, 1.0);
 }
 
-#[test]
-fn increases_reduction_when_ratio_is_below_the_lower_limit() {
-    let mut engine = fast_engine();
-    let config = AutomixEngineConfig::default();
-    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
-    let very_low_ratio = com_lo_lim - 10.0;
-
+/// Runs `ticks` control steps and returns the final reduction.
+fn run(engine: &mut AutomixEngine, ticks: usize, snap: LoudnessSnapshot, com: bool, is: bool) -> f64 {
     let mut last = 0.0;
-    for _ in 0..100 {
-        let result = engine.process_tick(RatioResult {
-            ratio_lu: very_low_ratio,
-            valid: true,
-            voice_active: true,
-        });
-        assert!(
-            result.gain_reduction_db >= last - 1e-9,
-            "reduction should never decrease while ratio stays below the lower limit"
-        );
-        last = result.gain_reduction_db;
+    for _ in 0..ticks {
+        last = engine.process_tick(snap, com, is, TICK).gain_reduction_db;
     }
-
-    assert!(last > 5.0, "expected meaningful reduction, got {last}dB");
+    last
 }
 
-#[test]
-fn releases_back_toward_unity_when_ratio_is_above_the_upper_limit() {
-    let mut engine = fast_engine();
-    let config = AutomixEngineConfig::default();
-    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
-    let com_hi_lim = config.target_ratio_lu + config.max_tolerance_lu;
-
-    // Build up some reduction first.
-    for _ in 0..100 {
-        engine.process_tick(RatioResult {
-            ratio_lu: com_lo_lim - 10.0,
-            valid: true,
-            voice_active: true,
-        });
-    }
-    let reduced = engine.current_gain_reduction_db();
-    assert!(reduced > 1.0);
-
-    // Now ratio is comfortably above the upper limit: reduction should ease back down.
-    for _ in 0..100 {
-        engine.process_tick(RatioResult {
-            ratio_lu: com_hi_lim + 10.0,
-            valid: true,
-            voice_active: true,
-        });
-    }
-    assert!(
-        engine.current_gain_reduction_db() < reduced - 1.0,
-        "expected reduction to release, was {reduced}dB, now {}dB",
-        engine.current_gain_reduction_db()
-    );
-}
+// ---------------------------------------------------------------------------
+// State selection (unchanged behaviour - the state machine survives the redesign intact)
+// ---------------------------------------------------------------------------
 
 #[test]
-fn invalid_ratio_holds_the_last_gain() {
-    // Isolates the "insufficient COM history to trust ratio_lu yet" gate (`valid == false`) from
-    // the separate "no voice detected at all" gate (`voice_active == false`, which now *releases*
-    // rather than holds - see `voice_inactive_releases_toward_unity_even_when_valid_latch_is_still_true`)
-    // by keeping `voice_active` true throughout: this is the realistic shape of that scenario -
-    // someone is actively talking, but not yet for the `valid_signal_hold_ticks` consecutive ticks
-    // required to trust the computed ratio number.
-    let mut engine = fast_engine();
-    let config = AutomixEngineConfig::default();
-    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
+fn each_vad_combination_selects_the_expected_state() {
+    let config = AutomixEngineConfig { interview_passthrough_enabled: true, ..Default::default() };
+    let snap = snapshot(-20.0, -20.0);
 
-    for _ in 0..100 {
-        engine.process_tick(RatioResult {
-            ratio_lu: com_lo_lim - 10.0,
-            valid: true,
-            voice_active: true,
-        });
-    }
-    let converged = engine.current_gain_reduction_db();
-
-    for _ in 0..50 {
-        let result = engine.process_tick(RatioResult {
-            ratio_lu: -100.0, // would otherwise look like an even bigger shortfall
-            valid: false,
-            voice_active: true,
-        });
-        assert_eq!(result.gain_reduction_db, converged);
+    let cases = [
+        (false, false, MixState::ReleaseToUnity),
+        (true, false, MixState::DuckToTarget),
+        (false, true, MixState::InterviewPassthrough),
+        (true, true, MixState::DuckToOvervoice),
+    ];
+    for (com, is, expected) in cases {
+        let mut engine = engine_with(config);
+        assert_eq!(engine.process_tick(snap, com, is, TICK).state, expected);
     }
 }
 
 #[test]
-fn voice_inactive_releases_toward_unity_even_when_valid_latch_is_still_true() {
-    // `valid` is a one-way latch (never reverts once true), so on its own it doesn't mean "COM
-    // has signal right now" - during a long gap after the first-ever speech burst it stays true
-    // while `ratio_lu` is a frozen, increasingly stale number. There's nothing to duck Bed *for*
-    // once COM stops talking, so `AutomixEngine` should release back toward unity (at the
-    // configured Recovery Time) rather than holding whatever reduction was applied when COM went
-    // quiet - and it should do so regardless of `valid` still being latched true.
-    let mut engine = fast_engine();
-    let config = AutomixEngineConfig::default();
-    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
-
-    for _ in 0..100 {
-        engine.process_tick(RatioResult {
-            ratio_lu: com_lo_lim - 10.0,
-            valid: true,
-            voice_active: true,
-        });
-    }
-    let converged = engine.current_gain_reduction_db();
-    assert!(converged > 1.0, "expected meaningful reduction to have built up, got {converged}dB");
-
-    let mut result = AutomixResult { gain_reduction_db: converged, gain_linear: 1.0 };
-    for _ in 0..50 {
-        result = engine.process_tick(RatioResult {
-            ratio_lu: com_lo_lim - 1000.0, // a stale, wildly-out-of-range held value
-            valid: true,                   // latch is still true...
-            voice_active: false,           // ...but no voice is detected right now
-        });
-    }
-    assert!(
-        result.gain_reduction_db < 1.0,
-        "expected reduction to release back toward unity, was {converged}dB, now {}dB",
-        result.gain_reduction_db
-    );
-}
-
-#[test]
-fn voice_onset_after_a_gap_immediately_resumes_the_pre_gap_reduction() {
-    // Regression test for real-world latency: without the fast trigger, RatioEngine needs several
-    // ticks after voice resumes before `held_ratio_lu` reflects fresh audio (on top of its own
-    // small hold-ticks debounce, short-term loudness has real integration time) - which meant Bed
-    // sat un-ducked for a noticeable stretch after *every* resumed utterance, not just the first
-    // one in a session. The fast trigger closes that gap: the instant voice comes back, the raw
-    // target should jump straight back to whatever it was converging to before the gap, not
-    // restart the "nudge, don't jump" ramp from 0.
-    let mut engine = fast_engine();
-    let config = AutomixEngineConfig::default();
-    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
-
-    // Converge to a real reduction while voice is active...
-    for _ in 0..100 {
-        engine.process_tick(RatioResult {
-            ratio_lu: com_lo_lim - 10.0,
-            valid: true,
-            voice_active: true,
-        });
-    }
-    let converged = engine.current_gain_reduction_db();
-    assert!(converged > 5.0, "expected meaningful reduction to have built up, got {converged}dB");
-
-    // ...then voice stops for a while (releases, per the test above)...
-    for _ in 0..50 {
-        engine.process_tick(RatioResult { ratio_lu: 0.0, valid: true, voice_active: false });
-    }
-    assert!(engine.current_gain_reduction_db() < 1.0, "expected a release to have happened during the gap");
-
-    // ...then voice resumes. Even on this very first tick back - before any fresh ratio reading
-    // could possibly have arrived - reduction should already be most of the way back to where it
-    // was, not starting over from unity.
-    let result = engine.process_tick(RatioResult {
-        ratio_lu: 0.0, // not yet refreshed with fresh audio - shouldn't matter for this tick
-        valid: true,
-        voice_active: true,
+fn interview_passthrough_disabled_makes_is_only_voice_an_ordinary_release() {
+    let mut engine = engine_with(AutomixEngineConfig {
+        interview_passthrough_enabled: false,
+        ..Default::default()
     });
+    let result = engine.process_tick(snapshot(-20.0, -20.0), false, true, TICK);
+    assert_eq!(result.state, MixState::ReleaseToUnity);
+}
+
+// ---------------------------------------------------------------------------
+// Feed-forward exactness - the property the whole redesign exists to obtain
+// ---------------------------------------------------------------------------
+
+/// Under the old feedback topology this test was impossible to write: the measured ratio already
+/// contained the applied reduction, so there was no independent "correct answer" to compare
+/// against. Feed-forward from the dry signals makes the required reduction exactly
+/// `target - (COM - BED)`, so the settled value is predictable in advance.
+#[test]
+fn settles_on_exactly_the_reduction_the_dry_levels_imply() {
+    let config = AutomixEngineConfig::default();
+    let mut engine = engine_with(config);
+
+    // Bed at -20, COM at -26: COM is 6 LU *below* Bed, target is +3, so 9 dB is required.
+    let snap = snapshot(-20.0, -26.0);
+    let settled = run(&mut engine, 400, snap, true, false);
+
     assert!(
-        result.gain_reduction_db > converged * 0.5,
-        "expected the fast trigger to resume close to the pre-gap {converged}dB immediately, got {}dB",
-        result.gain_reduction_db
+        (settled - 9.0).abs() < 0.1,
+        "expected exactly 9 dB (target 3 - ratio -6), got {settled}dB"
     );
+}
+
+#[test]
+fn over_voice_settles_on_its_own_higher_target() {
+    let config = AutomixEngineConfig::default();
+    let snap = snapshot(-20.0, -26.0); // ratio -6
+
+    let mut normal = engine_with(config);
+    let normal_db = run(&mut normal, 400, snap, true, false);
+
+    let mut over = engine_with(config);
+    let over_db = run(&mut over, 400, snap, true, true);
+
+    assert!((normal_db - (config.target_ratio_lu + 6.0)).abs() < 0.1, "got {normal_db}dB");
+    assert!((over_db - (config.overvoice_ratio_lu + 6.0)).abs() < 0.1, "got {over_db}dB");
+    assert!(over_db > normal_db + 1.0, "over-voice must duck harder");
+}
+
+#[test]
+fn never_boosts_when_com_is_already_above_target() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    // COM 10 LU above Bed, target 3 - no reduction is warranted, and automix never boosts.
+    let settled = run(&mut engine, 400, snapshot(-30.0, -20.0), true, false);
+    assert_eq!(settled, 0.0);
 }
 
 #[test]
 fn gain_reduction_never_exceeds_the_configured_maximum() {
-    let mut engine = fast_engine();
     let config = AutomixEngineConfig::default();
-    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
-
-    for _ in 0..500 {
-        let result = engine.process_tick(RatioResult {
-            ratio_lu: com_lo_lim - 1000.0, // absurdly large, persistent shortfall
-            valid: true,
-            voice_active: true,
-        });
-        assert!(result.gain_reduction_db <= config.max_gain_reduction_db + 1e-9);
-    }
+    let mut engine = engine_with(config);
+    let settled = run(&mut engine, 2000, snapshot(-10.0, -90.0), true, false);
+    assert!(settled <= config.max_gain_reduction_db + 1e-9, "got {settled}dB");
 }
 
+/// A reading at the silence sentinel is a placeholder, not a level. Acting on it would ask for an
+/// enormous reduction on the strength of a number that means "no data".
 #[test]
-fn set_config_raises_the_ceiling_for_a_wrapper_that_only_reads_params_once_at_construction() {
-    // Regression test: a host raising `max-gain-reduction-db` past its 24dB default (e.g. to
-    // 40dB) mid-session had no effect, because VST3's `initialize()` only ever read the
-    // parameter once, at construction - `AutomixEngine` kept using the config it was built with
-    // forever after. `set_config` is what a wrapper now calls every tick to keep it current.
-    let mut engine = fast_engine();
-    let config = AutomixEngineConfig::default();
-    let com_lo_lim = config.target_ratio_lu - config.min_tolerance_lu;
+fn a_silence_sentinel_reading_holds_rather_than_driving_the_gain() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    let established = run(&mut engine, 400, snapshot(-20.0, -26.0), true, false);
+    assert!(established > 1.0);
 
-    for _ in 0..500 {
-        engine.process_tick(RatioResult {
-            ratio_lu: com_lo_lim - 1000.0,
-            valid: true,
-            voice_active: true,
-        });
-    }
-    assert!((engine.current_gain_reduction_db() - config.max_gain_reduction_db).abs() < 1e-6);
-
-    let raised_config = AutomixEngineConfig {
-        max_gain_reduction_db: 40.0,
-        ..config
-    };
-    engine.set_config(raised_config, GainComputerConfig {
-        attack_seconds: 0.05,
-        hold_seconds: 0.0,
-        release_seconds: 0.2,
-        max_rate_db_per_s: None,
-    });
-
-    for _ in 0..500 {
-        engine.process_tick(RatioResult {
-            ratio_lu: com_lo_lim - 1000.0,
-            valid: true,
-            voice_active: true,
-        });
-    }
+    let silent = snapshot(-20.0, -100.0);
+    let after = run(&mut engine, 200, silent, true, false);
     assert!(
-        (engine.current_gain_reduction_db() - 40.0).abs() < 1e-6,
-        "expected the raised 40dB ceiling to take effect, got {}dB",
-        engine.current_gain_reduction_db()
+        (after - established).abs() < 0.01,
+        "sentinel reading moved the gain from {established}dB to {after}dB"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-loop behaviour
+// ---------------------------------------------------------------------------
+
+/// The mid stage may only trim the slow stage within its authority, so a momentary window that
+/// disagrees wildly with the short-term one cannot drag the total far.
+#[test]
+fn the_mid_stage_authority_bounds_how_far_momentary_can_pull_the_total() {
+    let config = AutomixEngineConfig::default();
+    let mut engine = engine_with(config);
+
+    // The Bed's short-term window says 9 dB is needed; its momentary window sees a far louder Bed
+    // (a surge) and would ask for much more.
+    let conflicting = LoudnessSnapshot {
+        bed_short_term_lufs: -20.0,
+        bed_momentary_lufs: 10.0,
+        dialogue_short_term_lufs: -26.0,
+    };
+    let settled = run(&mut engine, 600, conflicting, true, false);
+    let contributions = engine.contributions();
+
+    assert!(contributions.mid_db.abs() <= 6.0 + 1e-6, "mid stage exceeded its authority: {contributions:?}");
+    assert!(
+        settled <= 9.0 + 6.0 + 1e-6,
+        "total {settled}dB exceeds slow estimate plus mid authority"
+    );
+}
+
+/// The Speed macro is the only timing control left, so it has to do something measurable.
+///
+/// Measured early (200ms) deliberately: by ~800ms both settings have essentially arrived, because
+/// the mid stage rushes in to cover whatever the slow stage has not yet done. That masking is the
+/// cascade working as intended - it is also why "how fast is it?" has to be asked of the first few
+/// hundred milliseconds rather than of the settled value.
+#[test]
+fn a_higher_speed_setting_reacts_faster() {
+    let snap = snapshot(-20.0, -26.0);
+    let mut slow = engine_with(AutomixEngineConfig { speed: 0.5, ..Default::default() });
+    let mut fast = engine_with(AutomixEngineConfig { speed: 4.0, ..Default::default() });
+
+    let slow_db = run(&mut slow, 2, snap, true, false);
+    let fast_db = run(&mut fast, 2, snap, true, false);
+
+    assert!(
+        fast_db > slow_db * 1.5,
+        "after 200ms speed 4.0 reached {fast_db}dB where speed 0.5 reached {slow_db}dB"
+    );
+}
+
+/// Both settings must still converge on the same place - Speed changes how quickly the mixer gets
+/// there, never where "there" is. (Feed-forward is what makes that separation clean.)
+#[test]
+fn speed_changes_the_journey_not_the_destination() {
+    let snap = snapshot(-20.0, -26.0);
+    let mut slow = engine_with(AutomixEngineConfig { speed: 0.5, ..Default::default() });
+    let mut fast = engine_with(AutomixEngineConfig { speed: 4.0, ..Default::default() });
+
+    let slow_db = run(&mut slow, 600, snap, true, false);
+    let fast_db = run(&mut fast, 600, snap, true, false);
+
+    assert!((slow_db - fast_db).abs() < 0.1, "settled at {slow_db}dB vs {fast_db}dB");
+    assert!((slow_db - 9.0).abs() < 0.1, "both should land on the dry-level answer, got {slow_db}dB");
+}
+
+/// Adaptive ballistics: the fast stage must move long before the slow stage has, which is the
+/// whole justification for a cascade rather than one envelope.
+#[test]
+fn the_fast_stage_responds_before_the_slow_stage_has_moved() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    // Establish the ducking state without letting the slow stage build anything yet.
+    engine.process_tick(snapshot(-20.0, -20.0), true, false, TICK);
+
+    // 20ms of fast-stage stepping against dry levels needing a large reduction.
+    for _ in 0..15 {
+        engine.process_fast(-20.0, -32.0, 0.0013);
+    }
+
+    let contributions = engine.contributions();
+    assert!(
+        contributions.fast_db > 0.5,
+        "fast stage should have moved within 20ms, got {contributions:?}"
+    );
+    assert!(
+        contributions.fast_db <= 6.0 + 1e-6,
+        "fast stage exceeded its authority: {contributions:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Release behaviour
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_voice_anywhere_releases_toward_unity() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    let established = run(&mut engine, 400, snapshot(-20.0, -26.0), true, false);
+    assert!(established > 1.0);
+
+    let released = run(&mut engine, 400, snapshot(-20.0, -100.0), false, false);
+    assert!(released < 1.0, "expected release toward unity, was {established}dB, now {released}dB");
+}
+
+/// Short gaps must not swell the Bed: measured commentary pauses run ~1.2s, and the cascade holds
+/// before releasing at all (see `LoopBank`'s RELEASE_HOLD_SECONDS).
+#[test]
+fn a_short_gap_does_not_start_releasing() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    let established = run(&mut engine, 400, snapshot(-20.0, -26.0), true, false);
+
+    // 500ms of silence - inside the hold.
+    let after_gap = run(&mut engine, 5, snapshot(-20.0, -100.0), false, false);
+    assert!(
+        (after_gap - established).abs() < 0.01,
+        "a 500ms gap released from {established}dB to {after_gap}dB"
     );
 }
 
 #[test]
-fn seed_target_reduction_db_lets_a_vad_onset_trigger_an_immediate_attack() {
-    let mut engine = fast_engine();
+fn interview_passthrough_recovers_faster_than_an_ordinary_release() {
+    let config = AutomixEngineConfig { interview_passthrough_enabled: true, ..Default::default() };
+    let quiet = snapshot(-20.0, -100.0);
 
-    // Prime `was_voice_active` first, so the seed below doesn't itself land on a fresh
-    // false→true onset tick - `process_tick`'s own automatic fast-trigger would otherwise
-    // immediately overwrite the seeded value with `last_active_target_reduction_db` (0.0, since
-    // none has ever been recorded yet), defeating the seed before it can be exercised.
-    engine.process_tick(RatioResult { ratio_lu: 0.0, valid: false, voice_active: true });
+    let mut ordinary = engine_with(config);
+    let start = run(&mut ordinary, 400, snapshot(-20.0, -26.0), true, false);
+    let ordinary_after = run(&mut ordinary, 20, quiet, false, false);
 
-    engine.seed_target_reduction_db(6.0);
+    let mut interview = engine_with(config);
+    let interview_start = run(&mut interview, 400, snapshot(-20.0, -26.0), true, false);
+    let interview_after = run(&mut interview, 20, quiet, false, true);
 
-    // No *valid* ratio ticks needed - the envelope should still chase the seeded target. But
-    // `voice_active` must stay true here: `voice_active == false` now unconditionally releases
-    // the raw target back to 0 (see `process_tick`'s doc comment), which would immediately erase
-    // the seeded value rather than exercising it.
-    for _ in 0..50 {
-        engine.process_tick(RatioResult {
-            ratio_lu: 0.0,
-            valid: false,
-            voice_active: true,
-        });
+    assert!((start - interview_start).abs() < 1e-9, "both must start from the same reduction");
+    assert!(
+        interview_after < ordinary_after,
+        "interview recovered to {interview_after}dB, ordinary release only to {ordinary_after}dB"
+    );
+}
+
+/// After a gap the mixer must re-engage quickly, but **without** an instantaneous jump.
+///
+/// The feedback design achieved the first by seeding the envelope on voice onset, which produced a
+/// ~19dB step in a single tick. Feed-forward needs no seed - the dry levels are already correct -
+/// and the cascade covers the onset with its faster stages, so the gain climbs quickly but
+/// continuously. This test pins both halves of that: fast re-engagement, no step.
+#[test]
+fn re_engages_quickly_after_a_gap_without_an_instantaneous_jump() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    let snap = snapshot(-20.0, -26.0); // 9 dB required
+    let established = run(&mut engine, 400, snap, true, false);
+    assert!(established > 1.0);
+
+    let released = run(&mut engine, 600, snapshot(-20.0, -100.0), false, false);
+    assert!(released < 1.0, "expected a full release during the gap");
+
+    // Step back into speech, watching every tick.
+    let mut previous = released;
+    let mut max_step: f64 = 0.0;
+    let mut after_300ms = 0.0;
+    for tick in 0..3 {
+        let value = engine.process_tick(snap, true, false, TICK).gain_reduction_db;
+        max_step = max_step.max((value - previous).abs());
+        previous = value;
+        if tick == 2 {
+            after_300ms = value;
+        }
     }
 
-    assert!(engine.current_gain_reduction_db() > 5.0);
+    assert!(
+        after_300ms > established * 0.5,
+        "expected the cascade to recover past half of {established}dB within 300ms, got {after_300ms}dB"
+    );
+    assert!(
+        max_step < established * 0.75,
+        "re-engagement stepped {max_step}dB in one tick - it should climb continuously"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live reconfiguration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_config_applies_a_lowered_ceiling_live() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    run(&mut engine, 2000, snapshot(-10.0, -90.0), true, false);
+
+    engine.set_config(AutomixEngineConfig { max_gain_reduction_db: 6.0, ..Default::default() });
+    let after = run(&mut engine, 400, snapshot(-10.0, -90.0), true, false);
+    assert!(after <= 6.0 + 1e-6, "ceiling not applied: {after}dB");
 }

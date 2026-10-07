@@ -19,14 +19,14 @@
 // regardless of this toggle.
 
 use atomic_float::AtomicF32;
-use com_is_assist_core::automix::{mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, GainComputerConfig};
+use com_is_assist_core::automix::{mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, MixState};
 use com_is_assist_core::loudness::Ebur128Meter;
 use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use nih_plug::prelude::*;
 use nih_plug_egui::widgets::ParamSlider;
 use nih_plug_egui::{create_egui_editor, egui, resizable_window::ResizableWindow, EguiState};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 const BED_CHANNELS: u32 = 6;
@@ -39,8 +39,6 @@ const LEFT_CHANNEL: usize = 0;
 const RIGHT_CHANNEL: usize = 1;
 const CENTER_CHANNEL: usize = 2;
 const TICK_SECONDS: f64 = 0.1;
-const MIN_TIME_MS: f32 = 1.0;
-const MAX_TIME_MS: f32 = 5000.0;
 
 struct ComISAssist {
     params: Arc<ComISAssistParams>,
@@ -55,6 +53,13 @@ struct ComISAssist {
     /// can fail open (treat COM as always voice-active, matching the old pre-VAD behavior) rather
     /// than silently never ducking at all.
     voice_activity: Option<SileroVad>,
+    /// The second, Bed-side voice-activity detector (`Specs/UI.md`'s "voice detector IS"). Fed a
+    /// mono downmix of the dry Bed; together with `voice_activity` above it selects the automix
+    /// state (`com_is_assist_core::automix::MixState`) - which is what makes the interview
+    /// passthrough and over-voice cases possible at all. `None` on the same fail-open terms as the
+    /// COM detector, in which case IS is treated as never having voice (i.e. only the ordinary
+    /// release/duck states can be reached).
+    is_voice_activity: Option<SileroVad>,
     /// Live R128/gain-reduction readouts, shared between the audio thread (`process()`, writer)
     /// and the GUI thread (`editor()`, reader). This is the one thing `nih-plug` genuinely
     /// requires a custom GUI for - its parameter setter is deliberately private, so a plugin
@@ -81,6 +86,18 @@ struct Meters {
     /// Real voice-activity-detection state, for the GUI's "Voice activity Comm" indicator
     /// (`Specs/UI.md`'s originally-planned LED, blocked until real VAD existed).
     voice_active: AtomicBool,
+    /// The Bed-side equivalent, for `Specs/UI.md`'s "Voice activity IS" LED.
+    is_voice_active: AtomicBool,
+    /// The current `MixState`, as its `u8` discriminant (see `mix_state_index`/`MIX_STATE_LABELS`).
+    /// An `AtomicU8` because the state machine's current state is the single most useful thing to
+    /// show when the question is "why is it doing that right now?".
+    mix_state: AtomicU8,
+    /// What each loop stage is contributing, in dB. The three have visibly different characters -
+    /// slow carries the programme balance, mid tracks phrases, fast catches onsets - so seeing the
+    /// split is the quickest way to tell *which* of them is responsible for what you are hearing.
+    slow_db: AtomicF32,
+    mid_db: AtomicF32,
+    fast_db: AtomicF32,
 }
 
 impl Meters {
@@ -93,7 +110,24 @@ impl Meters {
             bed_momentary_lufs: AtomicF32::new(silence),
             dialogue_momentary_lufs: AtomicF32::new(silence),
             voice_active: AtomicBool::new(false),
+            is_voice_active: AtomicBool::new(false),
+            mix_state: AtomicU8::new(0),
+            slow_db: AtomicF32::new(0.0),
+            mid_db: AtomicF32::new(0.0),
+            fast_db: AtomicF32::new(0.0),
         }
+    }
+}
+
+/// Display names for each `MixState`, indexed by `mix_state_index`.
+const MIX_STATE_LABELS: [&str; 4] = ["Release", "Duck \u{2192} target", "Interview passthrough", "Duck \u{2192} over-voice"];
+
+fn mix_state_index(state: MixState) -> u8 {
+    match state {
+        MixState::ReleaseToUnity => 0,
+        MixState::DuckToTarget => 1,
+        MixState::InterviewPassthrough => 2,
+        MixState::DuckToOvervoice => 3,
     }
 }
 
@@ -101,15 +135,30 @@ impl Meters {
 struct ComISAssistParams {
     #[id = "target-ratio"]
     pub target_ratio: FloatParam,
+    /// The higher ratio COM must clear while *both* COM and IS carry voice (the "over-voice"
+    /// double-talk case - `MixState::DuckToOvervoice`). An absolute target, independent of
+    /// `target_ratio`, so the two situations can be dialed in separately by ear.
+    #[id = "overvoice-ratio"]
+    pub overvoice_ratio: FloatParam,
     #[id = "max-gain-reduction-db"]
     pub max_gain_reduction_db: FloatParam,
-    /// Milliseconds, not seconds - see the module doc comment and `MIN_TIME_MS`/`MAX_TIME_MS`.
-    #[id = "attack-ms"]
-    pub attack_ms: FloatParam,
-    #[id = "hold-ms"]
-    pub hold_ms: FloatParam,
-    #[id = "release-ms"]
-    pub release_ms: FloatParam,
+    /// "Speed" - the single timing control. Scales every loop stage's ballistics together.
+    /// Replaces the five separate time parameters the old single-loop design needed: with the
+    /// multi-loop cascade the effective attack and release are emergent, so there is nothing
+    /// meaningful left for individual times to set. Raise it if the mixer feels sluggish, lower it
+    /// if it breathes.
+    #[id = "speed"]
+    pub speed: FloatParam,
+    /// Lookahead in milliseconds, default 0. Non-zero delays both Bed and Dialogue so the loops can
+    /// act on a transient before it reaches the output, and the plugin reports the delay to the
+    /// host as latency.
+    #[id = "lookahead-ms"]
+    pub lookahead_ms: FloatParam,
+    /// Enables the interview-passthrough state at all. Off by default: a loud PA or stadium
+    /// announcement also reads as "voice on IS", and recovering the Bed fast on that is risky on
+    /// air - see `com_is_assist_core::automix::MixState`.
+    #[id = "interview-passthrough"]
+    pub interview_passthrough: BoolParam,
     /// `true` bypasses automix entirely (Bed passes through at unity gain, no ducking) - `false`
     /// (default) is normal operation. Inverted from the earlier `automix-enable` naming/polarity
     /// to match the conventional meaning of a "Bypass" control.
@@ -139,6 +188,7 @@ impl Default for ComISAssist {
             params: Arc::new(ComISAssistParams::default()),
             processor: None,
             voice_activity: None,
+            is_voice_activity: None,
             meters: Arc::new(Meters::new()),
         }
     }
@@ -147,7 +197,6 @@ impl Default for ComISAssist {
 impl Default for ComISAssistParams {
     fn default() -> Self {
         let automix = AutomixEngineConfig::default();
-        let gain = GainComputerConfig::default();
         Self {
             target_ratio: FloatParam::new(
                 "Target Ratio",
@@ -158,6 +207,13 @@ impl Default for ComISAssistParams {
             )
             .with_step_size(0.1)
             .with_unit(" LU"),
+            overvoice_ratio: FloatParam::new(
+                "Over-voice Ratio",
+                automix.overvoice_ratio_lu as f32,
+                FloatRange::Linear { min: 0.0, max: 24.0 },
+            )
+            .with_step_size(0.1)
+            .with_unit(" LU"),
             max_gain_reduction_db: FloatParam::new(
                 "Max Gain Reduction",
                 automix.max_gain_reduction_db as f32,
@@ -165,39 +221,22 @@ impl Default for ComISAssistParams {
             )
             .with_step_size(0.1)
             .with_unit(" dB"),
-            attack_ms: FloatParam::new(
-                "Fade Down Time",
-                (gain.attack_seconds * 1000.0) as f32,
-                FloatRange::Skewed {
-                    min: MIN_TIME_MS,
-                    max: MAX_TIME_MS,
-                    factor: FloatRange::skew_factor(-2.0),
-                },
+            speed: FloatParam::new(
+                "Speed",
+                automix.speed as f32,
+                // Multiplicative, so a symmetric log-ish sweep around 1.0 feels even either way.
+                FloatRange::Skewed { min: 0.25, max: 4.0, factor: FloatRange::skew_factor(0.0) },
             )
-            .with_step_size(1.0)
-            .with_unit(" ms"),
-            hold_ms: FloatParam::new(
-                "Hold Time",
-                (gain.hold_seconds * 1000.0) as f32,
-                FloatRange::Skewed {
-                    min: MIN_TIME_MS,
-                    max: MAX_TIME_MS,
-                    factor: FloatRange::skew_factor(-2.0),
-                },
+            .with_step_size(0.05)
+            .with_unit("x"),
+            lookahead_ms: FloatParam::new(
+                "Lookahead",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 20.0 },
             )
-            .with_step_size(1.0)
+            .with_step_size(0.5)
             .with_unit(" ms"),
-            release_ms: FloatParam::new(
-                "Recovery Time",
-                (gain.release_seconds * 1000.0) as f32,
-                FloatRange::Skewed {
-                    min: MIN_TIME_MS,
-                    max: MAX_TIME_MS,
-                    factor: FloatRange::skew_factor(-2.0),
-                },
-            )
-            .with_step_size(1.0)
-            .with_unit(" ms"),
+            interview_passthrough: BoolParam::new("Interview Passthrough", automix.interview_passthrough_enabled),
             bypass: BoolParam::new("Bypass", false),
             mix_dialogue_to_bed: BoolParam::new("Mix Dialogue to Bed", true),
             divergence: FloatParam::new("Voice Divergence", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
@@ -211,17 +250,10 @@ impl ComISAssistParams {
     fn automix_config(&self) -> AutomixEngineConfig {
         AutomixEngineConfig {
             target_ratio_lu: self.target_ratio.value() as f64,
+            overvoice_ratio_lu: self.overvoice_ratio.value() as f64,
             max_gain_reduction_db: self.max_gain_reduction_db.value() as f64,
-            ..AutomixEngineConfig::default()
-        }
-    }
-
-    fn gain_computer_config(&self) -> GainComputerConfig {
-        GainComputerConfig {
-            attack_seconds: self.attack_ms.value() as f64 / 1000.0,
-            hold_seconds: self.hold_ms.value() as f64 / 1000.0,
-            release_seconds: self.release_ms.value() as f64 / 1000.0,
-            max_rate_db_per_s: None,
+            speed: self.speed.value() as f64,
+            interview_passthrough_enabled: self.interview_passthrough.value(),
         }
     }
 }
@@ -255,6 +287,11 @@ const LOUDNESS_METER_MAX_LUFS: f32 = 0.0;
 /// (which defaults to 24), so headroom stays visible and the ticks stay a stable reference
 /// regardless of the configured ceiling.
 const GAIN_REDUCTION_METER_MAX_DB: f32 = 48.0;
+
+/// Half-width of the ratio meter's "on target" green band, in LU - a GUI-only readability
+/// threshold, deliberately independent of `AutomixEngineConfig`'s `tolerance_lu` (which governs
+/// the DSP's actual correction decisions, not what this indicator shows).
+const RATIO_METER_GREEN_BAND_LU: f32 = 2.0;
 
 /// Meter background - shared by every bar's unfilled portion.
 const METER_BACKGROUND: egui::Color32 = egui::Color32::from_gray(22);
@@ -526,25 +563,40 @@ impl Plugin for ComISAssist {
                         // not for drawing (see `Meters::ratio_lu`'s doc comment).
                         let ratio_lu = meters.ratio_lu.load(Ordering::Relaxed);
 
-                        // Red when the current ratio falls outside the same dead-band
-                        // `AutomixEngine::process_tick` itself uses to decide whether Bed's gain
-                        // needs adjusting - i.e. "the given COM/IS ratio isn't being met" means
-                        // exactly what it means to the DSP, not an independently-invented
-                        // GUI-only threshold. Deliberately checked against `ratio_lu` (the signed,
-                        // real control-loop value), not `display_ratio_lu` (floored at 0) - the
-                        // latter would make the lower bound of the tolerance band unreachable and
-                        // this indicator would almost never go red. `max-tolerance`/`min-tolerance`
-                        // aren't exposed as VST3 parameters (see `ComISAssistParams`'s doc
-                        // comments), so this reads them from the same `AutomixEngineConfig::default()`
-                        // the processor itself was built with.
-                        let tolerance = AutomixEngineConfig::default();
-                        let target_ratio_lu = params.target_ratio.value();
-                        let ratio_in_tolerance = ratio_lu >= target_ratio_lu - tolerance.min_tolerance_lu as f32
-                            && ratio_lu <= target_ratio_lu + tolerance.max_tolerance_lu as f32;
-                        let ratio_color = if ratio_in_tolerance {
+                        // Ratio bar color is an at-a-glance read of where the current COM/IS ratio
+                        // sits relative to the user's target, for tuning by ear - a GUI-only
+                        // signal, not the DSP's own dead-band (`AutomixEngine::process_tick` still
+                        // uses `AutomixEngineConfig`'s tolerances for its actual gain decisions,
+                        // unchanged by this):
+                        //   grey   - ratio is negative: COM is currently *quieter* than IS (a
+                        //            distinct situation from "not loud enough yet", worth its own
+                        //            neutral color rather than alarming red)
+                        //   red    - positive but under target by more than the green band
+                        //   green  - within +/-RATIO_METER_GREEN_BAND_LU of target (on target)
+                        //   orange - above the green band: COM louder than needed (not wrong, just
+                        //            excess headroom)
+                        // Deliberately keyed off `ratio_lu` (the signed, real control-loop value),
+                        // not `display_ratio_lu` (floored at 0) - the latter can never be negative,
+                        // so the grey state would be unreachable.
+                        // Must follow whichever target the engine is *actually* holding to right
+                        // now, not always `target_ratio`: while the state machine is in
+                        // `DuckToOvervoice` it is correctly aiming at the (higher) over-voice
+                        // ratio, and colouring that against the normal target would show orange
+                        // ("excess headroom") for exactly as long as it does the right thing.
+                        let mix_state_index = meters.mix_state.load(Ordering::Relaxed);
+                        let target_ratio_lu = if mix_state_index == 3 {
+                            params.overvoice_ratio.value()
+                        } else {
+                            params.target_ratio.value()
+                        };
+                        let ratio_color = if ratio_lu < 0.0 {
+                            egui::Color32::from_gray(120)
+                        } else if ratio_lu < target_ratio_lu - RATIO_METER_GREEN_BAND_LU {
+                            egui::Color32::from_rgb(224, 32, 32)
+                        } else if ratio_lu <= target_ratio_lu + RATIO_METER_GREEN_BAND_LU {
                             egui::Color32::from_rgb(0x39, 0xC8, 0x39)
                         } else {
-                            egui::Color32::from_rgb(224, 32, 32)
+                            egui::Color32::from_rgb(224, 140, 32)
                         };
 
                         ui.horizontal(|ui| {
@@ -565,7 +617,14 @@ impl Plugin for ComISAssist {
                                 ui.add_space(2.0);
                                 gain_reduction_scale_column(ui);
                                 ui.add_space(18.0);
-                                loudness_meter(ui, "IS", is_lufs, egui::Color32::from_rgb(0x52, 0xFF, 0xFE), Some(gain_reduction_db), None);
+                                loudness_meter(
+                                    ui,
+                                    "IS",
+                                    is_lufs,
+                                    egui::Color32::from_rgb(0x52, 0xFF, 0xFE),
+                                    Some(gain_reduction_db),
+                                    Some(meters.is_voice_active.load(Ordering::Relaxed)),
+                                );
                                 ui.add_space(2.0);
                                 loudness_scale_column(ui);
                                 ui.add_space(18.0);
@@ -600,20 +659,20 @@ impl Plugin for ComISAssist {
                                         ui.add(ParamSlider::for_param(&params.target_ratio, setter));
                                         ui.end_row();
 
+                                        ui.label("Over-voice ratio");
+                                        ui.add(ParamSlider::for_param(&params.overvoice_ratio, setter));
+                                        ui.end_row();
+
                                         ui.label("Max gain reduction");
                                         ui.add(ParamSlider::for_param(&params.max_gain_reduction_db, setter));
                                         ui.end_row();
 
-                                        ui.label("Fade down time");
-                                        ui.add(ParamSlider::for_param(&params.attack_ms, setter));
+                                        ui.label("Speed");
+                                        ui.add(ParamSlider::for_param(&params.speed, setter));
                                         ui.end_row();
 
-                                        ui.label("Hold time");
-                                        ui.add(ParamSlider::for_param(&params.hold_ms, setter));
-                                        ui.end_row();
-
-                                        ui.label("Recovery time");
-                                        ui.add(ParamSlider::for_param(&params.release_ms, setter));
+                                        ui.label("Lookahead");
+                                        ui.add(ParamSlider::for_param(&params.lookahead_ms, setter));
                                         ui.end_row();
 
                                         ui.label("Voice divergence");
@@ -625,6 +684,49 @@ impl Plugin for ComISAssist {
                                 bool_param_checkbox(ui, setter, &params.bypass, "Bypass");
                                 ui.add_space(10.0);
                                 bool_param_checkbox(ui, setter, &params.mix_dialogue_to_bed, "Mix dialogue to bed");
+                                ui.add_space(10.0);
+                                bool_param_checkbox(
+                                    ui,
+                                    setter,
+                                    &params.interview_passthrough,
+                                    "Interview passthrough (IS voice \u{2192} fast recovery)",
+                                );
+
+                                // The live state-machine readout. With the mixer's behavior now
+                                // defined entirely by which of four states it's in, showing that
+                                // state directly is the fastest answer to "why is it doing that?"
+                                // - far more legible than inferring it from the meters.
+                                ui.add_space(20.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("State:");
+                                    let index = mix_state_index as usize;
+                                    let label = MIX_STATE_LABELS.get(index).copied().unwrap_or("-");
+                                    let color = match index {
+                                        1 => egui::Color32::from_rgb(0x52, 0xFF, 0xFE), // duck -> target
+                                        2 => egui::Color32::from_rgb(0x39, 0xC8, 0x39), // interview
+                                        3 => egui::Color32::from_rgb(224, 140, 32),     // over-voice
+                                        _ => egui::Color32::from_gray(150),             // release
+                                    };
+                                    ui.colored_label(color, label);
+                                });
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Loops:");
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0x52, 0xFF, 0xFE),
+                                        format!("slow {:.1}", meters.slow_db.load(Ordering::Relaxed)),
+                                    );
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0x39, 0xC8, 0x39),
+                                        format!("mid {:+.1}", meters.mid_db.load(Ordering::Relaxed)),
+                                    );
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(224, 140, 32),
+                                        format!("fast {:+.1}", meters.fast_db.load(Ordering::Relaxed)),
+                                    );
+                                });
                             });
                         });
                         ui.add_space(14.0);
@@ -637,20 +739,28 @@ impl Plugin for ComISAssist {
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
+        context: &mut impl InitContext<Self>,
     ) -> bool {
         self.processor = AutomixProcessor::new(
             BED_CHANNELS,
             buffer_config.sample_rate as u32,
             self.params.automix_config(),
-            self.params.gain_computer_config(),
             TICK_SECONDS,
         )
         .ok();
+        if let Some(processor) = self.processor.as_mut() {
+            processor.set_lookahead_seconds(self.params.lookahead_ms.value() as f64 / 1000.0);
+            // Tell the host up front, so delay compensation is right from the first block.
+            context.set_latency_samples(processor.lookahead_frames() as u32);
+        }
         // `.ok()`, not `.expect(...)`: if this fails (e.g. the ONNX Runtime binary couldn't be
         // obtained), `process()` fails open rather than the whole plugin refusing to initialize
         // over what's ultimately just a display/gating refinement, not the core automix path.
         self.voice_activity = SileroVad::new(buffer_config.sample_rate as u32, VoiceActivityConfig::default()).ok();
+        // A second, independent detector instance for the Bed - same model and settings, its own
+        // recurrent state and hangover timer (see `is_voice_activity`'s doc comment).
+        self.is_voice_activity =
+            SileroVad::new(buffer_config.sample_rate as u32, VoiceActivityConfig::default()).ok();
         self.processor.is_some()
     }
 
@@ -658,22 +768,26 @@ impl Plugin for ComISAssist {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let Some(processor) = self.processor.as_mut() else {
             return ProcessStatus::Error("processor not initialized");
         };
 
         // `initialize()` only reads these parameters once, at plugin load - without refreshing
-        // them here on every block, a live parameter change (e.g. raising `max-gain-reduction-db`
-        // from its 24dB default toward its 48dB ceiling mid-session) would silently have no
-        // effect, since `AutomixEngine`/`GainComputer` would keep using whatever values were
-        // current back at `initialize()` time forever after. Cheap - just a couple of struct
-        // copies - and preserves all accumulated state (loudness meters, the gain ramp, the
-        // in-progress reduction target), unlike rebuilding the processor would.
-        processor.set_config(self.params.automix_config(), self.params.gain_computer_config());
+        // them here on every block, a live parameter change would silently have no effect. Cheap -
+        // a couple of struct copies - and preserves all accumulated state (loudness detectors, the
+        // loop stages' in-flight values), unlike rebuilding the processor would.
+        processor.set_config(self.params.automix_config());
+        let previous_lookahead = processor.lookahead_frames();
+        processor.set_lookahead_seconds(self.params.lookahead_ms.value() as f64 / 1000.0);
+        if processor.lookahead_frames() != previous_lookahead {
+            // Only on an actual change: hosts generally rebuild their delay-compensation graph on
+            // this, so calling it every block would be wasteful and disruptive.
+            context.set_latency_samples(processor.lookahead_frames() as u32);
+        }
+        processor.set_automix_enabled(!self.params.bypass.value());
 
-        let automix_enabled = !self.params.bypass.value();
         let mix_dialogue_to_bed = self.params.mix_dialogue_to_bed.value();
         let divergence = self.params.divergence.value() / 100.0;
 
@@ -694,22 +808,17 @@ impl Plugin for ComISAssist {
         }
         let dialogue: Vec<f32> = channels[DIALOGUE_CHANNEL][..num_samples].to_vec();
 
-        // Must happen before `apply_gain_to_bed_chunk` below, which mutates `interleaved_bed` in
-        // place - this measures the dry/incoming Bed level for display (`Specs/UI.md`'s "IS
-        // LUFS-M"), deliberately separate from the closed-loop `bed_meter` the control loop uses
-        // (see `AutomixProcessor::feed_bed_pre_gain`'s doc comment). Gated on the GUI being open,
-        // like the meter-publishing block below - this does real per-sample meter work, unlike a
-        // cheap atomic store, so it's not worth paying for when nothing will read it.
-        if self.params.editor_state.is_open() {
-            let _ = processor.feed_bed_pre_gain(&interleaved_bed);
-        }
+        // Mono downmix of the *dry* Bed for the IS-side detector - Silero is a mono model, and
+        // "is anyone speaking anywhere on the Bed" is a whole-Bed question, so averaging the
+        // channels is the right reduction. Taken before `process_bed` mutates `interleaved_bed`.
+        let mono_bed: Vec<f32> = interleaved_bed
+            .chunks_exact(BED_CHANNELS as usize)
+            .map(|frame| frame.iter().sum::<f32>() / BED_CHANNELS as f32)
+            .collect();
 
-        processor.apply_gain_to_bed_chunk(&mut interleaved_bed);
-        // Closed loop (Specs/TechnicalConcept.md section 4): the Bed meter observes the
-        // already-gained signal, not the dry one. A mismatched channel count here would be a
-        // caller bug in this fixed-layout plugin, not a runtime condition - deliberately ignored
-        // rather than crashing the audio thread over it.
-        let _ = processor.feed_bed(&interleaved_bed);
+        // Feed-forward: Dialogue is measured dry, before anything is applied to it.
+        // A mismatched channel count here would be a caller bug in this fixed-layout plugin, not a
+        // runtime condition - deliberately ignored rather than crashing the audio thread over it.
         let _ = processor.feed_dialogue(&dialogue);
 
         // Fails open (treats COM as always voice-active) if VAD couldn't be constructed at
@@ -721,7 +830,21 @@ impl Plugin for ComISAssist {
             }
             None => true,
         };
-        processor.maybe_run_control_step(automix_enabled, voice_active);
+        // Fails *closed* on the IS side (no detector => "no voice on IS"), unlike COM's fail-open:
+        // IS voice only ever selects the interview/over-voice states, so assuming it absent just
+        // falls back to the ordinary duck/release behavior rather than inventing a state.
+        let is_voice_active = match self.is_voice_activity.as_mut() {
+            Some(vad) => {
+                let _ = vad.feed(&mono_bed);
+                vad.voice_active()
+            }
+            None => false,
+        };
+        // Measures the dry Bed, steps the fast stage and applies the resulting gain in sub-chunks,
+        // then applies the lookahead delay - all inside the shared core, so every wrapper gets
+        // identical DSP.
+        let _ = processor.process_bed(&mut interleaved_bed);
+        processor.maybe_run_control_step(voice_active, is_voice_active);
 
         // Only bother publishing to the meters while the GUI is actually open - matches
         // nih-plug's own guidance for keeping this off the hot path otherwise.
@@ -734,7 +857,21 @@ impl Plugin for ComISAssist {
                 .dialogue_momentary_lufs
                 .store(processor.dialogue_momentary_lufs() as f32, Ordering::Relaxed);
             self.meters.voice_active.store(voice_active, Ordering::Relaxed);
+            self.meters.is_voice_active.store(is_voice_active, Ordering::Relaxed);
+            self.meters
+                .mix_state
+                .store(mix_state_index(processor.mix_state()), Ordering::Relaxed);
+            let contributions = processor.contributions();
+            self.meters.slow_db.store(contributions.slow_db as f32, Ordering::Relaxed);
+            self.meters.mid_db.store(contributions.mid_db as f32, Ordering::Relaxed);
+            self.meters.fast_db.store(contributions.fast_db as f32, Ordering::Relaxed);
         }
+
+        // The Bed path is delayed by the lookahead, so Dialogue must be too or the Mix output goes
+        // out of alignment. No-op while lookahead is 0.
+        let mut dialogue_out = dialogue;
+        processor.delay_dialogue(&mut dialogue_out);
+        let dialogue = dialogue_out;
 
         if mix_dialogue_to_bed {
             mix_dialogue_into_bed(

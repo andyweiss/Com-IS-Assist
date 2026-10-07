@@ -81,6 +81,13 @@ pub struct VoiceActivityConfig {
     /// threshold would chatter the signal on and off every 32ms, which is exactly the kind of
     /// flutter `Specs/TechnicalConcept.md` section 5/6 already had to solve once for the
     /// LUFS-floor stand-in this replaces.
+    ///
+    /// This is effectively "how long a pause still counts as *still talking*", so it has to span a
+    /// natural inter-sentence break, not just an inter-word one. It directly gates the automix
+    /// state machine (`automix::MixState`), and measured commentary pauses run ~1.2s: at the
+    /// original 300ms this dropped to `ReleaseToUnity` in every one of them, shedding several dB
+    /// of reduction and then re-ducking on the next sentence - an audible swell repeating at
+    /// sentence rate. See `Specs/TechnicalConcept.md` section 5's pumping analysis.
     pub hangover_seconds: f64,
 }
 
@@ -88,7 +95,7 @@ impl Default for VoiceActivityConfig {
     fn default() -> Self {
         Self {
             speech_probability_threshold: 0.5,
-            hangover_seconds: 0.3,
+            hangover_seconds: 0.8,
         }
     }
 }

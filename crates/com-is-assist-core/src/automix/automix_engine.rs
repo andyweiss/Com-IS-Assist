@@ -1,183 +1,240 @@
-use super::gain_computer::{GainComputer, GainComputerConfig};
-use crate::ratio::RatioResult;
+use super::loop_bank::{LoopBank, LoopBankConfig, LoopContributions};
+use super::mix_state::MixState;
+use crate::loudness::Ebur128Meter;
 
-/// Target/tolerance policy for [`AutomixEngine`], matching the JSFX settings panel's framing
-/// (`target_ratio_lu` defaults to its "Target Ratio (LU)" default, etc. — see
-/// `Specs/TechnicalConcept.md` section 5).
+/// The feed-forward identity at the heart of the design: reducing the Bed by 1 dB raises the
+/// COM/IS ratio by exactly 1 LU, so the reduction needed to put the ratio on target is simply
+/// `target - (COM - BED)`. Exact only because both readings come from the **dry** signals.
+///
+/// `None` when either side is at the silence sentinel, where the "ratio" is not a real quantity —
+/// propagating it would ask for an enormous reduction on the strength of a placeholder number.
+fn required_reduction(target_ratio_lu: f64, bed_lufs: f64, dialogue_lufs: f64) -> Option<f64> {
+    if bed_lufs <= Ebur128Meter::NEGATIVE_INFINITY_DB || dialogue_lufs <= Ebur128Meter::NEGATIVE_INFINITY_DB {
+        return None;
+    }
+    Some(target_ratio_lu - (dialogue_lufs - bed_lufs))
+}
+
+/// Target policy for [`AutomixEngine`]. See `Specs/TechnicalConcept.md` section 5 for the state
+/// machine (5.1) and the multi-loop control law (5.2) these values feed.
 #[derive(Debug, Clone, Copy)]
 pub struct AutomixEngineConfig {
+    /// `UI.md`'s "Com/IS distance": how many LU COM should sit *above* IS while the commentator is
+    /// talking and the Bed has no voice of its own ([`MixState::DuckToTarget`]).
     pub target_ratio_lu: f64,
-    pub max_tolerance_lu: f64,
-    pub min_tolerance_lu: f64,
+    /// The higher target for the double-talk / "over-voice" case ([`MixState::DuckToOvervoice`]):
+    /// both COM *and* IS carry voice, so COM needs more headroom above the Bed to stay
+    /// intelligible. An **absolute** target, not an offset on `target_ratio_lu`, so the two cases
+    /// can be dialed in independently by ear.
+    pub overvoice_ratio_lu: f64,
     pub max_gain_reduction_db: f64,
-    /// How many dB the raw target nudges per LU of shortfall/excess, per tick. Deliberately a
-    /// small incremental step, not a one-shot jump to the "needed" value — see the closed-loop
-    /// note in `Specs/TechnicalConcept.md` section 4/5 for why a one-shot jump wouldn't
-    /// converge cleanly (the 3s LUFS window smears the effect of any gain change in gradually).
-    pub step_db_per_lu: f64,
+    /// The "Speed" macro — scales every stage's ballistics together. This is the *only* timing
+    /// control, replacing the five separate time parameters (`adaptation`/`attack`/`hold`/
+    /// `release`/`interview-release`) the single-loop design needed: with the multi-loop cascade
+    /// the effective attack and release are emergent, so the individual times had nothing
+    /// meaningful left to set.
+    pub speed: f64,
+    /// Whether voice-on-IS-only may select [`MixState::InterviewPassthrough`] (a fast recovery to
+    /// unity) rather than an ordinary release. Off by default: a loud PA or stadium announcement
+    /// also reads as "voice on IS", and recovering the Bed *fast* on that is risky on air.
+    pub interview_passthrough_enabled: bool,
 }
 
 impl Default for AutomixEngineConfig {
     fn default() -> Self {
         Self {
             target_ratio_lu: 3.0,
-            max_tolerance_lu: 4.0,
-            min_tolerance_lu: 8.0,
+            overvoice_ratio_lu: 8.0,
             max_gain_reduction_db: 24.0,
-            step_db_per_lu: 0.5,
+            speed: 1.0,
+            interview_passthrough_enabled: false,
         }
     }
+}
+
+/// The loudness readings one control tick works from, all measured **feed-forward on the dry
+/// signals** — see [`AutomixEngine::process_tick`].
+///
+/// Note the asymmetry: the Bed is read at several speeds, the Dialogue at only one. That is
+/// deliberate and is what the stages actually differ in.
+///
+/// **Why only the Bed gets fast detectors.** `ratio = COM − BED`, so `required = target − ratio`:
+/// if COM gets *louder* the ratio rises and *less* ducking is needed, not more. The event that
+/// genuinely demands a fast response is therefore a **Bed** surge — a crowd roar burying the
+/// commentator — not a COM one. Driving the fast stages from COM as well was tried and was wrong
+/// twice over: at 50ms a speech signal's "level" is its syllable envelope, so the stage tracked
+/// vowels and modulated the Bed at syllable rate; and because a 3s window over speech-with-gaps
+/// measures a systematically quieter COM than a 400ms window during speech, the stages disagreed
+/// by a constant offset and sat fighting each other (measured: the mid stage parked at −2 to −5 dB
+/// while the fast stage repeatedly saturated its +4 dB clamp).
+///
+/// Reading COM at one stable speed for every stage removes both problems: the stages now measure
+/// the *same* quantity and differ only in how quickly they see the Bed move, so they agree in
+/// steady state and separate only during a Bed transient — which is exactly the intended division
+/// of labour.
+#[derive(Debug, Clone, Copy)]
+pub struct LoudnessSnapshot {
+    /// Bed at the 3s short-term window — the slow stage's detector.
+    pub bed_short_term_lufs: f64,
+    /// Bed at the 400ms momentary window — the mid stage's detector.
+    pub bed_momentary_lufs: f64,
+    /// COM at the 3s short-term window. The single Dialogue reference every stage works against.
+    pub dialogue_short_term_lufs: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AutomixResult {
     pub gain_reduction_db: f64,
     pub gain_linear: f64,
+    /// Which state produced this tick's result — surfaced so wrappers can display it and tests can
+    /// assert on the state machine directly rather than inferring it from gain values.
+    pub state: MixState,
+    pub contributions: LoopContributions,
 }
 
-/// Turns a [`RatioResult`] into a smoothed Bed gain-reduction value. See
-/// `Specs/TechnicalConcept.md` section 5 for the full design and section 4 for the closed-loop
-/// signal flow this is meant to run inside (the Bed loudness meter feeding `RatioEngine` must
-/// observe the *already-gained* Bed signal, not the dry one).
+/// Decides *what* the mixer should be doing (the four-state machine) and hands the question of
+/// *how* to get there to the multi-loop [`LoopBank`].
+///
+/// The split matters: the state machine is the part that was already right, and it stays exactly as
+/// it was. Everything underneath it — a single feedback loop with five time constants — was
+/// replaced by the feed-forward cascade, because no amount of tuning fixes a topology whose
+/// measurement lags its actuation by three seconds.
 pub struct AutomixEngine {
     config: AutomixEngineConfig,
-    gain_computer: GainComputer,
-    target_reduction_db: f64,
-    /// Whether the *previous* tick's `RatioResult::voice_active` was true - used only to detect
-    /// the false→true onset transition (see `process_tick`'s fast-trigger doc comment).
-    was_voice_active: bool,
-    /// The most recent `target_reduction_db` while voice was active - i.e. wherever the
-    /// ratio-driven policy last left it before COM went quiet. Re-seeded on the next onset - see
-    /// `process_tick`.
-    last_active_target_reduction_db: f64,
+    loops: LoopBank,
+    previous_state: MixState,
 }
 
 impl AutomixEngine {
-    pub fn new(
-        config: AutomixEngineConfig,
-        gain_computer_config: GainComputerConfig,
-        tick_seconds: f64,
-    ) -> Self {
+    pub fn new(config: AutomixEngineConfig) -> Self {
         Self {
+            loops: LoopBank::new(Self::loop_config(&config)),
             config,
-            gain_computer: GainComputer::new(gain_computer_config, tick_seconds),
-            target_reduction_db: 0.0,
-            was_voice_active: false,
-            last_active_target_reduction_db: 0.0,
+            previous_state: MixState::ReleaseToUnity,
         }
     }
 
-    /// Call once per ~100ms tick with the latest `RatioEngine::update` result.
-    pub fn process_tick(&mut self, ratio: RatioResult) -> AutomixResult {
-        let voice_onset = ratio.voice_active && !self.was_voice_active;
-        self.was_voice_active = ratio.voice_active;
+    fn loop_config(config: &AutomixEngineConfig) -> LoopBankConfig {
+        LoopBankConfig {
+            speed: config.speed,
+            max_gain_reduction_db: config.max_gain_reduction_db,
+            ..LoopBankConfig::default()
+        }
+    }
 
-        // No voice detected on COM right now: there's nothing to duck Bed *for*, so release back
-        // toward unity (at whatever `release_seconds`/"Recovery Time" is configured) rather than
-        // holding whatever reduction happened to be applied when COM stopped talking. This is
-        // deliberately unconditional on `ratio.valid` - even before a ratio has ever been
-        // established, "no voice" means "nothing to react to," the same as after one has. Setting
-        // the raw target straight to `0.0` and letting `gain_computer`'s own release envelope
-        // (below) ease the *applied* gain back smoothly is exactly the same mechanism already
-        // used for "ratio comfortably above target" (see the `com_hi_lim` branch) - no new timing
-        // knob needed.
-        if !ratio.voice_active {
-            self.target_reduction_db = 0.0;
+    /// Call once per ~100ms control tick with dry-signal loudness at both R128 windows, the two
+    /// voice-activity flags, and the elapsed time since the previous call.
+    ///
+    /// The required reduction at each time scale is computed directly:
+    /// `required = target_ratio − (COM − BED)`. That identity holds because reducing the Bed by
+    /// 1 dB raises the ratio by exactly 1 LU, and it is exact only because both readings come from
+    /// the **dry** signals. Measuring the already-ducked Bed (as this engine used to) turns the
+    /// same expression into a feedback loop that cannot see its own effect for three seconds.
+    pub fn process_tick(
+        &mut self,
+        loudness: LoudnessSnapshot,
+        com_voice_active: bool,
+        is_voice_active: bool,
+        dt_seconds: f64,
+    ) -> AutomixResult {
+        let state = MixState::from_vad(
+            com_voice_active,
+            is_voice_active,
+            self.config.interview_passthrough_enabled,
+        );
+
+        if state.is_ducking() {
+            // Note there is deliberately **no** voice-onset fast trigger here. The feedback design
+            // needed one: after a gap its measurement was stale, so it had to be told where to
+            // resume from, and that seeding produced an instantaneous ~19dB jump in the applied
+            // gain. Feed-forward has nothing stale to compensate for - the dry levels are correct
+            // on the very first tick back - and the cascade covers the onset on its own: the mid
+            // stage engages within ~150ms and the fast stage within milliseconds, while the slow
+            // stage takes over the steady state behind them. Measured on real commentary, removing
+            // the trigger cut the largest single-tick gain movement from 19.4dB to 8.0dB with no
+            // loss of onset response.
+            let target = match state {
+                MixState::DuckToOvervoice => self.config.overvoice_ratio_lu,
+                _ => self.config.target_ratio_lu,
+            };
+            let required_slow = required_reduction(
+                target,
+                loudness.bed_short_term_lufs,
+                loudness.dialogue_short_term_lufs,
+            );
+            let required_mid = required_reduction(
+                target,
+                loudness.bed_momentary_lufs,
+                loudness.dialogue_short_term_lufs,
+            );
+            self.loops.update_slow_mid(required_slow, required_mid, dt_seconds);
         } else {
-            // VAD-onset fast trigger (`Specs/TechnicalConcept.md` section 5/6): the instant voice
-            // resumes after a gap, immediately jump the raw target back to wherever it was
-            // converging to *before* COM went quiet, rather than starting the ratio-driven
-            // "nudge, don't jump" ramp from `0.0` again. `RatioEngine`'s own `held_ratio_lu` also
-            // needs a few ticks after an onset to refresh with fresh audio (short-term loudness
-            // has real integration time, on top of `valid_signal_hold_ticks`'s own small
-            // debounce) - without this, Bed would sit un-ducked for that entire window on *every*
-            // resumed utterance, not just the very first one in a session. This is a genuine
-            // guess, not a measurement - if the correct reduction has actually changed since the
-            // last utterance, the ratio-driven policy below corrects it within a few ticks, same
-            // as it would from any other starting point.
-            if voice_onset {
-                self.target_reduction_db = self.last_active_target_reduction_db;
-            }
-
-            if ratio.valid {
-                // `ratio.valid` is a one-way latch (meter-appropriate: never un-shows a value
-                // once shown) so on its own it doesn't mean "COM has signal right now" — during a
-                // long gap after the first-ever speech burst, `valid` stays true but `ratio_lu` is
-                // a frozen, increasingly stale number. The `!voice_active` branch above already
-                // handles that case (COM having gone quiet); this branch only runs once real
-                // voice-activity detection *also* confirms speech is actually present this tick.
-                let com_hi_lim = self.config.target_ratio_lu + self.config.max_tolerance_lu;
-                let com_lo_lim = self.config.target_ratio_lu - self.config.min_tolerance_lu;
-
-                if ratio.ratio_lu < com_lo_lim {
-                    let shortfall = com_lo_lim - ratio.ratio_lu;
-                    self.target_reduction_db = (self.target_reduction_db
-                        + shortfall * self.config.step_db_per_lu)
-                        .min(self.config.max_gain_reduction_db);
-                } else if ratio.ratio_lu > com_hi_lim {
-                    let excess = ratio.ratio_lu - com_hi_lim;
-                    self.target_reduction_db =
-                        (self.target_reduction_db - excess * self.config.step_db_per_lu).max(0.0);
-                }
-                // Inside the dead-band: target_reduction_db is left unchanged (hold).
-            }
-            // voice_active but !valid (insufficient COM history to trust ratio_lu yet): hold
-            // (possibly at the just-fast-triggered value from this same tick, if `voice_onset`).
-
-            self.last_active_target_reduction_db = self.target_reduction_db;
+            self.loops
+                .update_release(state == MixState::InterviewPassthrough, dt_seconds);
         }
 
-        let smoothed_db = self.gain_computer.process_tick(self.target_reduction_db);
+        self.previous_state = state;
+        self.result(state)
+    }
+
+    /// Steps the fast stage between control ticks, at audio sub-chunk rate, from the fast
+    /// K-weighted **Bed** detector against the stable COM reference (see [`LoudnessSnapshot`] for
+    /// why COM is not read fast). Uses the state the last control tick resolved to — the state
+    /// machine runs on VAD, which does not change meaningfully within one audio block.
+    pub fn process_fast(&mut self, bed_fast_lufs: f64, dialogue_reference_lufs: f64, dt_seconds: f64) -> f64 {
+        let required = if self.previous_state.is_ducking() {
+            let target = match self.previous_state {
+                MixState::DuckToOvervoice => self.config.overvoice_ratio_lu,
+                _ => self.config.target_ratio_lu,
+            };
+            required_reduction(target, bed_fast_lufs, dialogue_reference_lufs)
+        } else {
+            None
+        };
+        self.loops.update_fast(required, dt_seconds);
+        self.loops.total_reduction_db()
+    }
+
+    /// The ratio target the engine is currently aiming at, for metering.
+    pub fn active_target_ratio_lu(&self) -> f64 {
+        match self.previous_state {
+            MixState::DuckToOvervoice => self.config.overvoice_ratio_lu,
+            _ => self.config.target_ratio_lu,
+        }
+    }
+
+    fn result(&self, state: MixState) -> AutomixResult {
+        let contributions = self.loops.contributions();
         AutomixResult {
-            gain_reduction_db: smoothed_db,
-            gain_linear: 10f64.powf(-smoothed_db / 20.0),
+            gain_reduction_db: contributions.total_db,
+            gain_linear: 10f64.powf(-contributions.total_db / 20.0),
+            state,
+            contributions,
         }
     }
 
-    /// Replaces the target/tolerance/ceiling config and the gain computer's attack/hold/release
-    /// config, without resetting `target_reduction_db` or the gain computer's own in-progress
-    /// envelope state - so a live parameter change (a VST3 host's parameter automation, or a
-    /// dragged slider) actually takes effect on the next tick. Without this, a wrapper that only
-    /// reads its parameters once at construction time would keep using whatever values were
-    /// current back then forever after, no matter how the user later adjusts them.
-    /// `target_reduction_db` is re-clamped against the new `max_gain_reduction_db` in case the
-    /// ceiling was just lowered below the currently-applied reduction.
-    pub fn set_config(&mut self, config: AutomixEngineConfig, gain_computer_config: GainComputerConfig) {
+    /// Replaces the config in place without disturbing any in-flight stage value, so host
+    /// automation (or a dragged slider) takes effect on the next step.
+    pub fn set_config(&mut self, config: AutomixEngineConfig) {
         self.config = config;
-        self.target_reduction_db = self.target_reduction_db.min(config.max_gain_reduction_db);
-        self.gain_computer.set_config(gain_computer_config);
-    }
-
-    /// Directly seeds the raw target, bypassing the ratio-driven policy for one tick — for the
-    /// interview-passthrough override (M3, not yet built). The VAD-onset fast trigger this was
-    /// originally written for is now handled automatically inside `process_tick` itself (see its
-    /// `voice_onset` handling) and no longer needs a caller to invoke this explicitly.
-    ///
-    /// **Known caveat for the not-yet-built interview-passthrough override**: that feature's own
-    /// design (`Specs/TechnicalConcept.md` section 5) forces reduction toward `0.0` specifically
-    /// when COM has *no* voice (and Bed does) - i.e. exactly the condition under which
-    /// `process_tick`'s `!ratio.voice_active` branch *also* unconditionally resets
-    /// `target_reduction_db` to `0.0` on every tick. A future caller seeding a value while COM's
-    /// `voice_active` is false would have that seed immediately overwritten before this method
-    /// even returns control to `process_tick`'s caller. Whichever mechanism implements that
-    /// override will need its own explicit bypass of the `!voice_active` release branch (e.g. a
-    /// dedicated override-active flag checked ahead of it), not a bare call to this method - not
-    /// solved here since the override itself doesn't exist yet.
-    ///
-    /// The smoothing envelope still governs how quickly the *applied* gain actually moves toward
-    /// whatever value is seeded.
-    pub fn seed_target_reduction_db(&mut self, value: f64) {
-        self.target_reduction_db = value.clamp(0.0, self.config.max_gain_reduction_db);
+        self.loops.set_config(Self::loop_config(&config));
     }
 
     pub fn current_gain_reduction_db(&self) -> f64 {
-        self.gain_computer.value()
+        self.loops.total_reduction_db()
+    }
+
+    pub fn contributions(&self) -> LoopContributions {
+        self.loops.contributions()
+    }
+
+    /// The state the most recent `process_tick` resolved to (`ReleaseToUnity` before the first).
+    pub fn current_state(&self) -> MixState {
+        self.previous_state
     }
 
     pub fn reset(&mut self) {
-        self.target_reduction_db = 0.0;
-        self.was_voice_active = false;
-        self.last_active_target_reduction_db = 0.0;
-        self.gain_computer.reset(0.0);
+        self.loops.reset();
+        self.previous_state = MixState::ReleaseToUnity;
     }
 }

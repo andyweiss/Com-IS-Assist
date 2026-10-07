@@ -1,20 +1,24 @@
 // Offline validation CLI (see Specs/TechnicalConcept.md): feeds a Bed + Dialogue WAV pair through
-// the closed-loop automix (Ebur128Meter -> RatioEngine -> AutomixEngine, with the Bed meter
-// observing the *already-gained* Bed signal per section 4/5's closed-loop design) and prints
-// per-tick loudness/ratio/gain as CSV. Optionally renders leveled-Bed/Mix WAVs so the result can
-// actually be listened to (M2's "listening sign-off" exit criterion).
+// the shared `AutomixProcessor` - the same multi-loop, feed-forward DSP both plugin wrappers use -
+// and prints per-tick measurements as CSV, including what each loop stage is contributing.
+// Optionally renders leveled-Bed/Mix WAVs so the result can actually be listened to.
+//
+// Every tunable is overridable from the environment (see `env_f64`) so a settings sweep can be
+// scripted against real material without recompiling.
 
-use com_is_assist_core::automix::{apply_ramped_gain, AutomixEngine, AutomixEngineConfig, GainComputerConfig};
-use com_is_assist_core::loudness::Ebur128Meter;
-use com_is_assist_core::ratio::RatioEngine;
+use com_is_assist_core::automix::{AutomixEngineConfig, AutomixProcessor, MixState};
 use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-/// Reads one interleaved tick's worth of frames (`frame_count * channels` samples) as
-/// normalized f32, regardless of whether the file is integer PCM or IEEE float.
+/// 100ms control tick, matching BS.1770's own gating-block granularity - the R128 readings do not
+/// update faster than this, so there is nothing to gain from a shorter one. (The fast loop runs far
+/// more often than this, inside `AutomixProcessor`.)
+const TICK_SECONDS: f64 = 0.1;
+
+/// Reads one interleaved tick's worth of frames as normalized f32, whatever the file's format.
 fn read_tick(
     reader: &mut WavReader<std::io::BufReader<std::fs::File>>,
     frame_count: usize,
@@ -46,6 +50,58 @@ fn read_tick(
     out
 }
 
+/// Reads one `f64` override from the environment, falling back to `default`. An unparseable value
+/// is reported and ignored rather than silently treated as the default.
+fn env_f64(name: &str, default: f64) -> f64 {
+    match env::var(name) {
+        Ok(raw) => match raw.parse() {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("ignoring {name}={raw:?} (not a number), using {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => {
+                eprintln!("ignoring {name}={other:?} (not a boolean), using {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+/// Averages an interleaved multichannel block to mono for the IS-side voice detector (Silero is a
+/// mono model). Every wrapper does the same reduction so the detector sees identical input.
+fn downmix_to_mono(interleaved: &[f32], channels: u32) -> Vec<f32> {
+    let channels = channels as usize;
+    if channels <= 1 {
+        return interleaved.to_vec();
+    }
+    interleaved
+        .chunks_exact(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect()
+}
+
+/// Short, stable CSV labels for the automix state.
+fn mix_state_label(state: MixState) -> &'static str {
+    match state {
+        MixState::ReleaseToUnity => "release",
+        MixState::DuckToTarget => "duck_target",
+        MixState::InterviewPassthrough => "interview",
+        MixState::DuckToOvervoice => "duck_overvoice",
+    }
+}
+
 fn float_wav_spec(channels: u16, sample_rate: u32) -> WavSpec {
     WavSpec {
         channels,
@@ -59,6 +115,11 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 && args.len() != 4 {
         eprintln!("usage: com-is-assist-offline <bed.wav> <dialogue.wav> [render_output_dir]");
+        eprintln!();
+        eprintln!("Config overrides (environment variables, all optional):");
+        eprintln!("  COMIS_TARGET_RATIO_LU, COMIS_OVERVOICE_RATIO_LU, COMIS_MAX_GAIN_REDUCTION_DB,");
+        eprintln!("  COMIS_SPEED, COMIS_LOOKAHEAD_MS, COMIS_INTERVIEW_PASSTHROUGH,");
+        eprintln!("  COMIS_VAD_HANGOVER_SECONDS");
         return ExitCode::FAILURE;
     }
 
@@ -95,39 +156,40 @@ fn main() -> ExitCode {
     let sample_rate = bed_spec.sample_rate;
     let bed_channels = bed_spec.channels as u32;
 
-    let bed_channel_map = match Ebur128Meter::bed_channel_map(bed_channels) {
-        Ok(map) => map,
+    let defaults = AutomixEngineConfig::default();
+    let config = AutomixEngineConfig {
+        target_ratio_lu: env_f64("COMIS_TARGET_RATIO_LU", defaults.target_ratio_lu),
+        overvoice_ratio_lu: env_f64("COMIS_OVERVOICE_RATIO_LU", defaults.overvoice_ratio_lu),
+        max_gain_reduction_db: env_f64("COMIS_MAX_GAIN_REDUCTION_DB", defaults.max_gain_reduction_db),
+        speed: env_f64("COMIS_SPEED", defaults.speed),
+        interview_passthrough_enabled: env_bool("COMIS_INTERVIEW_PASSTHROUGH", defaults.interview_passthrough_enabled),
+    };
+
+    let mut processor = match AutomixProcessor::new(bed_channels, sample_rate, config, TICK_SECONDS) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("unsupported bed channel count {}: {:?}", bed_channels, e);
+            eprintln!("unsupported bed channel count {bed_channels}: {e:?}");
             return ExitCode::FAILURE;
         }
     };
-    // Measures the Bed signal *after* automix gain is applied (closed loop) — see
-    // Specs/TechnicalConcept.md section 4.
-    let mut bed_meter = Ebur128Meter::new(&bed_channel_map, sample_rate).expect("bed meter config");
-    let mut dialogue_meter =
-        Ebur128Meter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate).expect("dialogue meter config");
+    processor.set_lookahead_seconds(env_f64("COMIS_LOOKAHEAD_MS", 0.0) / 1000.0);
 
-    let mut ratio_engine = RatioEngine::default();
-    // Real voice-activity detection on Dialogue - see `com_is_assist_core::voice_activity`'s doc
-    // comment for why this replaced the old LUFS-floor "is COM currently silent?" stand-in. Fails
-    // open (always voice-active) if construction fails, matching both wrappers' fallback.
-    let mut voice_activity = match SileroVad::new(sample_rate, VoiceActivityConfig::default()) {
+    // Real voice-activity detection on both sides - together they select the automix state.
+    // COM fails open (always voiced), IS fails closed, matching both plugin wrappers.
+    let vad_config = VoiceActivityConfig {
+        hangover_seconds: env_f64("COMIS_VAD_HANGOVER_SECONDS", VoiceActivityConfig::default().hangover_seconds),
+        ..VoiceActivityConfig::default()
+    };
+    let mut com_vad = match SileroVad::new(sample_rate, vad_config) {
         Ok(vad) => Some(vad),
         Err(e) => {
-            eprintln!("voice-activity detection unavailable, failing open: {e}");
+            eprintln!("COM voice-activity detection unavailable, failing open: {e}");
             None
         }
     };
+    let mut is_vad = SileroVad::new(sample_rate, vad_config).ok();
 
-    // 100ms tick, matching the JSFX's LOUD_METER_UPDATE and RatioEngine/AutomixEngine's cadence.
-    let tick_seconds = 0.1;
-    let tick_frames = (sample_rate as f64 * tick_seconds) as usize;
-    let mut automix_engine = AutomixEngine::new(
-        AutomixEngineConfig::default(),
-        GainComputerConfig::default(),
-        tick_seconds,
-    );
+    let tick_frames = (sample_rate as f64 * TICK_SECONDS) as usize;
 
     let mut render = args.get(3).map(|dir| {
         fs::create_dir_all(dir).expect("create render output dir");
@@ -136,9 +198,6 @@ fn main() -> ExitCode {
             float_wav_spec(bed_channels as u16, sample_rate),
         )
         .expect("create leveled_bed.wav");
-        // Mix mirrors the Bed's channel layout — Dialogue is summed into every channel (the
-        // simplest "all-channels" mix mode; the real product exposes this as `dialogue-mix-mode`,
-        // see Specs/Ressouces/GSTdefinitions.md).
         let mix = WavWriter::create(
             format!("{dir}/mix.wav"),
             float_wav_spec(bed_channels as u16, sample_rate),
@@ -147,16 +206,10 @@ fn main() -> ExitCode {
         (leveled_bed, mix)
     });
 
-    println!("tick,time_s,bed_lufs_m,bed_lufs_s,com_lufs_m,com_lufs_s,voice_active,ratio_lu,ratio_valid,gain_reduction_db");
-
-    // The gain applied to *this* tick's Bed audio ramps from `ramp_start_gain` (the value the
-    // previous tick's ramp ended on) to `applied_gain_linear` (whatever AutomixEngine computed at
-    // the end of the *previous* tick — this tick's target). Both start at unity. See the
-    // closed-loop note in Specs/TechnicalConcept.md section 4, and `apply_ramped_gain`'s doc
-    // comment for why a flat per-tick scalar isn't enough (it clicks at every tick boundary).
-    let mut applied_gain_reduction_db = 0.0_f64;
-    let mut applied_gain_linear = 1.0_f64;
-    let mut ramp_start_gain = 1.0_f64;
+    println!(
+        "tick,time_s,bed_lufs_m,com_lufs_m,com_voice_active,is_voice_active,mix_state,\
+ratio_lu,target_lu,r_slow,r_mid,r_fast,gain_reduction_db"
+    );
 
     let mut tick: u64 = 0;
     loop {
@@ -175,58 +228,62 @@ fn main() -> ExitCode {
             dialogue_spec.bits_per_sample,
         );
 
-        let bed_frames_read = bed_block.len() / bed_channels as usize;
-        let dialogue_frames_read = dialogue_block.len();
-        let frames_read = bed_frames_read.min(dialogue_frames_read);
+        let frames_read = (bed_block.len() / bed_channels as usize).min(dialogue_block.len());
         if frames_read == 0 {
             break;
         }
 
-        let mut leveled_bed: Vec<f32> = bed_block[..frames_read * bed_channels as usize].to_vec();
-        apply_ramped_gain(
-            &mut leveled_bed,
-            bed_channels,
-            ramp_start_gain as f32,
-            applied_gain_linear as f32,
-        );
-        ramp_start_gain = applied_gain_linear;
+        let dry_bed = &bed_block[..frames_read * bed_channels as usize];
+        let dry_dialogue = &dialogue_block[..frames_read];
 
-        bed_meter.push_frames(&leveled_bed).expect("push bed frames");
-        dialogue_meter
-            .push_frames(&dialogue_block[..frames_read])
-            .expect("push dialogue frames");
-
-        let bed_m = bed_meter.momentary_loudness_db();
-        let bed_s = bed_meter.short_term_loudness_db();
-        let com_m = dialogue_meter.momentary_loudness_db();
-        let com_s = dialogue_meter.short_term_loudness_db();
-
-        let voice_active = match voice_activity.as_mut() {
+        // Voice activity on the dry signals, before anything is applied.
+        let com_voice_active = match com_vad.as_mut() {
             Some(vad) => {
-                vad.feed(&dialogue_block[..frames_read]).expect("feed voice-activity detector");
+                vad.feed(dry_dialogue).expect("feed COM voice-activity detector");
                 vad.voice_active()
             }
             None => true,
         };
-        let ratio = ratio_engine.update(bed_s, com_s, voice_active);
+        let is_voice_active = match is_vad.as_mut() {
+            Some(vad) => {
+                let mono_bed = downmix_to_mono(dry_bed, bed_channels);
+                vad.feed(&mono_bed).expect("feed IS voice-activity detector");
+                vad.voice_active()
+            }
+            None => false,
+        };
 
+        processor.feed_dialogue(dry_dialogue).expect("feed dialogue meters");
+
+        let mut leveled_bed = dry_bed.to_vec();
+        processor.process_bed(&mut leveled_bed).expect("process bed");
+
+        let mut dialogue_out = dry_dialogue.to_vec();
+        processor.delay_dialogue(&mut dialogue_out);
+
+        processor.maybe_run_control_step(com_voice_active, is_voice_active);
+
+        let c = processor.contributions();
         println!(
-            "{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.2},{},{:.2}",
+            "{},{:.2},{:.2},{:.2},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
             tick,
-            tick as f64 * tick_seconds,
-            bed_m,
-            bed_s,
-            com_m,
-            com_s,
-            if voice_active { 1 } else { 0 },
-            ratio.ratio_lu,
-            if ratio.valid { 1 } else { 0 },
-            applied_gain_reduction_db,
+            tick as f64 * TICK_SECONDS,
+            processor.bed_momentary_lufs(),
+            processor.dialogue_momentary_lufs(),
+            if com_voice_active { 1 } else { 0 },
+            if is_voice_active { 1 } else { 0 },
+            mix_state_label(processor.mix_state()),
+            processor.applied_ratio_lu(),
+            processor.active_target_ratio_lu(),
+            c.slow_db,
+            c.mid_db,
+            c.fast_db,
+            c.total_db,
         );
 
         if let Some((leveled_bed_writer, mix_writer)) = render.as_mut() {
             for frame in 0..frames_read {
-                let dialogue_sample = dialogue_block[frame];
+                let dialogue_sample = dialogue_out[frame];
                 for channel in 0..bed_channels as usize {
                     let bed_sample = leveled_bed[frame * bed_channels as usize + channel];
                     leveled_bed_writer.write_sample(bed_sample).expect("write leveled_bed sample");
@@ -237,13 +294,7 @@ fn main() -> ExitCode {
             }
         }
 
-        // Compute the gain for the *next* tick from this tick's (now post-gain) measurement.
-        let automix_result = automix_engine.process_tick(ratio);
-        applied_gain_reduction_db = automix_result.gain_reduction_db;
-        applied_gain_linear = automix_result.gain_linear;
-
         tick += 1;
-
         if frames_read < tick_frames {
             break; // final partial tick
         }

@@ -1,7 +1,7 @@
 // GstComISAssist: 2 sink pads (bed_sink, dialogue_sink) / 3 src pads (is_leveled_src,
-// dialogue_src, mix_src), wired to com_is_assist_core's closed-loop automix (Ebur128Meter -> RatioEngine
-// -> AutomixEngine). See Specs/TechnicalConcept.md section 7 for the design, and section 4 for
-// why the Bed meter must observe the already-gained signal.
+// dialogue_src, mix_src), wired to com_is_assist_core's feed-forward multi-loop automix
+// (dry detectors -> LoopBank -> gain). See Specs/TechnicalConcept.md section 7 for the element
+// design, section 4 for why the detectors observe the *dry* signal, and 5.2 for the cascade.
 //
 // Bed negotiates 2-6ch dynamically via caps (48kHz, F32LE - see `ranged_audio_caps`); Dialogue is
 // always fixed mono. `ProcessingState` (and therefore the `AutomixProcessor` inside it) is only
@@ -19,13 +19,13 @@
 // before being forwarded. See `ProcessingState` below.
 
 use com_is_assist_core::automix::{
-    bed_lrc_channels, mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, GainComputerConfig,
+    bed_lrc_channels, mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, MixState,
 };
 use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer::subclass::prelude::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
@@ -97,13 +97,18 @@ fn f32_slice_to_buffer(samples: &[f32], channels: u32, frame_index: u64) -> gst:
 #[derive(Debug, Clone, Copy)]
 struct Settings {
     target_ratio_lu: f64,
-    max_tolerance_lu: f64,
-    min_tolerance_lu: f64,
+    /// The higher absolute ratio required while both COM and IS carry voice (the "over-voice"
+    /// double-talk case) - see `com_is_assist_core::automix::MixState`.
+    overvoice_ratio_lu: f64,
     max_gain_reduction_db: f64,
-    step_db_per_lu: f64,
-    attack_seconds: f64,
-    hold_seconds: f64,
-    release_seconds: f64,
+    /// The single timing control - scales every loop stage's ballistics together. Replaces the
+    /// former attack/hold/release/adaptation/interview-release set, which the multi-loop cascade
+    /// made meaningless (its effective ballistics are emergent).
+    speed: f64,
+    /// Lookahead in milliseconds, default 0. Non-zero delays both outputs and is added to the
+    /// element's reported latency.
+    lookahead_ms: f64,
+    interview_passthrough_enabled: bool,
     automix_enabled: bool,
     /// "Voice divergence" (`Specs/UI.md`), 0.0-100.0 (a percentage, matching the VST3 wrapper's
     /// convention): 0% = Dialogue is Center-only in `mix_src` when Bed has a Center channel
@@ -116,16 +121,13 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         let automix = AutomixEngineConfig::default();
-        let gain = GainComputerConfig::default();
         Self {
             target_ratio_lu: automix.target_ratio_lu,
-            max_tolerance_lu: automix.max_tolerance_lu,
-            min_tolerance_lu: automix.min_tolerance_lu,
+            overvoice_ratio_lu: automix.overvoice_ratio_lu,
             max_gain_reduction_db: automix.max_gain_reduction_db,
-            step_db_per_lu: automix.step_db_per_lu,
-            attack_seconds: gain.attack_seconds,
-            hold_seconds: gain.hold_seconds,
-            release_seconds: gain.release_seconds,
+            speed: automix.speed,
+            lookahead_ms: 0.0,
+            interview_passthrough_enabled: automix.interview_passthrough_enabled,
             automix_enabled: true,
             divergence_percent: 0.0,
         }
@@ -136,19 +138,10 @@ impl Settings {
     fn automix_config(&self) -> AutomixEngineConfig {
         AutomixEngineConfig {
             target_ratio_lu: self.target_ratio_lu,
-            max_tolerance_lu: self.max_tolerance_lu,
-            min_tolerance_lu: self.min_tolerance_lu,
+            overvoice_ratio_lu: self.overvoice_ratio_lu,
             max_gain_reduction_db: self.max_gain_reduction_db,
-            step_db_per_lu: self.step_db_per_lu,
-        }
-    }
-
-    fn gain_computer_config(&self) -> GainComputerConfig {
-        GainComputerConfig {
-            attack_seconds: self.attack_seconds,
-            hold_seconds: self.hold_seconds,
-            release_seconds: self.release_seconds,
-            max_rate_db_per_s: None,
+            speed: self.speed,
+            interview_passthrough_enabled: self.interview_passthrough_enabled,
         }
     }
 }
@@ -181,13 +174,13 @@ impl ProcessingState {
     /// `settings` - it's a property of the stream, not something a user configures.
     fn new(settings: &Settings, bed_channels: u32) -> Result<Self, com_is_assist_core::loudness::ConfigError> {
         Ok(Self {
-            processor: AutomixProcessor::new(
-                bed_channels,
-                SAMPLE_RATE,
-                settings.automix_config(),
-                settings.gain_computer_config(),
-                TICK_SECONDS,
-            )?,
+            processor: {
+                let mut processor =
+                    AutomixProcessor::new(bed_channels, SAMPLE_RATE, settings.automix_config(), TICK_SECONDS)?;
+                processor.set_lookahead_seconds(settings.lookahead_ms / 1000.0);
+                processor.set_automix_enabled(settings.automix_enabled);
+                processor
+            },
             divergence: (settings.divergence_percent / 100.0) as f32,
             mix_bed_pending: Vec::new(),
             mix_dialogue_pending: Vec::new(),
@@ -389,6 +382,17 @@ pub struct ComISAssist {
     /// (e.g. the ONNX Runtime binary couldn't be obtained) - callers then fail open (treat COM as
     /// always voice-active, matching the old pre-VAD behavior) rather than silently never ducking.
     voice_activity: Mutex<Option<SileroVad>>,
+    /// The second, Bed-side detector (`Specs/UI.md`'s "voice detector IS"), fed a mono downmix of
+    /// the *dry* Bed. Together with `voice_activity` it selects the automix state (see
+    /// `com_is_assist_core::automix::MixState`). Same fixed `SAMPLE_RATE` as the COM detector, so
+    /// it likewise doesn't need to wait on caps negotiation. `None` if construction failed, in
+    /// which case callers fail *closed* (IS treated as never voiced), which simply leaves the
+    /// ordinary duck/release states in play rather than inventing an interview/over-voice state.
+    is_voice_activity: Mutex<Option<SileroVad>>,
+    /// Bed's negotiated channel count, mirrored out of `ProcessingState` so the mono downmix for
+    /// `is_voice_activity` can be computed *without* holding the `state` lock - the two locks are
+    /// deliberately never held together (see `feed_voice_activity`). `0` until Bed's caps arrive.
+    bed_channels: AtomicU32,
     frame_indices: Mutex<FrameIndices>,
     bed_sink: gst::Pad,
     dialogue_sink: gst::Pad,
@@ -430,6 +434,35 @@ impl ComISAssist {
         lock_recover(&self.voice_activity).as_ref().map_or(true, |vad| vad.voice_active())
     }
 
+    /// Feeds one chunk of *dry* Bed audio into `is_voice_activity`, downmixed to mono (Silero is a
+    /// mono model, and "is anyone speaking anywhere on the Bed" is a whole-Bed question), and
+    /// returns the resulting state. Fails closed (`false`) if the detector wasn't constructed or
+    /// Bed's channel count isn't known yet. Locked and released without ever holding `state`, same
+    /// discipline as `feed_voice_activity`.
+    fn feed_is_voice_activity(&self, raw_bed: &[f32]) -> bool {
+        let channels = self.bed_channels.load(Ordering::Relaxed) as usize;
+        if channels == 0 {
+            return false;
+        }
+        let mono: Vec<f32> = raw_bed
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect();
+        match lock_recover(&self.is_voice_activity).as_mut() {
+            Some(vad) => {
+                let _ = vad.feed(&mono);
+                vad.voice_active()
+            }
+            None => false,
+        }
+    }
+
+    /// Reads the IS-side voice-active state without feeding new audio - for the Dialogue chain,
+    /// which has no Bed audio of its own. Fails closed, same as `feed_is_voice_activity`.
+    fn is_voice_active(&self) -> bool {
+        lock_recover(&self.is_voice_activity).as_ref().is_some_and(|vad| vad.voice_active())
+    }
+
     fn sink_chain(&self, is_bed: bool, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
         let map = buffer.map_readable().map_err(|_| {
             gst::element_error!(
@@ -465,6 +498,7 @@ impl ComISAssist {
             return;
         };
         let bed_channels = channels as u32;
+        self.bed_channels.store(bed_channels, Ordering::Relaxed);
 
         let mut state_guard = lock_recover(&self.state);
         let already_current = state_guard
@@ -507,11 +541,13 @@ impl ComISAssist {
     /// `state` must already be `Some` by the time this runs: GStreamer guarantees Bed's own Caps
     /// event precedes Bed's own first buffer, and `handle_bed_caps` constructs `state` right then.
     fn process_bed_chunk(&self, raw_bed: &[f32]) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let automix_enabled = lock_recover(&self.settings).automix_enabled;
         // No new Dialogue audio arrived in this call - just read whatever `voice_activity` last
         // settled on (see `voice_active`'s doc comment for the locking-order reason this is read
         // *before* `state` is locked below, not while it's held).
         let voice_active = self.voice_active();
+        // The IS detector gets this chunk's *dry* Bed (before `apply_gain_to_bed_chunk` below), so
+        // detection never depends on how hard the automix is currently ducking.
+        let is_voice_active = self.feed_is_voice_activity(raw_bed);
         let mut leveled_bed = raw_bed.to_vec();
 
         let (mix_ready, bed_channels) = {
@@ -524,11 +560,10 @@ impl ComISAssist {
                 );
                 gst::FlowError::Error
             })?;
-            state.processor.apply_gain_to_bed_chunk(&mut leveled_bed);
-
-            // Closed loop (Specs/TechnicalConcept.md section 4): the Bed meter observes the
-            // already-gained signal, not the dry one.
-            state.processor.feed_bed(&leveled_bed).map_err(|err| {
+            // Feed-forward (Specs/TechnicalConcept.md section 5.2): `process_bed` measures the dry
+            // signal, steps the fast loop stage and applies the resulting gain in sub-chunks, then
+            // applies the lookahead delay - all inside the shared core.
+            state.processor.process_bed(&mut leveled_bed).map_err(|err| {
                 gst::element_error!(
                     self.obj(),
                     gst::StreamError::Failed,
@@ -538,7 +573,7 @@ impl ComISAssist {
             })?;
             state.mix_bed_pending.extend_from_slice(&leveled_bed);
 
-            state.processor.maybe_run_control_step(automix_enabled, voice_active);
+            state.processor.maybe_run_control_step(voice_active, is_voice_active);
 
             (drain_mix_ready(state), state.processor.bed_channels())
         };
@@ -561,8 +596,8 @@ impl ComISAssist {
     /// `voice_activity`'s doc comment) - Dialogue's sample rate is fixed, so there's nothing to
     /// wait on there.
     fn process_dialogue_chunk(&self, raw_dialogue: &[f32]) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let automix_enabled = lock_recover(&self.settings).automix_enabled;
         let voice_active = self.feed_voice_activity(raw_dialogue);
+        let is_voice_active = self.is_voice_active();
 
         let (mix_ready, bed_channels) = {
             let mut state_guard = lock_recover(&self.state);
@@ -578,7 +613,7 @@ impl ComISAssist {
                     })?;
                     state.mix_dialogue_pending.extend_from_slice(raw_dialogue);
 
-                    state.processor.maybe_run_control_step(automix_enabled, voice_active);
+                    state.processor.maybe_run_control_step(voice_active, is_voice_active);
 
                     (drain_mix_ready(state), Some(state.processor.bed_channels()))
                 }
@@ -717,11 +752,23 @@ impl ComISAssist {
                 };
 
                 let live = bed_live || dialogue_live;
-                let min = bed_min.max(dialogue_min);
+
+                // Whatever lookahead is configured is genuinely held back before output, so it is
+                // this element's own added latency and must be reported. At the default of 0 this
+                // adds nothing and the element keeps the zero-added-latency property the OB-van
+                // deployment depends on (see the module header). Under-reporting it is not a
+                // cosmetic bug: a synced sink schedules rendering from the pipeline's total
+                // reported latency, and getting it wrong caused audible periodic glitching once
+                // before.
+                let own_latency = gst::ClockTime::from_nseconds(
+                    lock_recover(&self.settings).lookahead_ms as u64 * 1_000_000,
+                );
+
+                let min = bed_min.max(dialogue_min) + own_latency;
                 let max = match (bed_max, dialogue_max) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
+                    (Some(a), Some(b)) => Some(a.min(b) + own_latency),
+                    (Some(a), None) => Some(a + own_latency),
+                    (None, Some(b)) => Some(b + own_latency),
                     (None, None) => None,
                 };
                 q.set(live, min, max);
@@ -861,12 +908,16 @@ impl ObjectSubclass for ComISAssist {
         let voice_activity = SileroVad::new(SAMPLE_RATE, VoiceActivityConfig::default())
             .inspect_err(|err| eprintln!("[comisassist] voice-activity detection unavailable, failing open: {err}"))
             .ok();
+        // A second, independent detector instance for the Bed side - see `is_voice_activity`.
+        let is_voice_activity = SileroVad::new(SAMPLE_RATE, VoiceActivityConfig::default()).ok();
         Self {
             state: Mutex::new(None),
             pending_dialogue_before_state: Mutex::new(Vec::new()),
             bed_eos: AtomicBool::new(false),
             dialogue_eos: AtomicBool::new(false),
+            bed_channels: AtomicU32::new(0),
             voice_activity: Mutex::new(voice_activity),
+            is_voice_activity: Mutex::new(is_voice_activity),
             settings: Mutex::new(settings),
             frame_indices: Mutex::new(FrameIndices::default()),
             bed_sink,
@@ -896,23 +947,24 @@ impl ObjectImpl for ComISAssist {
                 glib::ParamSpecDouble::builder("target-ratio")
                     .default_value(AutomixEngineConfig::default().target_ratio_lu)
                     .build(),
-                glib::ParamSpecDouble::builder("max-tolerance")
-                    .default_value(AutomixEngineConfig::default().max_tolerance_lu)
+                glib::ParamSpecDouble::builder("overvoice-ratio")
+                    .default_value(AutomixEngineConfig::default().overvoice_ratio_lu)
                     .build(),
-                glib::ParamSpecDouble::builder("min-tolerance")
-                    .default_value(AutomixEngineConfig::default().min_tolerance_lu)
+                glib::ParamSpecDouble::builder("speed")
+                    .minimum(0.25)
+                    .maximum(4.0)
+                    .default_value(AutomixEngineConfig::default().speed)
+                    .build(),
+                glib::ParamSpecDouble::builder("lookahead-ms")
+                    .minimum(0.0)
+                    .maximum(20.0)
+                    .default_value(0.0)
+                    .build(),
+                glib::ParamSpecBoolean::builder("interview-passthrough-enable")
+                    .default_value(AutomixEngineConfig::default().interview_passthrough_enabled)
                     .build(),
                 glib::ParamSpecDouble::builder("max-gain-reduction-db")
                     .default_value(AutomixEngineConfig::default().max_gain_reduction_db)
-                    .build(),
-                glib::ParamSpecDouble::builder("attack-seconds")
-                    .default_value(GainComputerConfig::default().attack_seconds)
-                    .build(),
-                glib::ParamSpecDouble::builder("hold-seconds")
-                    .default_value(GainComputerConfig::default().hold_seconds)
-                    .build(),
-                glib::ParamSpecDouble::builder("release-seconds")
-                    .default_value(GainComputerConfig::default().release_seconds)
                     .build(),
                 glib::ParamSpecBoolean::builder("automix-enable")
                     .default_value(true)
@@ -934,6 +986,14 @@ impl ObjectImpl for ComISAssist {
                     .default_value(false)
                     .read_only()
                     .build(),
+                glib::ParamSpecBoolean::builder("voice-active-is")
+                    .default_value(false)
+                    .read_only()
+                    .build(),
+                glib::ParamSpecString::builder("current-mix-state")
+                    .default_value(Some("release"))
+                    .read_only()
+                    .build(),
             ]
         })
     }
@@ -941,12 +1001,13 @@ impl ObjectImpl for ComISAssist {
     fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
         match pspec.name() {
             "target-ratio" => lock_recover(&self.settings).target_ratio_lu.to_value(),
-            "max-tolerance" => lock_recover(&self.settings).max_tolerance_lu.to_value(),
-            "min-tolerance" => lock_recover(&self.settings).min_tolerance_lu.to_value(),
+            "overvoice-ratio" => lock_recover(&self.settings).overvoice_ratio_lu.to_value(),
+            "speed" => lock_recover(&self.settings).speed.to_value(),
+            "lookahead-ms" => lock_recover(&self.settings).lookahead_ms.to_value(),
+            "interview-passthrough-enable" => {
+                lock_recover(&self.settings).interview_passthrough_enabled.to_value()
+            }
             "max-gain-reduction-db" => lock_recover(&self.settings).max_gain_reduction_db.to_value(),
-            "attack-seconds" => lock_recover(&self.settings).attack_seconds.to_value(),
-            "hold-seconds" => lock_recover(&self.settings).hold_seconds.to_value(),
-            "release-seconds" => lock_recover(&self.settings).release_seconds.to_value(),
             "automix-enable" => lock_recover(&self.settings).automix_enabled.to_value(),
             "divergence" => lock_recover(&self.settings).divergence_percent.to_value(),
             "current-gain-reduction-db" => lock_recover(&self.state)
@@ -958,11 +1019,22 @@ impl ObjectImpl for ComISAssist {
                 0.0f64.to_value()
             }
             "voice-active" => self.voice_active().to_value(),
+            "voice-active-is" => self.is_voice_active().to_value(),
+            "current-mix-state" => lock_recover(&self.state)
+                .as_ref()
+                .map_or("release", |state| match state.processor.mix_state() {
+                    MixState::ReleaseToUnity => "release",
+                    MixState::DuckToTarget => "duck-target",
+                    MixState::InterviewPassthrough => "interview",
+                    MixState::DuckToOvervoice => "duck-overvoice",
+                })
+                .to_value(),
             _ => unimplemented!(),
         }
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        let mut lookahead_changed = false;
         // Updates the running `AutomixProcessor` in place via `set_config` (added once
         // `AutomixEngine`/`GainComputer` gained live-reconfiguration support) rather than
         // rebuilding `ProcessingState` from scratch - preserves accumulated loudness-meter
@@ -978,12 +1050,16 @@ impl ObjectImpl for ComISAssist {
             let mut settings = lock_recover(&self.settings);
             match pspec.name() {
                 "target-ratio" => settings.target_ratio_lu = value.get().unwrap(),
-                "max-tolerance" => settings.max_tolerance_lu = value.get().unwrap(),
-                "min-tolerance" => settings.min_tolerance_lu = value.get().unwrap(),
+                "overvoice-ratio" => settings.overvoice_ratio_lu = value.get().unwrap(),
+                    "speed" => settings.speed = value.get().unwrap(),
+                "lookahead-ms" => {
+                    settings.lookahead_ms = value.get().unwrap();
+                    lookahead_changed = true;
+                }
+                "interview-passthrough-enable" => {
+                    settings.interview_passthrough_enabled = value.get().unwrap()
+                }
                 "max-gain-reduction-db" => settings.max_gain_reduction_db = value.get().unwrap(),
-                "attack-seconds" => settings.attack_seconds = value.get().unwrap(),
-                "hold-seconds" => settings.hold_seconds = value.get().unwrap(),
-                "release-seconds" => settings.release_seconds = value.get().unwrap(),
                 "divergence" => settings.divergence_percent = value.get().unwrap(),
                 "automix-enable" => settings.automix_enabled = value.get().unwrap(),
                 _ => unimplemented!(),
@@ -991,12 +1067,21 @@ impl ObjectImpl for ComISAssist {
             *settings
         };
 
+        if lookahead_changed {
+            // The element's own latency contribution just changed, so the pipeline has to
+            // re-run its latency negotiation - otherwise synced sinks keep scheduling against
+            // the previous value.
+            let _ = self.obj().post_message(gst::message::Latency::builder().src(&*self.obj()).build());
+        }
+
         // Nothing to update yet if Bed's caps haven't arrived (see `handle_bed_caps`) - the fresh
         // `Settings` will be picked up whenever it first constructs `ProcessingState`.
         if let Some(state) = lock_recover(&self.state).as_mut() {
-            state.processor.set_config(settings_snapshot.automix_config(), settings_snapshot.gain_computer_config());
-            // Not part of `AutomixEngineConfig`/`GainComputerConfig` (it's a GStreamer-wrapper-only
-            // concept, not shared core config), so `set_config` above doesn't touch it.
+            state.processor.set_config(settings_snapshot.automix_config());
+            state.processor.set_lookahead_seconds(settings_snapshot.lookahead_ms / 1000.0);
+            state.processor.set_automix_enabled(settings_snapshot.automix_enabled);
+            // Not part of `AutomixEngineConfig` (it's a GStreamer-wrapper-only concept, not shared
+            // core config), so `set_config` above doesn't touch it.
             state.divergence = (settings_snapshot.divergence_percent / 100.0) as f32;
         }
     }
