@@ -1,7 +1,6 @@
 mod automix_engine;
 mod dialogue_mix;
 mod envelope_detector;
-mod delay_line;
 mod fast_loudness;
 mod gain_ramp;
 mod loop_bank;
@@ -9,7 +8,6 @@ mod mix_state;
 mod processor;
 
 pub use automix_engine::{AutomixEngine, AutomixEngineConfig, AutomixResult, LoudnessSnapshot};
-pub use delay_line::DelayLine;
 pub use fast_loudness::FastLoudnessMeter;
 pub use loop_bank::{LoopBank, LoopBankConfig, LoopContributions};
 pub use mix_state::MixState;

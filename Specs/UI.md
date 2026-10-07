@@ -3,9 +3,9 @@
 ## Implementation status
 
 Parameters (both wrappers unless noted; see `Specs/GSTdefinitions.md`/`Specs/vstDefinitions.md` for exact names):
-- **Implemented**: Com/IS distance (`target-ratio`), Over-voice ratio (`overvoice-ratio`), Speed (`speed`), Lookahead (`lookahead-ms`), Interview passthrough on/off (`interview-passthrough*`), Voice divergence (`divergence`, both wrappers — restricted to Left/Right/Center, see `mix_dialogue_into_bed`; GStreamer's Bed is 2-6ch dynamically negotiated, and has no audible effect below a 3ch/Center-having layout).
+- **Implemented**: Com/IS distance (`target-ratio`), Over-voice ratio (`overvoice-ratio`), Speed (`speed`), Voice divergence (`divergence`, both wrappers — restricted to Left/Right/Center, see `mix_dialogue_into_bed`; GStreamer's Bed is 2-6ch dynamically negotiated, and has no audible effect below a 3ch/Center-having layout).
 - **"voice detector comm" - implemented, but not as an on/off toggle.** Real voice-activity detection (Silero VAD, via `com_is_assist_core::voice_activity::SileroVad`) gates the ratio/automix control loop directly, replacing the old flat -70dB LUFS-floor "is COM currently silent?" stand-in - see `Specs/TechnicalConcept.md` section 6. Always on, not exposed as a disable-able parameter: turning it off would just reintroduce the exact problem it fixes (Bed getting reduced in response to COM having *some* sound - room tone, static, another open mic - that isn't actually speech).
-- **"voice detector IS" - implemented.** A second, independent `SileroVad` instance runs on a mono downmix of the dry Bed. Like the COM detector it is always on rather than switchable; what *is* switchable is the behavior it unlocks — see "Interview passthrough" below. Together the two detectors select the automix state (section 5.1 of `TechnicalConcept.md`).
+- **"voice detector IS" - implemented.** A second, independent `SileroVad` instance runs on a mono downmix of the dry Bed. Like the COM detector it is always on rather than switchable. When it finds voice on the original while Comm is silent, the bed recovers to unity faster than normal; when both carry voice, the higher Over-voice ratio applies. Together the two detectors select the automix state (section 5.1 of `TechnicalConcept.md`).
 - **Not yet implemented**: Reset loudness.
 
 Display:
@@ -20,7 +20,7 @@ The mixer does exactly one of four things at any moment, chosen by the two voice
 |---|---|---|
 | no | no | Bed recovers to unity |
 | yes | no | Bed is ducked until **Com/IS distance** is met |
-| no | yes | Bed recovers to unity *faster* — only if *Interview passthrough* is on, otherwise treated as the first row |
+| no | yes | Bed recovers to unity *faster* (voice on the original is worth hearing) |
 | yes | yes | Bed is ducked until the higher **Over-voice ratio** is met |
 
 How *fast* each of those happens is set by **Speed**, not by per-state times.
@@ -33,20 +33,14 @@ How *fast* each of those happens is set by **Speed**, not by per-state times.
 # Speed
 How quickly the mixer responds, as a single control. There are no separate attack/release times any more: the leveling is built from three control loops at different speeds (a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges), and the resulting attack and release behaviour emerges from how they interact. Long and gentle when the programme is steady, very quick when something jumps. Speed scales all three together: raise it if the mix feels sluggish, lower it if it breathes.
 
-# Lookahead
-0 by default. Delays the audio slightly so the control loops can see a transient coming and act before it reaches the output. Costs exactly that much latency, which the plugin reports to the host, so leave it at 0 for live/OB use unless you specifically want it.
-
 # Over-voice ratio
 The distance required when Comm *and* IS both have voice (a possible over-voice situation, e.g. commentary over an interview or a speaking crowd mic). An absolute value, not an offset on Com/IS distance, and normally set higher than it so the commentator stays intelligible over the competing voice.
-
-# Interview passthrough
-on/off. Enables the behavior above. **Off by default**: a loud PA or stadium announcement also registers as voice on IS, and bringing the Bed back up fast on that is risky on air, so it has to be switched on deliberately.
 
 # voice detector comm
 Always on (not a parameter) — see Implementation status.
 
 # voice detector IS
-Always on (not a parameter) — see Implementation status. The switchable part is *Interview passthrough*.
+Always on (not a parameter) — see Implementation status. When it detects voice on the original while Comm is silent, the bed recovers to unity faster than normal. This is always active; there is no switch.
 
 # Voice divergence
 0% = Center only up to 100% = LR only

@@ -105,10 +105,6 @@ struct Settings {
     /// former attack/hold/release/adaptation/interview-release set, which the multi-loop cascade
     /// made meaningless (its effective ballistics are emergent).
     speed: f64,
-    /// Lookahead in milliseconds, default 0. Non-zero delays both outputs and is added to the
-    /// element's reported latency.
-    lookahead_ms: f64,
-    interview_passthrough_enabled: bool,
     automix_enabled: bool,
     /// "Voice divergence" (`Specs/UI.md`), 0.0-100.0 (a percentage, matching the VST3 wrapper's
     /// convention): 0% = Dialogue is Center-only in `mix_src` when Bed has a Center channel
@@ -126,8 +122,6 @@ impl Default for Settings {
             overvoice_ratio_lu: automix.overvoice_ratio_lu,
             max_gain_reduction_db: automix.max_gain_reduction_db,
             speed: automix.speed,
-            lookahead_ms: 0.0,
-            interview_passthrough_enabled: automix.interview_passthrough_enabled,
             automix_enabled: true,
             divergence_percent: 0.0,
         }
@@ -141,7 +135,6 @@ impl Settings {
             overvoice_ratio_lu: self.overvoice_ratio_lu,
             max_gain_reduction_db: self.max_gain_reduction_db,
             speed: self.speed,
-            interview_passthrough_enabled: self.interview_passthrough_enabled,
         }
     }
 }
@@ -177,7 +170,6 @@ impl ProcessingState {
             processor: {
                 let mut processor =
                     AutomixProcessor::new(bed_channels, SAMPLE_RATE, settings.automix_config(), TICK_SECONDS)?;
-                processor.set_lookahead_seconds(settings.lookahead_ms / 1000.0);
                 processor.set_automix_enabled(settings.automix_enabled);
                 processor
             },
@@ -561,8 +553,8 @@ impl ComISAssist {
                 gst::FlowError::Error
             })?;
             // Feed-forward (Specs/TechnicalConcept.md section 5.2): `process_bed` measures the dry
-            // signal, steps the fast loop stage and applies the resulting gain in sub-chunks, then
-            // applies the lookahead delay - all inside the shared core.
+            // signal, then steps the fast loop stage and applies the resulting gain in sub-chunks -
+            // all inside the shared core, in place, adding no latency.
             state.processor.process_bed(&mut leveled_bed).map_err(|err| {
                 gst::element_error!(
                     self.obj(),
@@ -753,22 +745,15 @@ impl ComISAssist {
 
                 let live = bed_live || dialogue_live;
 
-                // Whatever lookahead is configured is genuinely held back before output, so it is
-                // this element's own added latency and must be reported. At the default of 0 this
-                // adds nothing and the element keeps the zero-added-latency property the OB-van
-                // deployment depends on (see the module header). Under-reporting it is not a
-                // cosmetic bug: a synced sink schedules rendering from the pipeline's total
-                // reported latency, and getting it wrong caused audible periodic glitching once
-                // before.
-                let own_latency = gst::ClockTime::from_nseconds(
-                    lock_recover(&self.settings).lookahead_ms as u64 * 1_000_000,
-                );
-
-                let min = bed_min.max(dialogue_min) + own_latency;
+                // This element adds **zero** latency of its own: it forwards audio the moment it
+                // arrives and holds nothing back, so it only combines what its peers report. Not an
+                // assumption - the feed-forward DSP measures and gains the same block in place
+                // (`AutomixProcessor::process_bed`), with no buffering anywhere in the path.
+                let min = bed_min.max(dialogue_min);
                 let max = match (bed_max, dialogue_max) {
-                    (Some(a), Some(b)) => Some(a.min(b) + own_latency),
-                    (Some(a), None) => Some(a + own_latency),
-                    (None, Some(b)) => Some(b + own_latency),
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
                     (None, None) => None,
                 };
                 q.set(live, min, max);
@@ -955,14 +940,6 @@ impl ObjectImpl for ComISAssist {
                     .maximum(4.0)
                     .default_value(AutomixEngineConfig::default().speed)
                     .build(),
-                glib::ParamSpecDouble::builder("lookahead-ms")
-                    .minimum(0.0)
-                    .maximum(20.0)
-                    .default_value(0.0)
-                    .build(),
-                glib::ParamSpecBoolean::builder("interview-passthrough-enable")
-                    .default_value(AutomixEngineConfig::default().interview_passthrough_enabled)
-                    .build(),
                 glib::ParamSpecDouble::builder("max-gain-reduction-db")
                     .default_value(AutomixEngineConfig::default().max_gain_reduction_db)
                     .build(),
@@ -1003,10 +980,6 @@ impl ObjectImpl for ComISAssist {
             "target-ratio" => lock_recover(&self.settings).target_ratio_lu.to_value(),
             "overvoice-ratio" => lock_recover(&self.settings).overvoice_ratio_lu.to_value(),
             "speed" => lock_recover(&self.settings).speed.to_value(),
-            "lookahead-ms" => lock_recover(&self.settings).lookahead_ms.to_value(),
-            "interview-passthrough-enable" => {
-                lock_recover(&self.settings).interview_passthrough_enabled.to_value()
-            }
             "max-gain-reduction-db" => lock_recover(&self.settings).max_gain_reduction_db.to_value(),
             "automix-enable" => lock_recover(&self.settings).automix_enabled.to_value(),
             "divergence" => lock_recover(&self.settings).divergence_percent.to_value(),
@@ -1034,9 +1007,7 @@ impl ObjectImpl for ComISAssist {
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-        let mut lookahead_changed = false;
-        // Updates the running `AutomixProcessor` in place via `set_config` (added once
-        // `AutomixEngine`/`GainComputer` gained live-reconfiguration support) rather than
+        // Updates the running `AutomixProcessor` in place via `set_config` rather than
         // rebuilding `ProcessingState` from scratch - preserves accumulated loudness-meter
         // history, the in-progress gain ramp, and any pending mix-alignment buffers, none of
         // which a full rebuild could keep.
@@ -1051,34 +1022,19 @@ impl ObjectImpl for ComISAssist {
             match pspec.name() {
                 "target-ratio" => settings.target_ratio_lu = value.get().unwrap(),
                 "overvoice-ratio" => settings.overvoice_ratio_lu = value.get().unwrap(),
-                    "speed" => settings.speed = value.get().unwrap(),
-                "lookahead-ms" => {
-                    settings.lookahead_ms = value.get().unwrap();
-                    lookahead_changed = true;
-                }
-                "interview-passthrough-enable" => {
-                    settings.interview_passthrough_enabled = value.get().unwrap()
-                }
+                "speed" => settings.speed = value.get().unwrap(),
                 "max-gain-reduction-db" => settings.max_gain_reduction_db = value.get().unwrap(),
-                "divergence" => settings.divergence_percent = value.get().unwrap(),
                 "automix-enable" => settings.automix_enabled = value.get().unwrap(),
+                "divergence" => settings.divergence_percent = value.get().unwrap(),
                 _ => unimplemented!(),
             }
             *settings
         };
 
-        if lookahead_changed {
-            // The element's own latency contribution just changed, so the pipeline has to
-            // re-run its latency negotiation - otherwise synced sinks keep scheduling against
-            // the previous value.
-            let _ = self.obj().post_message(gst::message::Latency::builder().src(&*self.obj()).build());
-        }
-
         // Nothing to update yet if Bed's caps haven't arrived (see `handle_bed_caps`) - the fresh
         // `Settings` will be picked up whenever it first constructs `ProcessingState`.
         if let Some(state) = lock_recover(&self.state).as_mut() {
             state.processor.set_config(settings_snapshot.automix_config());
-            state.processor.set_lookahead_seconds(settings_snapshot.lookahead_ms / 1000.0);
             state.processor.set_automix_enabled(settings_snapshot.automix_enabled);
             // Not part of `AutomixEngineConfig` (it's a GStreamer-wrapper-only concept, not shared
             // core config), so `set_config` above doesn't touch it.

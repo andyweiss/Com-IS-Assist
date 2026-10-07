@@ -65,20 +65,6 @@ fn env_f64(name: &str, default: f64) -> f64 {
     }
 }
 
-fn env_bool(name: &str, default: bool) -> bool {
-    match env::var(name) {
-        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            other => {
-                eprintln!("ignoring {name}={other:?} (not a boolean), using {default}");
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
-
 /// Averages an interleaved multichannel block to mono for the IS-side voice detector (Silero is a
 /// mono model). Every wrapper does the same reduction so the detector sees identical input.
 fn downmix_to_mono(interleaved: &[f32], channels: u32) -> Vec<f32> {
@@ -118,7 +104,7 @@ fn main() -> ExitCode {
         eprintln!();
         eprintln!("Config overrides (environment variables, all optional):");
         eprintln!("  COMIS_TARGET_RATIO_LU, COMIS_OVERVOICE_RATIO_LU, COMIS_MAX_GAIN_REDUCTION_DB,");
-        eprintln!("  COMIS_SPEED, COMIS_LOOKAHEAD_MS, COMIS_INTERVIEW_PASSTHROUGH,");
+        eprintln!("  COMIS_SPEED,");
         eprintln!("  COMIS_VAD_HANGOVER_SECONDS");
         return ExitCode::FAILURE;
     }
@@ -162,7 +148,6 @@ fn main() -> ExitCode {
         overvoice_ratio_lu: env_f64("COMIS_OVERVOICE_RATIO_LU", defaults.overvoice_ratio_lu),
         max_gain_reduction_db: env_f64("COMIS_MAX_GAIN_REDUCTION_DB", defaults.max_gain_reduction_db),
         speed: env_f64("COMIS_SPEED", defaults.speed),
-        interview_passthrough_enabled: env_bool("COMIS_INTERVIEW_PASSTHROUGH", defaults.interview_passthrough_enabled),
     };
 
     let mut processor = match AutomixProcessor::new(bed_channels, sample_rate, config, TICK_SECONDS) {
@@ -172,7 +157,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    processor.set_lookahead_seconds(env_f64("COMIS_LOOKAHEAD_MS", 0.0) / 1000.0);
 
     // Real voice-activity detection on both sides - together they select the automix state.
     // COM fails open (always voiced), IS fails closed, matching both plugin wrappers.
@@ -258,9 +242,6 @@ ratio_lu,target_lu,r_slow,r_mid,r_fast,gain_reduction_db"
         let mut leveled_bed = dry_bed.to_vec();
         processor.process_bed(&mut leveled_bed).expect("process bed");
 
-        let mut dialogue_out = dry_dialogue.to_vec();
-        processor.delay_dialogue(&mut dialogue_out);
-
         processor.maybe_run_control_step(com_voice_active, is_voice_active);
 
         let c = processor.contributions();
@@ -283,7 +264,7 @@ ratio_lu,target_lu,r_slow,r_mid,r_fast,gain_reduction_db"
 
         if let Some((leveled_bed_writer, mix_writer)) = render.as_mut() {
             for frame in 0..frames_read {
-                let dialogue_sample = dialogue_out[frame];
+                let dialogue_sample = dry_dialogue[frame];
                 for channel in 0..bed_channels as usize {
                     let bed_sample = leveled_bed[frame * bed_channels as usize + channel];
                     leveled_bed_writer.write_sample(bed_sample).expect("write leveled_bed sample");

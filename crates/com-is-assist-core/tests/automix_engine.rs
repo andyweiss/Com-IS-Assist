@@ -30,7 +30,7 @@ fn run(engine: &mut AutomixEngine, ticks: usize, snap: LoudnessSnapshot, com: bo
 
 #[test]
 fn each_vad_combination_selects_the_expected_state() {
-    let config = AutomixEngineConfig { interview_passthrough_enabled: true, ..Default::default() };
+    let config = AutomixEngineConfig::default();
     let snap = snapshot(-20.0, -20.0);
 
     let cases = [
@@ -43,16 +43,6 @@ fn each_vad_combination_selects_the_expected_state() {
         let mut engine = engine_with(config);
         assert_eq!(engine.process_tick(snap, com, is, TICK).state, expected);
     }
-}
-
-#[test]
-fn interview_passthrough_disabled_makes_is_only_voice_an_ordinary_release() {
-    let mut engine = engine_with(AutomixEngineConfig {
-        interview_passthrough_enabled: false,
-        ..Default::default()
-    });
-    let result = engine.process_tick(snapshot(-20.0, -20.0), false, true, TICK);
-    assert_eq!(result.state, MixState::ReleaseToUnity);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,9 +233,40 @@ fn a_short_gap_does_not_start_releasing() {
     );
 }
 
+/// The hold must freeze the **whole** cascade, not just the stages that happen to be stepped from
+/// the control tick. The fast stage steps from the audio path instead, and originally carried on
+/// decaying through the hold - measured as up to 1.25dB of unintended recovery inside the hold
+/// window on real commentary, and up to its full authority in the worst case.
+#[test]
+fn the_release_hold_freezes_the_fast_stage_too() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    let snap = snapshot(-20.0, -26.0);
+    run(&mut engine, 400, snap, true, false);
+
+    // Drive the fast stage up with a Bed surge, so it has something to leak.
+    for _ in 0..200 {
+        engine.process_fast(0.0, -26.0, 0.0013);
+    }
+    let fast_before = engine.contributions().fast_db;
+    assert!(fast_before > 0.5, "sanity: fast stage should have engaged, got {fast_before}dB");
+
+    // COM goes quiet. Inside the hold, nothing may move - including the fast stage, even though it
+    // is stepped from the audio path many times per control tick.
+    engine.process_tick(snapshot(-20.0, -100.0), false, false, TICK);
+    for _ in 0..200 {
+        engine.process_fast(0.0, -100.0, 0.0013);
+    }
+
+    assert!(
+        (engine.contributions().fast_db - fast_before).abs() < 1e-9,
+        "fast stage leaked from {fast_before}dB to {}dB during the hold",
+        engine.contributions().fast_db
+    );
+}
+
 #[test]
 fn interview_passthrough_recovers_faster_than_an_ordinary_release() {
-    let config = AutomixEngineConfig { interview_passthrough_enabled: true, ..Default::default() };
+    let config = AutomixEngineConfig::default();
     let quiet = snapshot(-20.0, -100.0);
 
     let mut ordinary = engine_with(config);

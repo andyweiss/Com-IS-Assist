@@ -1,7 +1,7 @@
 use ebur128::Error as Ebur128Error;
 
 use crate::automix::{
-    apply_ramped_gain, AutomixEngine, AutomixEngineConfig, DelayLine, FastLoudnessMeter, LoopContributions,
+    apply_ramped_gain, AutomixEngine, AutomixEngineConfig, FastLoudnessMeter, LoopContributions,
     LoudnessSnapshot, MixState,
 };
 use crate::loudness::{ConfigError, Ebur128Meter};
@@ -49,11 +49,6 @@ pub struct AutomixProcessor {
 
     automix_engine: AutomixEngine,
 
-    /// Optional lookahead. Both paths are delayed by the same amount so the Mix stays aligned; the
-    /// detectors above tap the signal *before* this, which is what gives the fast stage preview.
-    bed_delay: DelayLine,
-    dialogue_delay: DelayLine,
-
     /// The gain actually applied to the most recent sample, so the next chunk can ramp from it
     /// rather than stepping. Replaces the old tick-length ramp: with the fast stage updating every
     /// sub-chunk there is no fixed ramp window any more.
@@ -87,8 +82,6 @@ impl AutomixProcessor {
             bed_fast: FastLoudnessMeter::new(&bed_map, sample_rate, FAST_WINDOW_SECONDS),
             dialogue_reference_lufs: Ebur128Meter::NEGATIVE_INFINITY_DB,
             automix_engine: AutomixEngine::new(automix_config),
-            bed_delay: DelayLine::new(bed_channels),
-            dialogue_delay: DelayLine::new(1),
             current_gain: 1.0,
             automix_enabled: true,
             bed_frames_since_control: 0,
@@ -110,43 +103,28 @@ impl AutomixProcessor {
         self.automix_engine.set_config(automix_config);
     }
 
-    /// Sets the lookahead. `0.0` (the default) is a genuine no-op and keeps both wrappers' zero
-    /// added latency. Wrappers must report [`Self::lookahead_frames`] to their host/pipeline.
-    pub fn set_lookahead_seconds(&mut self, seconds: f64) {
-        let frames = (seconds.max(0.0) * self.sample_rate as f64).round() as usize;
-        self.bed_delay.set_delay_frames(frames);
-        self.dialogue_delay.set_delay_frames(frames);
-    }
-
-    pub fn lookahead_frames(&self) -> usize {
-        self.bed_delay.delay_frames()
-    }
-
     /// `false` bypasses automix: Bed passes at unity gain. Metering keeps running.
     pub fn set_automix_enabled(&mut self, enabled: bool) {
         self.automix_enabled = enabled;
     }
 
-    /// Feeds one chunk of *dry* Dialogue into both Dialogue detectors and advances the control
-    /// cadence. Dialogue is never gained, so there is no equivalent of `process_bed` on this side -
-    /// only [`Self::delay_dialogue`], for lookahead alignment.
+    /// Feeds one chunk of *dry* Dialogue into the Dialogue meter and advances the control cadence.
+    /// Dialogue is never gained and never delayed, so there is no equivalent of `process_bed` on
+    /// this side - the caller forwards its own buffer untouched.
     pub fn feed_dialogue(&mut self, dry_dialogue: &[f32]) -> Result<(), Ebur128Error> {
         self.dialogue_meter.push_frames(dry_dialogue)?;
         self.dialogue_frames_since_control += dry_dialogue.len() as u64;
         Ok(())
     }
 
-    /// Applies the lookahead delay to the Dialogue output path. No-op unless lookahead is set.
-    pub fn delay_dialogue(&mut self, dialogue: &mut [f32]) {
-        self.dialogue_delay.process(dialogue);
-    }
-
-    /// The Bed signal path, in place: measures the dry signal, steps the fast stage and applies the
-    /// resulting gain in sub-chunks, then delays the output.
+    /// The Bed signal path, in place: measures the dry signal, then steps the fast stage and
+    /// applies the resulting gain in sub-chunks.
     ///
-    /// Order matters and is the whole feed-forward idea: everything is *measured* before any gain
-    /// or delay is applied to it, so the control value that reaches a given sample was derived from
-    /// that same sample rather than from one three seconds old.
+    /// Order matters and is the whole feed-forward idea: audio is *measured* before any gain is
+    /// applied to it, so the control value that reaches a given sample was derived from that same
+    /// sample rather than from one three seconds old. Nothing is buffered or held back, so this
+    /// path adds exactly zero latency - a property the GStreamer deployment depends on (see
+    /// `Specs/TechnicalConcept.md` section 7).
     pub fn process_bed(&mut self, bed: &mut [f32]) -> Result<(), Ebur128Error> {
         let channels = self.bed_channels as usize;
         if channels == 0 || bed.is_empty() {
@@ -176,9 +154,6 @@ impl AutomixProcessor {
                 1.0
             };
 
-            // Lookahead: the detector above saw this sub-chunk dry and undelayed; the audio that
-            // now gets gained is from `lookahead` frames earlier.
-            self.bed_delay.process(subchunk);
             apply_ramped_gain(subchunk, self.bed_channels, self.current_gain, target_gain);
             self.current_gain = target_gain;
         }

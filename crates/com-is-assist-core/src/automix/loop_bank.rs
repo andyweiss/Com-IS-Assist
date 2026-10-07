@@ -75,7 +75,7 @@ pub struct LoopContributions {
 }
 
 /// The multi-loop gain computer: three cascaded stages whose reductions add in dB (equivalently,
-/// whose gains multiply — the three VCAs of the Jünger reference topology).
+/// whose gains multiply — i.e. three cascaded gain elements, the classic multi-loop topology).
 ///
 /// Each stage is fed a `required` reduction derived **feed-forward** from the dry signals at its own
 /// integration time (see `Specs/TechnicalConcept.md` section 5.2). Because reducing the Bed by 1 dB
@@ -105,6 +105,12 @@ pub struct LoopBank {
     /// Set by the most recent update so the fast stage, which steps between control ticks, knows
     /// whether it should be driving toward a target or toward unity.
     releasing: bool,
+    /// Whether the release hold is currently blocking recovery. The fast stage has to consult this
+    /// too: it steps from `process_bed` rather than from `update_release`, so without it the hold
+    /// froze only the slow and mid stages while the fast stage carried on decaying - measured as
+    /// 0.35-1.25dB of unintended recovery inside the hold window on real commentary, and up to its
+    /// full 4dB authority in the worst case. "Hold" has to mean the whole cascade holds.
+    hold_blocks_release: bool,
     release_speedup: f64,
 }
 
@@ -117,6 +123,7 @@ impl LoopBank {
             fast: EnvelopeDetector::new(0.0),
             hold_remaining_seconds: 0.0,
             releasing: false,
+            hold_blocks_release: false,
             release_speedup: 1.0,
         }
     }
@@ -150,6 +157,7 @@ impl LoopBank {
         dt_seconds: f64,
     ) {
         self.releasing = false;
+        self.hold_blocks_release = false;
         self.release_speedup = 1.0;
         self.hold_remaining_seconds = RELEASE_HOLD_SECONDS;
 
@@ -170,6 +178,9 @@ impl LoopBank {
     /// detector. Trims whatever slow+mid currently contribute, within `fast_authority_db`.
     pub fn update_fast(&mut self, required_fast_db: Option<f64>, dt_seconds: f64) {
         let target = match (self.releasing, required_fast_db) {
+            // Releasing, but the hold is still blocking recovery: freeze, exactly as the slow and
+            // mid stages do. See `hold_blocks_release`.
+            (true, _) if self.hold_blocks_release => self.fast.value(),
             (true, _) => 0.0,
             (false, None) => self.fast.value(), // unusable reading: hold
             (false, Some(required)) => {
@@ -195,8 +206,11 @@ impl LoopBank {
         self.releasing = true;
         self.release_speedup = if interview { INTERVIEW_RELEASE_SPEEDUP } else { 1.0 };
 
-        // Hold the current reduction through short gaps before letting go at all.
-        if self.hold_remaining_seconds > 0.0 && !interview {
+        // Hold the current reduction through short gaps before letting go at all. Interview
+        // passthrough deliberately skips the hold - its whole purpose is to get back to unity
+        // quickly.
+        self.hold_blocks_release = self.hold_remaining_seconds > 0.0 && !interview;
+        if self.hold_blocks_release {
             self.hold_remaining_seconds -= dt_seconds;
             return;
         }
@@ -231,6 +245,7 @@ impl LoopBank {
         self.fast.reset(0.0);
         self.hold_remaining_seconds = 0.0;
         self.releasing = false;
+        self.hold_blocks_release = false;
         self.release_speedup = 1.0;
     }
 }

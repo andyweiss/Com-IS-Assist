@@ -34,10 +34,6 @@ pub struct AutomixEngineConfig {
     /// the effective attack and release are emergent, so the individual times had nothing
     /// meaningful left to set.
     pub speed: f64,
-    /// Whether voice-on-IS-only may select [`MixState::InterviewPassthrough`] (a fast recovery to
-    /// unity) rather than an ordinary release. Off by default: a loud PA or stadium announcement
-    /// also reads as "voice on IS", and recovering the Bed *fast* on that is risky on air.
-    pub interview_passthrough_enabled: bool,
 }
 
 impl Default for AutomixEngineConfig {
@@ -47,7 +43,6 @@ impl Default for AutomixEngineConfig {
             overvoice_ratio_lu: 8.0,
             max_gain_reduction_db: 24.0,
             speed: 1.0,
-            interview_passthrough_enabled: false,
         }
     }
 }
@@ -137,11 +132,7 @@ impl AutomixEngine {
         is_voice_active: bool,
         dt_seconds: f64,
     ) -> AutomixResult {
-        let state = MixState::from_vad(
-            com_voice_active,
-            is_voice_active,
-            self.config.interview_passthrough_enabled,
-        );
+        let state = MixState::from_vad(com_voice_active, is_voice_active);
 
         if state.is_ducking() {
             // Note there is deliberately **no** voice-onset fast trigger here. The feedback design

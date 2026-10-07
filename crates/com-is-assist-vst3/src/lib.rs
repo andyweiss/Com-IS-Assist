@@ -149,16 +149,6 @@ struct ComISAssistParams {
     /// if it breathes.
     #[id = "speed"]
     pub speed: FloatParam,
-    /// Lookahead in milliseconds, default 0. Non-zero delays both Bed and Dialogue so the loops can
-    /// act on a transient before it reaches the output, and the plugin reports the delay to the
-    /// host as latency.
-    #[id = "lookahead-ms"]
-    pub lookahead_ms: FloatParam,
-    /// Enables the interview-passthrough state at all. Off by default: a loud PA or stadium
-    /// announcement also reads as "voice on IS", and recovering the Bed fast on that is risky on
-    /// air - see `com_is_assist_core::automix::MixState`.
-    #[id = "interview-passthrough"]
-    pub interview_passthrough: BoolParam,
     /// `true` bypasses automix entirely (Bed passes through at unity gain, no ducking) - `false`
     /// (default) is normal operation. Inverted from the earlier `automix-enable` naming/polarity
     /// to match the conventional meaning of a "Bypass" control.
@@ -229,14 +219,6 @@ impl Default for ComISAssistParams {
             )
             .with_step_size(0.05)
             .with_unit("x"),
-            lookahead_ms: FloatParam::new(
-                "Lookahead",
-                0.0,
-                FloatRange::Linear { min: 0.0, max: 20.0 },
-            )
-            .with_step_size(0.5)
-            .with_unit(" ms"),
-            interview_passthrough: BoolParam::new("Interview Passthrough", automix.interview_passthrough_enabled),
             bypass: BoolParam::new("Bypass", false),
             mix_dialogue_to_bed: BoolParam::new("Mix Dialogue to Bed", true),
             divergence: FloatParam::new("Voice Divergence", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
@@ -253,7 +235,6 @@ impl ComISAssistParams {
             overvoice_ratio_lu: self.overvoice_ratio.value() as f64,
             max_gain_reduction_db: self.max_gain_reduction_db.value() as f64,
             speed: self.speed.value() as f64,
-            interview_passthrough_enabled: self.interview_passthrough.value(),
         }
     }
 }
@@ -671,10 +652,6 @@ impl Plugin for ComISAssist {
                                         ui.add(ParamSlider::for_param(&params.speed, setter));
                                         ui.end_row();
 
-                                        ui.label("Lookahead");
-                                        ui.add(ParamSlider::for_param(&params.lookahead_ms, setter));
-                                        ui.end_row();
-
                                         ui.label("Voice divergence");
                                         ui.add(ParamSlider::for_param(&params.divergence, setter));
                                         ui.end_row();
@@ -684,13 +661,6 @@ impl Plugin for ComISAssist {
                                 bool_param_checkbox(ui, setter, &params.bypass, "Bypass");
                                 ui.add_space(10.0);
                                 bool_param_checkbox(ui, setter, &params.mix_dialogue_to_bed, "Mix dialogue to bed");
-                                ui.add_space(10.0);
-                                bool_param_checkbox(
-                                    ui,
-                                    setter,
-                                    &params.interview_passthrough,
-                                    "Interview passthrough (IS voice \u{2192} fast recovery)",
-                                );
 
                                 // The live state-machine readout. With the mixer's behavior now
                                 // defined entirely by which of four states it's in, showing that
@@ -739,7 +709,7 @@ impl Plugin for ComISAssist {
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        context: &mut impl InitContext<Self>,
+        _context: &mut impl InitContext<Self>,
     ) -> bool {
         self.processor = AutomixProcessor::new(
             BED_CHANNELS,
@@ -748,11 +718,6 @@ impl Plugin for ComISAssist {
             TICK_SECONDS,
         )
         .ok();
-        if let Some(processor) = self.processor.as_mut() {
-            processor.set_lookahead_seconds(self.params.lookahead_ms.value() as f64 / 1000.0);
-            // Tell the host up front, so delay compensation is right from the first block.
-            context.set_latency_samples(processor.lookahead_frames() as u32);
-        }
         // `.ok()`, not `.expect(...)`: if this fails (e.g. the ONNX Runtime binary couldn't be
         // obtained), `process()` fails open rather than the whole plugin refusing to initialize
         // over what's ultimately just a display/gating refinement, not the core automix path.
@@ -768,7 +733,7 @@ impl Plugin for ComISAssist {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        context: &mut impl ProcessContext<Self>,
+        _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let Some(processor) = self.processor.as_mut() else {
             return ProcessStatus::Error("processor not initialized");
@@ -779,13 +744,6 @@ impl Plugin for ComISAssist {
         // a couple of struct copies - and preserves all accumulated state (loudness detectors, the
         // loop stages' in-flight values), unlike rebuilding the processor would.
         processor.set_config(self.params.automix_config());
-        let previous_lookahead = processor.lookahead_frames();
-        processor.set_lookahead_seconds(self.params.lookahead_ms.value() as f64 / 1000.0);
-        if processor.lookahead_frames() != previous_lookahead {
-            // Only on an actual change: hosts generally rebuild their delay-compensation graph on
-            // this, so calling it every block would be wasteful and disruptive.
-            context.set_latency_samples(processor.lookahead_frames() as u32);
-        }
         processor.set_automix_enabled(!self.params.bypass.value());
 
         let mix_dialogue_to_bed = self.params.mix_dialogue_to_bed.value();
@@ -840,9 +798,9 @@ impl Plugin for ComISAssist {
             }
             None => false,
         };
-        // Measures the dry Bed, steps the fast stage and applies the resulting gain in sub-chunks,
-        // then applies the lookahead delay - all inside the shared core, so every wrapper gets
-        // identical DSP.
+        // Measures the dry Bed, then steps the fast stage and applies the resulting gain in
+        // sub-chunks - all inside the shared core, so every wrapper gets identical DSP. In place
+        // and unbuffered, so the plugin adds no latency and reports none.
         let _ = processor.process_bed(&mut interleaved_bed);
         processor.maybe_run_control_step(voice_active, is_voice_active);
 
@@ -866,12 +824,6 @@ impl Plugin for ComISAssist {
             self.meters.mid_db.store(contributions.mid_db as f32, Ordering::Relaxed);
             self.meters.fast_db.store(contributions.fast_db as f32, Ordering::Relaxed);
         }
-
-        // The Bed path is delayed by the lookahead, so Dialogue must be too or the Mix output goes
-        // out of alignment. No-op while lookahead is 0.
-        let mut dialogue_out = dialogue;
-        processor.delay_dialogue(&mut dialogue_out);
-        let dialogue = dialogue_out;
 
         if mix_dialogue_to_bed {
             mix_dialogue_into_bed(
