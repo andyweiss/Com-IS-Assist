@@ -15,6 +15,14 @@ fn snapshot(bed_lufs: f64, dialogue_lufs: f64) -> LoudnessSnapshot {
     }
 }
 
+/// The reduction the feed-forward law implies for these dry levels: `target - (COM - BED)`.
+/// Derived from the config rather than written in as a number, so retuning a shipped default
+/// retunes what these tests expect instead of breaking them - which is exactly what happened when
+/// the target ratio moved from 3 LU to 5.
+fn required(config: &AutomixEngineConfig, bed_lufs: f64, dialogue_lufs: f64) -> f64 {
+    config.target_ratio_lu - (dialogue_lufs - bed_lufs)
+}
+
 /// Runs `ticks` control steps and returns the final reduction.
 fn run(engine: &mut AutomixEngine, ticks: usize, snap: LoudnessSnapshot, com: bool, is: bool) -> f64 {
     let mut last = 0.0;
@@ -58,13 +66,15 @@ fn settles_on_exactly_the_reduction_the_dry_levels_imply() {
     let config = AutomixEngineConfig::default();
     let mut engine = engine_with(config);
 
-    // Bed at -20, COM at -26: COM is 6 LU *below* Bed, target is +3, so 9 dB is required.
+    // Bed at -20, COM at -26: COM is 6 LU *below* Bed, so the target ratio plus 6 dB is required.
     let snap = snapshot(-20.0, -26.0);
+    let expected = required(&config, -20.0, -26.0);
     let settled = run(&mut engine, 400, snap, true, false);
 
     assert!(
-        (settled - 9.0).abs() < 0.1,
-        "expected exactly 9 dB (target 3 - ratio -6), got {settled}dB"
+        (settled - expected).abs() < 0.1,
+        "expected exactly {expected}dB (target {} - ratio -6), got {settled}dB",
+        config.target_ratio_lu
     );
 }
 
@@ -127,8 +137,8 @@ fn the_mid_stage_authority_bounds_how_far_momentary_can_pull_the_total() {
     let config = AutomixEngineConfig::default();
     let mut engine = engine_with(config);
 
-    // The Bed's short-term window says 9 dB is needed; its momentary window sees a far louder Bed
-    // (a surge) and would ask for much more.
+    // The Bed's short-term window implies `required(...)`; its momentary window sees a far louder
+    // Bed (a surge) and would ask for much more.
     let conflicting = LoudnessSnapshot {
         bed_short_term_lufs: -20.0,
         bed_momentary_lufs: 10.0,
@@ -137,10 +147,11 @@ fn the_mid_stage_authority_bounds_how_far_momentary_can_pull_the_total() {
     let settled = run(&mut engine, 600, conflicting, true, false);
     let contributions = engine.contributions();
 
+    let slow_estimate = required(&config, -20.0, -26.0);
     assert!(contributions.mid_db.abs() <= 6.0 + 1e-6, "mid stage exceeded its authority: {contributions:?}");
     assert!(
-        settled <= 9.0 + 6.0 + 1e-6,
-        "total {settled}dB exceeds slow estimate plus mid authority"
+        settled <= slow_estimate + 6.0 + 1e-6,
+        "total {settled}dB exceeds slow estimate {slow_estimate}dB plus mid authority"
     );
 }
 
@@ -176,8 +187,35 @@ fn speed_changes_the_journey_not_the_destination() {
     let slow_db = run(&mut slow, 600, snap, true, false);
     let fast_db = run(&mut fast, 600, snap, true, false);
 
+    let expected = required(&AutomixEngineConfig::default(), -20.0, -26.0);
     assert!((slow_db - fast_db).abs() < 0.1, "settled at {slow_db}dB vs {fast_db}dB");
-    assert!((slow_db - 9.0).abs() < 0.1, "both should land on the dry-level answer, got {slow_db}dB");
+    assert!((slow_db - expected).abs() < 0.1, "both should land on the dry-level answer {expected}dB, got {slow_db}dB");
+}
+
+/// Guards the ends of the Speed range (0.25x-8x in both wrappers). The extremes are the settings
+/// most likely to expose a numerical problem - 8x drives the fast stage's time constant to well
+/// under a millisecond, below the sub-chunk step that advances it, and 0.25x stretches the slow
+/// stage's release to 12s - so both ends are checked for a finite, in-range result rather than
+/// trusted to behave because the middle of the range does.
+#[test]
+fn the_speed_extremes_stay_well_behaved() {
+    let snap = snapshot(-20.0, -26.0);
+    for speed in [0.25, 8.0] {
+        let mut engine = engine_with(AutomixEngineConfig { speed, ..Default::default() });
+        let db = run(&mut engine, 600, snap, true, false);
+        assert!(db.is_finite(), "speed {speed}x produced a non-finite reduction: {db}");
+        assert!(
+            (0.0..=AutomixEngineConfig::default().max_gain_reduction_db).contains(&db),
+            "speed {speed}x left the reduction outside its bounds: {db}dB"
+        );
+    }
+
+    // 8x must still land on the same feed-forward answer as 1x - Speed is a journey control, and
+    // opening up the top of the range must not have made it change the destination.
+    let mut quick = engine_with(AutomixEngineConfig { speed: 8.0, ..Default::default() });
+    let settled = run(&mut quick, 600, snap, true, false);
+    let expected = required(&AutomixEngineConfig::default(), -20.0, -26.0);
+    assert!((settled - expected).abs() < 0.1, "speed 8x settled at {settled}dB, expected the {expected}dB dry answer");
 }
 
 /// Adaptive ballistics: the fast stage must move long before the slow stage has, which is the
@@ -457,9 +495,15 @@ fn the_engine_follows_whatever_com_flag_it_is_given() {
     assert_eq!(engine.process_tick(snap, true, false, TICK).state, MixState::DuckToTarget);
 }
 
+/// The guard band now ships **engaged** (-32 LUFS) rather than open at the bottom of its range.
+/// That is a deliberate behaviour change, not an oversight: a gate parked at -70 protects nothing,
+/// and bed crosstalk ducking the bed against its own bleed is the failure it exists to prevent. It
+/// has to stay inside the range both wrappers expose and well below a commentator's own momentary
+/// level, or it would start gating out real speech.
 #[test]
-fn the_guard_band_defaults_to_open() {
-    // -70 LUFS sits far below any real programme level, so the gate changes nothing until it is
-    // deliberately raised - existing sessions keep their behaviour.
-    assert!(AutomixEngineConfig::default().com_gate_lufs <= -70.0);
+fn the_guard_band_ships_engaged_and_inside_the_exposed_range() {
+    let gate = AutomixEngineConfig::default().com_gate_lufs;
+    assert!((-70.0..=-10.0).contains(&gate), "default gate {gate} LUFS is outside the exposed range");
+    assert!(gate > -70.0, "a gate at the bottom of its range would protect nothing");
+    assert!(gate <= -25.0, "default gate {gate} LUFS is high enough to risk gating real speech");
 }

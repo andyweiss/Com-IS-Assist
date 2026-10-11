@@ -62,11 +62,15 @@ fn loud_com_passes_the_guard_band() {
     );
 }
 
-/// With the gate at its default it must not interfere at all.
+/// The default gate is no longer open at the bottom of its range (-32 LUFS since the defaults were
+/// retuned), so "it does not interfere" became a claim worth testing rather than one that held
+/// trivially. The signal here is deliberately well clear of the threshold - a commentator at a
+/// normal working level, not one hovering at it - since a test sitting a dB or two above the gate
+/// would fail on any future retune without that meaning anything was wrong.
 #[test]
 fn the_default_guard_band_does_not_gate_normal_programme() {
     let rate = 48_000;
-    let normal = sine(400.0, 0.05, rate, 4_800);
+    let normal = sine(400.0, 0.15, rate, 4_800);
     let mut p = processor(AutomixEngineConfig::default().com_gate_lufs);
 
     for _ in 0..40 {
@@ -75,5 +79,10 @@ fn the_default_guard_band_does_not_gate_normal_programme() {
         p.process_bed(&mut bed).unwrap();
         p.maybe_run_control_step(true, false);
     }
-    assert!(p.com_voice_gated(), "default gate must be open for normal levels");
+    assert!(
+        p.com_voice_gated(),
+        "a commentator at {:.1} LUFS must pass the default {} LUFS gate",
+        p.dialogue_momentary_lufs(),
+        AutomixEngineConfig::default().com_gate_lufs
+    );
 }

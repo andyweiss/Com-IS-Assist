@@ -38,11 +38,11 @@ Settable (all live — `set_property` forwards to `AutomixProcessor::set_config`
 
 | Property | Type | Default | Notes |
 |---|---|---|---|
-| `target-ratio` | double (LU) | 3.0 | Distance required while COM alone has voice |
-| `overvoice-ratio` | double (LU) | 8.0 | **Absolute** distance required while COM *and* IS both have voice |
-| `speed` | double | 1.0 | **The one timing control** - scales every loop stage's ballistics together (0.25-4.0, default 1.0). Raise if sluggish, lower if it breathes |
+| `target-ratio` | double (LU) | 5.0 | Distance required while COM alone has voice |
+| `overvoice-ratio` | double (LU) | 13.0 | **Absolute** distance required while COM *and* IS both have voice |
+| `speed` | double | 1.0 | **The one timing control** - scales every loop stage's ballistics together (0.25-8.0, default 1.0). Raise if sluggish, lower if it breathes |
 | `max-gain-reduction-db` | double (dB) | 24.0 | |
-| `com-gate-lufs` | double (LUFS) | -70.0 | Guard band on COM voice detection: reported speech is ignored while COM's momentary loudness is below this, so bed crosstalk in the commentary mic cannot duck the bed against itself. Default is effectively open |
+| `com-gate-lufs` | double (LUFS) | -32.0 | Guard band on COM voice detection: reported speech is ignored while COM's momentary loudness is below this, so bed crosstalk in the commentary mic cannot duck the bed against itself. The default is engaged, not parked at the bottom of its range |
 | `automix-enable` | boolean | true | Note the polarity is inverted from VST3's `bypass` |
 | `divergence` | double (%) | 0.0 | |
 

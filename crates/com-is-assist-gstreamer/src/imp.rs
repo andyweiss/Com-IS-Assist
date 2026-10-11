@@ -942,7 +942,7 @@ impl ObjectImpl for ComISAssist {
                     .build(),
                 glib::ParamSpecDouble::builder("speed")
                     .minimum(0.25)
-                    .maximum(4.0)
+                    .maximum(8.0)
                     .default_value(AutomixEngineConfig::default().speed)
                     .build(),
                 glib::ParamSpecDouble::builder("com-gate-lufs")

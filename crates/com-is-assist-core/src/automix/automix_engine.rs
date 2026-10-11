@@ -53,10 +53,14 @@ pub struct AutomixEngineConfig {
 impl Default for AutomixEngineConfig {
     fn default() -> Self {
         Self {
-            target_ratio_lu: 3.0,
-            overvoice_ratio_lu: 8.0,
+            target_ratio_lu: 5.0,
+            overvoice_ratio_lu: 13.0,
             max_gain_reduction_db: 24.0,
-            com_gate_lufs: -70.0,
+            // Not fully open (-70, the bottom of the control's range). The guard band only earns
+            // its keep when it is actually above the crosstalk, and -32 is a working starting
+            // point on real commentary: comfortably under a commentator's own momentary level,
+            // comfortably over the bed's bleed into the mic.
+            com_gate_lufs: -32.0,
             speed: 1.0,
         }
     }

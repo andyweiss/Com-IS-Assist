@@ -149,6 +149,28 @@ fn mix_state_color(index: usize) -> egui::Color32 {
 /// the meter bars can share it and the two halves of the window read as one instrument rather than
 /// as a meter panel bolted to a control panel. Read from the live visuals instead of being
 /// hardcoded alongside it, so the bars cannot drift away from the controls if the theme changes.
+/// The gutter between the meter bank and the controls column. Both the content row and the title
+/// row above it go through this, so the title row's Bypass checkbox lands at exactly the controls
+/// column's left edge without either row needing to know the other's arithmetic.
+///
+/// Alignment holds because the two rows are built from the *same sequence of items* - left indent,
+/// a `METER_BANK_WIDTH`-wide block, this gutter, then the content - so they accumulate egui's
+/// automatic `item_spacing` identically. Zeroing that spacing instead would have been the more
+/// direct fix, but a horizontal `Ui`'s spacing is inherited by its children, and the controls
+/// column's own label/slider rows depend on it.
+///
+/// `rule` draws the dividing line; the title row passes `false` and reserves the same width blank,
+/// since one rule down the middle of the window reads better than two stacked.
+fn meters_to_controls_gutter(ui: &mut egui::Ui, rule: bool) {
+    ui.add_space(CONTROLS_GUTTER_PAD);
+    if rule {
+        ui.add(egui::Separator::default().vertical().spacing(CONTROLS_RULE_WIDTH));
+    } else {
+        ui.allocate_exact_size(egui::vec2(CONTROLS_RULE_WIDTH, 1.0), egui::Sense::hover());
+    }
+    ui.add_space(CONTROLS_GUTTER_PAD);
+}
+
 fn control_accent(ui: &egui::Ui) -> egui::Color32 {
     ui.visuals().selection.bg_fill
 }
@@ -282,15 +304,41 @@ impl Default for ComISAssistParams {
             speed: FloatParam::new(
                 "Speed",
                 automix.speed as f32,
-                // Multiplicative, so a symmetric log-ish sweep around 1.0 feels even either way.
-                FloatRange::Skewed { min: 0.25, max: 4.0, factor: FloatRange::skew_factor(0.0) },
+                // A multiplier, so the useful range is logarithmic: 0.25x to 8x, with unity at the
+                // exact centre of the slider and equal travel either side of it. `Skewed`
+                // unnormalizes as `t^(1/factor)·(max-min) + min`, so the factor that puts 1.0 at
+                // t = 0.5 is `ln(0.5) / ln((1-min)/(max-min))` - derived rather than dialled in, so
+                // unity stays centred if the limits are ever retuned. (The original range passed
+                // `skew_factor(0.0)`, which is 2^0 = 1.0 - i.e. plain linear, despite the comment
+                // claiming otherwise, leaving unity at 20% of the travel.)
+                FloatRange::Skewed {
+                    min: SPEED_MIN,
+                    max: SPEED_MAX,
+                    factor: 0.5_f32.ln() / ((1.0 - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)).ln(),
+                },
             )
-            .with_step_size(0.05)
-            .with_unit("x"),
+            // Continuous rather than stepped: a fixed step that reads sensibly at 0.06x is far too
+            // fine at 16x. The formatter carries the precision instead, loosening as the value
+            // grows, since a hundredth matters at the bottom of the range and nothing at the top.
+            .with_unit("x")
+            .with_value_to_string(Arc::new(|value| {
+                if value < 1.0 {
+                    format!("{value:.2}")
+                } else if value < 10.0 {
+                    format!("{value:.1}")
+                } else {
+                    format!("{value:.0}")
+                }
+            })),
             bypass: BoolParam::new("Bypass", false),
             mix_dialogue_to_bed: BoolParam::new("Mix Dialogue to Bed", true),
             divergence: FloatParam::new("Voice Divergence", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
-                .with_unit(" %"),
+                .with_unit(" %")
+                // Whole percent, same as the level controls: the step size alone still renders
+                // "40.0 %", so the formatter is what actually drops the decimal. A tenth of a
+                // percent of pan position is far below what the control is deciding.
+                .with_step_size(1.0)
+                .with_value_to_string(formatters::v2s_f32_rounded(0)),
             editor_state: EguiState::from_size(820, 690),
         }
     }
@@ -314,6 +362,13 @@ impl ComISAssistParams {
 const CONTROL_LABEL_WIDTH: f32 = 132.0;
 /// Length of the control sliders.
 const CONTROL_SLIDER_WIDTH: f32 = 190.0;
+/// Gap between a control's label and its slider. Shared by the parameter `Grid` and by the two
+/// rows laid out by hand outside it, which otherwise fell back to egui's default 8px `item_spacing`
+/// and put their sliders 4px left of every other one.
+const CONTROL_LABEL_GAP: f32 = 12.0;
+/// Full width of the controls column, so the title row's Bypass can be right-aligned to exactly
+/// where the sliders end.
+const CONTROLS_COLUMN_WIDTH: f32 = CONTROL_LABEL_WIDTH + CONTROL_LABEL_GAP + CONTROL_SLIDER_WIDTH;
 
 /// A control's name, at the fixed width every row shares.
 fn control_label(ui: &mut egui::Ui, text: &str) -> egui::Rect {
@@ -427,6 +482,23 @@ const GAP_AFTER_SCALED: f32 = BAR_TO_BAR_GAP - SCALE_SPAN;
 const GAP_BEFORE_RATIO: f32 = BAR_TO_BAR_GAP - SCALE_SPAN - RATIO_SIDE_SLACK;
 /// After the Ratio column (Ratio -> COM).
 const GAP_AFTER_RATIO: f32 = BAR_TO_BAR_GAP - RATIO_SIDE_SLACK;
+
+/// Range of the `speed` macro. The slow end stays at the original 0.25x - below that the mixer is
+/// simply too sluggish to be useful, and a wider sweep only made the usable part of the control
+/// harder to hit. Only the fast end was opened up, 4x to 8x.
+///
+/// Note the practical ceiling is lower than 8x for the *slow* stage - its 3s R128 short-term
+/// measurement only changes so fast, so past a point its ballistics stop being what limits it and
+/// raising `speed` further only sharpens the mid and fast stages. That is not a defect; it is the
+/// cascade behaving as designed.
+const SPEED_MIN: f32 = 0.25;
+const SPEED_MAX: f32 = 8.0;
+
+/// Padding either side of the rule dividing the meter bank from the controls column.
+const CONTROLS_GUTTER_PAD: f32 = 20.0;
+/// Width `egui::Separator` occupies in a horizontal layout. Pinned explicitly rather than left to
+/// the default so the title row can reserve exactly the same width without drawing a rule.
+const CONTROLS_RULE_WIDTH: f32 = 6.0;
 
 /// Indent shared by the title row and the meter/controls row, so nothing sits flush against the
 /// window edge.
@@ -903,6 +975,29 @@ fn voice_activity_led(ui: &mut egui::Ui, indicator: VoiceIndicator) {
     );
 }
 
+/// Every control row goes through this, including the two that sit alone between the dividing
+/// rules, so all of them share one geometry: the same label column, the same label-to-slider gap,
+/// and - because `Grid` installs its spacing on the `Ui` the cells inherit - the same gap inside
+/// `ParamSlider` between its bar and its value box.
+///
+/// Those two rows were previously laid out by hand with `ui.horizontal`. Matching the grid by
+/// setting `item_spacing.x` on the row does not work: `ParamSlider` builds its own inner
+/// `horizontal`, so zeroing the row's spacing to control the label gap also closed up the gap
+/// between the slider and its value readout, which is what made those two rows look cramped.
+/// Returns the x of the grid's right edge - the end of its value boxes - which is what the title
+/// row's Bypass is aligned to. The *column's* own rect is no use for that: the rules dividing the
+/// control groups are `ui.separator()`s, which stretch to the full remaining window width and drag
+/// the column's rect out with them, far past where any row actually ends.
+fn control_grid(ui: &mut egui::Ui, id: &str, add_rows: impl FnOnce(&mut egui::Ui)) -> f32 {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([CONTROL_LABEL_GAP, 10.0])
+        .show(ui, add_rows)
+        .response
+        .rect
+        .right()
+}
+
 /// `nih_plug_egui` has no built-in bool-parameter widget (`ParamSlider` treats everything as a
 /// continuous/stepped slider) - a checkbox reads far more naturally for a two-state toggle like
 /// `bypass`/`mix-dialogue-to-bed`, so this drives one directly through `ParamSetter`, the same
@@ -953,24 +1048,43 @@ impl Plugin for ComISAssist {
         let meters = self.meters.clone();
         let params = self.params.clone();
         let egui_state = self.params.editor_state.clone();
+        // The controls column's rendered width, carried from one frame to the next so the title
+        // row's Bypass can be right-aligned to it. It cannot be computed: each `ParamSlider` sizes
+        // its value box to whatever text it currently holds ("5 LU" against "-32 LUFS"), so the
+        // column's right edge is only known once the column has been laid out - and the title row
+        // is drawn before it. Measuring the previous frame is exact in every frame but the first,
+        // and the layout is otherwise static.
+        let controls_width = Arc::new(AtomicF32::new(CONTROLS_COLUMN_WIDTH));
         create_egui_editor(
             self.params.editor_state.clone(),
             (),
             |_, _| {},
             move |egui_ctx, setter, _state| {
+                let controls_width = &controls_width;
                 ResizableWindow::new("com-is-assist-editor-window")
                     .min_size(egui::Vec2::new(760.0, 650.0))
                     .show(egui_ctx, egui_state.as_ref(), |ui| {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.label(egui::RichText::new("Com-IS-Assist").size(23.0).strong());
-                            // Right-aligned in whatever width is left: Bypass is the one control
-                            // an operator reaches for without looking, so it sits apart from the
-                            // tuning parameters rather than among them.
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add_space(CONTENT_LEFT_PADDING);
-                                bool_param_checkbox(ui, setter, &params.bypass, "Bypass");
+                            ui.add_space(CONTENT_LEFT_PADDING);
+                            // Reserves the meter bank's width so the gutter after it, and the
+                            // Bypass after that, line up with the content row below.
+                            ui.scope(|ui| {
+                                ui.set_width(METER_BANK_WIDTH);
+                                ui.label(egui::RichText::new("Com-IS-Assist").size(23.0).strong());
+                            });
+                            meters_to_controls_gutter(ui, false);
+                            // Bypass sits in the title row rather than among the tuning parameters
+                            // - it is the one control an operator reaches for without looking -
+                            // over on the right, but ending exactly where the sliders below it end
+                            // rather than at the window's edge. `set_width` pins the child's max
+                            // rect as well as its min, which is what gives the right-to-left layout
+                            // an edge to align to.
+                            ui.scope(|ui| {
+                                ui.set_width(controls_width.load(Ordering::Relaxed));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    bool_param_checkbox(ui, setter, &params.bypass, "Bypass");
+                                });
                             });
                         });
                         ui.add_space(10.0);
@@ -1119,16 +1233,15 @@ impl Plugin for ComISAssist {
                             );
                             });
 
-                            ui.add_space(20.0);
-                            ui.separator();
-                            ui.add_space(20.0);
+                            meters_to_controls_gutter(ui, true);
 
                             // Parameters (right).
-                            ui.vertical(|ui| {
-                                egui::Grid::new("com-is-assist-controls")
-                                    .num_columns(2)
-                                    .spacing([12.0, 10.0])
-                                    .show(ui, |ui| {
+                            let controls = ui.vertical(|ui| {
+                                // The widest row wins: the value boxes are not all the same width,
+                                // so the column's right edge is whichever grid holds the longest
+                                // one (today, the gate's "-32 LUFS").
+                                let mut rows_right = f32::NEG_INFINITY;
+                                rows_right = rows_right.max(control_grid(ui, "com-is-assist-controls", |ui| {
                                         // Whichever ratio the state machine is currently aiming at
                                         // gets tinted in that state's own colour, so the control
                                         // and the state badge agree without having to be compared.
@@ -1154,7 +1267,7 @@ impl Plugin for ComISAssist {
                                         control_label(ui, "Speed");
                                         ui.add(ParamSlider::for_param(&params.speed, setter).with_width(CONTROL_SLIDER_WIDTH));
                                         ui.end_row();
-                                    });
+                                    }));
 
                                 // Set off on its own: this gates *detection* rather than shaping
                                 // the mix, so it belongs with neither the tuning parameters above
@@ -1162,13 +1275,14 @@ impl Plugin for ComISAssist {
                                 ui.add_space(14.0);
                                 ui.separator();
                                 ui.add_space(10.0);
-                                ui.horizontal(|ui| {
+                                rows_right = rows_right.max(control_grid(ui, "com-is-assist-gate", |ui| {
                                     control_label(ui, "Voice detect gate");
                                     ui.add(
                                         ParamSlider::for_param(&params.com_gate_lufs, setter)
                                             .with_width(CONTROL_SLIDER_WIDTH),
                                     );
-                                });
+                                    ui.end_row();
+                                }));
 
                                 // Bus-insert group, set off from the tuning parameters above by a
                                 // rule: these two are about *routing* rather than how the automix
@@ -1183,12 +1297,16 @@ impl Plugin for ComISAssist {
                                 // Divergence only places Dialogue *within* the Bed, so with the mix
                                 // off it controls nothing. Greyed out rather than hidden, so the
                                 // relationship between the two stays visible.
-                                ui.add_enabled_ui(mix_to_bed, |ui| {
-                                    ui.horizontal(|ui| {
-                                        control_label(ui, "Voice divergence");
-                                        ui.add(ParamSlider::for_param(&params.divergence, setter).with_width(CONTROL_SLIDER_WIDTH));
-                                    });
-                                });
+                                rows_right = rows_right.max(
+                                    ui.add_enabled_ui(mix_to_bed, |ui| {
+                                        control_grid(ui, "com-is-assist-divergence", |ui| {
+                                            control_label(ui, "Voice divergence");
+                                            ui.add(ParamSlider::for_param(&params.divergence, setter).with_width(CONTROL_SLIDER_WIDTH));
+                                            ui.end_row();
+                                        })
+                                    })
+                                    .inner,
+                                );
 
                                 // The live state-machine readout. With the mixer's behavior now
                                 // defined entirely by which of four states it's in, showing that
@@ -1217,7 +1335,15 @@ impl Plugin for ComISAssist {
                                     meters.fast_db.load(Ordering::Relaxed),
                                     egui::Color32::from_rgb(224, 140, 32),
                                 );
+                                rows_right
                             });
+                            // Hand this frame's measurement to the next frame's title row: the
+                            // distance from the column's left edge to the end of its widest value
+                            // box, which is what Bypass aligns its right edge to.
+                            if controls.inner.is_finite() {
+                                controls_width
+                                    .store(controls.inner - controls.response.rect.left(), Ordering::Relaxed);
+                            }
                         });
                         ui.add_space(14.0);
                     });
