@@ -28,6 +28,20 @@ pub struct AutomixEngineConfig {
     /// can be dialed in independently by ear.
     pub overvoice_ratio_lu: f64,
     pub max_gain_reduction_db: f64,
+    /// Guard band for COM voice detection: speech reported on COM is **ignored** while COM's own
+    /// momentary loudness sits below this, in LUFS.
+    ///
+    /// The detector answers "is this speech?", not "is this speech *on this microphone*". A
+    /// commentary mic picks up the programme bed as crosstalk, and that spill is real speech - so
+    /// a VAD will quite correctly fire on it, and the Bed then ducks itself. A level gate is the
+    /// natural discriminator, because spill is reliably far quieter than the commentator; what it
+    /// cannot be is a *loudness* judgement, which is why this sits alongside the VAD rather than
+    /// replacing it.
+    ///
+    /// Default -70 LUFS, which is effectively open: real programme audio sits well above it, so
+    /// behaviour is unchanged until the gate is deliberately raised. Useful settings are typically
+    /// 20-30 dB below the commentator's own momentary level.
+    pub com_gate_lufs: f64,
     /// The "Speed" macro — scales every stage's ballistics together. This is the *only* timing
     /// control, replacing the five separate time parameters (`adaptation`/`attack`/`hold`/
     /// `release`/`interview-release`) the single-loop design needed: with the multi-loop cascade
@@ -42,6 +56,7 @@ impl Default for AutomixEngineConfig {
             target_ratio_lu: 3.0,
             overvoice_ratio_lu: 8.0,
             max_gain_reduction_db: 24.0,
+            com_gate_lufs: -70.0,
             speed: 1.0,
         }
     }

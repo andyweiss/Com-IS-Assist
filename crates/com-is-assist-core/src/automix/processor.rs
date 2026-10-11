@@ -64,6 +64,13 @@ pub struct AutomixProcessor {
     applied_gain_reduction_db: f64,
     control_ratio_lu: f64,
     mix_state: MixState,
+
+    /// See [`AutomixEngineConfig::com_gate_lufs`]. Held here rather than in the engine because the
+    /// gate needs COM's measured level, which lives on this side.
+    com_gate_lufs: f64,
+    /// The COM voice flag *after* gating - what actually drove the most recent control step, and
+    /// therefore what a GUI indicator should show.
+    com_voice_gated: bool,
 }
 
 impl AutomixProcessor {
@@ -90,6 +97,8 @@ impl AutomixProcessor {
             applied_gain_reduction_db: 0.0,
             control_ratio_lu: 0.0,
             mix_state: MixState::ReleaseToUnity,
+            com_gate_lufs: automix_config.com_gate_lufs,
+            com_voice_gated: false,
         })
     }
 
@@ -100,6 +109,7 @@ impl AutomixProcessor {
     /// Refreshes the live-adjustable config without resetting any accumulated state. Safe to call
     /// every block - it is a couple of struct copies, not a rebuild.
     pub fn set_config(&mut self, automix_config: AutomixEngineConfig) {
+        self.com_gate_lufs = automix_config.com_gate_lufs;
         self.automix_engine.set_config(automix_config);
     }
 
@@ -177,6 +187,13 @@ impl AutomixProcessor {
         self.bed_frames_since_control = 0;
         self.dialogue_frames_since_control = 0;
 
+        // Guard band: ignore reported speech on COM while COM itself is too quiet to be the
+        // commentator - see `AutomixEngineConfig::com_gate_lufs`. Momentary (400ms) rather than
+        // short-term, so the gate tracks the talker rather than lagging seconds behind them.
+        let com_voice_active =
+            com_voice_active && self.dialogue_meter.momentary_loudness_db() >= self.com_gate_lufs;
+        self.com_voice_gated = com_voice_active;
+
         let loudness = LoudnessSnapshot {
             bed_short_term_lufs: self.bed_meter.short_term_loudness_db(),
             bed_momentary_lufs: self.bed_meter.momentary_loudness_db(),
@@ -206,6 +223,13 @@ impl AutomixProcessor {
 
     pub fn mix_state(&self) -> MixState {
         self.mix_state
+    }
+
+    /// Whether COM voice was considered present at the most recent control step, *after* the
+    /// guard band. This is what actually drives the state machine, so it is what a GUI indicator
+    /// should show - a raw detector flag would light while the gate was suppressing it.
+    pub fn com_voice_gated(&self) -> bool {
+        self.com_voice_gated
     }
 
     /// The COM/IS ratio the control loop is actually achieving: the dry ratio plus whatever

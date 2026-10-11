@@ -101,6 +101,8 @@ struct Settings {
     /// double-talk case) - see `com_is_assist_core::automix::MixState`.
     overvoice_ratio_lu: f64,
     max_gain_reduction_db: f64,
+    /// Guard band on COM voice detection - see `AutomixEngineConfig::com_gate_lufs`.
+    com_gate_lufs: f64,
     /// The single timing control - scales every loop stage's ballistics together. Replaces the
     /// former attack/hold/release/adaptation/interview-release set, which the multi-loop cascade
     /// made meaningless (its effective ballistics are emergent).
@@ -121,6 +123,7 @@ impl Default for Settings {
             target_ratio_lu: automix.target_ratio_lu,
             overvoice_ratio_lu: automix.overvoice_ratio_lu,
             max_gain_reduction_db: automix.max_gain_reduction_db,
+            com_gate_lufs: automix.com_gate_lufs,
             speed: automix.speed,
             automix_enabled: true,
             divergence_percent: 0.0,
@@ -134,6 +137,7 @@ impl Settings {
             target_ratio_lu: self.target_ratio_lu,
             overvoice_ratio_lu: self.overvoice_ratio_lu,
             max_gain_reduction_db: self.max_gain_reduction_db,
+            com_gate_lufs: self.com_gate_lufs,
             speed: self.speed,
         }
     }
@@ -941,6 +945,11 @@ impl ObjectImpl for ComISAssist {
                     .maximum(4.0)
                     .default_value(AutomixEngineConfig::default().speed)
                     .build(),
+                glib::ParamSpecDouble::builder("com-gate-lufs")
+                    .minimum(-70.0)
+                    .maximum(-10.0)
+                    .default_value(AutomixEngineConfig::default().com_gate_lufs)
+                    .build(),
                 glib::ParamSpecDouble::builder("max-gain-reduction-db")
                     .default_value(AutomixEngineConfig::default().max_gain_reduction_db)
                     .build(),
@@ -981,6 +990,7 @@ impl ObjectImpl for ComISAssist {
             "target-ratio" => lock_recover(&self.settings).target_ratio_lu.to_value(),
             "overvoice-ratio" => lock_recover(&self.settings).overvoice_ratio_lu.to_value(),
             "speed" => lock_recover(&self.settings).speed.to_value(),
+            "com-gate-lufs" => lock_recover(&self.settings).com_gate_lufs.to_value(),
             "max-gain-reduction-db" => lock_recover(&self.settings).max_gain_reduction_db.to_value(),
             "automix-enable" => lock_recover(&self.settings).automix_enabled.to_value(),
             "divergence" => lock_recover(&self.settings).divergence_percent.to_value(),
@@ -992,7 +1002,11 @@ impl ObjectImpl for ComISAssist {
                 // Cheap diagnostic read; not stored separately from the engine's own state.
                 0.0f64.to_value()
             }
-            "voice-active" => self.voice_active().to_value(),
+            // The *gated* flag - what actually drives the mix (see `com_gate_lufs`).
+            "voice-active" => lock_recover(&self.state)
+                .as_ref()
+                .is_some_and(|state| state.processor.com_voice_gated())
+                .to_value(),
             "voice-active-is" => self.is_voice_active().to_value(),
             "current-mix-state" => lock_recover(&self.state)
                 .as_ref()
@@ -1024,6 +1038,7 @@ impl ObjectImpl for ComISAssist {
                 "target-ratio" => settings.target_ratio_lu = value.get().unwrap(),
                 "overvoice-ratio" => settings.overvoice_ratio_lu = value.get().unwrap(),
                 "speed" => settings.speed = value.get().unwrap(),
+                "com-gate-lufs" => settings.com_gate_lufs = value.get().unwrap(),
                 "max-gain-reduction-db" => settings.max_gain_reduction_db = value.get().unwrap(),
                 "automix-enable" => settings.automix_enabled = value.get().unwrap(),
                 "divergence" => settings.divergence_percent = value.get().unwrap(),

@@ -104,7 +104,7 @@ fn main() -> ExitCode {
         eprintln!();
         eprintln!("Config overrides (environment variables, all optional):");
         eprintln!("  COMIS_TARGET_RATIO_LU, COMIS_OVERVOICE_RATIO_LU, COMIS_MAX_GAIN_REDUCTION_DB,");
-        eprintln!("  COMIS_SPEED,");
+        eprintln!("  COMIS_SPEED, COMIS_COM_GATE_LUFS,");
         eprintln!("  COMIS_VAD_HANGOVER_SECONDS");
         return ExitCode::FAILURE;
     }
@@ -147,6 +147,7 @@ fn main() -> ExitCode {
         target_ratio_lu: env_f64("COMIS_TARGET_RATIO_LU", defaults.target_ratio_lu),
         overvoice_ratio_lu: env_f64("COMIS_OVERVOICE_RATIO_LU", defaults.overvoice_ratio_lu),
         max_gain_reduction_db: env_f64("COMIS_MAX_GAIN_REDUCTION_DB", defaults.max_gain_reduction_db),
+        com_gate_lufs: env_f64("COMIS_COM_GATE_LUFS", defaults.com_gate_lufs),
         speed: env_f64("COMIS_SPEED", defaults.speed),
     };
 
@@ -251,7 +252,7 @@ ratio_lu,target_lu,r_slow,r_mid,r_fast,gain_reduction_db"
             tick as f64 * TICK_SECONDS,
             processor.bed_momentary_lufs(),
             processor.dialogue_momentary_lufs(),
-            if com_voice_active { 1 } else { 0 },
+            if processor.com_voice_gated() { 1 } else { 0 },
             if is_voice_active { 1 } else { 0 },
             mix_state_label(processor.mix_state()),
             processor.applied_ratio_lu(),

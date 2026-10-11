@@ -296,29 +296,71 @@ fn release_eases_in_rather_than_starting_abruptly() {
     );
 }
 
-/// Collapsing the cascade at the start of a release must preserve the gain exactly - the fold is
-/// a bookkeeping change, not an audible one.
+/// Each stage must release at its **own** time constant, so the multi-loop character carries
+/// through the recovery: the fast stage lets go first, the slow stage carries the tail.
 #[test]
-fn collapsing_the_cascade_into_one_stage_does_not_move_the_gain() {
+fn each_stage_releases_at_its_own_rate() {
     let mut engine = engine_with(AutomixEngineConfig::default());
     let snap = snapshot(-20.0, -26.0);
     run(&mut engine, 400, snap, true, false);
-    for _ in 0..200 {
+    for _ in 0..400 {
         engine.process_fast(0.0, -26.0, 0.0013);
     }
-    let before = engine.current_gain_reduction_db();
-    let contributions = engine.contributions();
-    assert!(contributions.fast_db > 0.5, "setup: expected an engaged fast stage, got {contributions:?}");
+    let before = engine.contributions();
+    assert!(before.slow_db > 1.0 && before.fast_db > 0.5, "setup: {before:?}");
 
-    // First release tick: the stages fold into one, but the total must be unchanged beyond the
-    // tiny amount this tick's own (heavily eased-in) release accounts for.
-    let after = engine
-        .process_tick(snapshot(-20.0, -100.0), false, false, TICK)
-        .gain_reduction_db;
+    // Half a second of recovery - long against the fast stage's constant, short against the slow's.
+    let quiet = snapshot(-20.0, -100.0);
+    for _ in 0..5 {
+        engine.process_tick(quiet, false, false, TICK);
+        for _ in 0..77 {
+            engine.process_fast(0.0, -100.0, 0.0013);
+        }
+    }
+    let after = engine.contributions();
+
+    let fast_remaining = after.fast_db / before.fast_db;
+    let slow_remaining = after.slow_db / before.slow_db;
     assert!(
-        (before - after) < 0.05,
-        "the fold moved the gain: {before}dB -> {after}dB"
+        fast_remaining < slow_remaining,
+        "the fast stage should let go first: fast kept {fast_remaining:.3}, slow kept {slow_remaining:.3}"
     );
+    assert!(slow_remaining > 0.5, "the slow stage should still be carrying the tail: {slow_remaining:.3}");
+}
+
+/// A negative mid trim must not raise the total as it returns to zero - it is a subtraction being
+/// removed. It hands exactly that much to the slow stage as it goes, so the total stays monotonic
+/// while the mid stage still visibly decays at its own rate (rather than being snapped to zero,
+/// which looks on the meters like a stage having died).
+#[test]
+fn a_negative_mid_trim_decays_visibly_without_raising_the_total() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    let negative_mid = LoudnessSnapshot {
+        bed_short_term_lufs: -20.0,
+        bed_momentary_lufs: -30.0,
+        dialogue_short_term_lufs: -26.0,
+    };
+    run(&mut engine, 400, negative_mid, true, false);
+    let before = engine.contributions();
+    assert!(before.mid_db < -0.5, "setup: expected a negative mid stage, got {before:?}");
+
+    // One tick in, the mid stage must have moved *partway* - not been snapped straight to zero.
+    let quiet = snapshot(-20.0, -100.0);
+    let mut previous = engine.current_gain_reduction_db();
+    let after_one = engine.process_tick(quiet, false, false, TICK).gain_reduction_db;
+    let mid_after_one = engine.contributions().mid_db;
+    assert!(
+        mid_after_one < 0.0 && mid_after_one > before.mid_db,
+        "mid should decay gradually, not snap to zero: {before:?} -> {mid_after_one}"
+    );
+    assert!(after_one <= previous + 1e-9, "total rose on the first release tick");
+    previous = after_one;
+
+    for _ in 0..200 {
+        let value = engine.process_tick(quiet, false, false, TICK).gain_reduction_db;
+        assert!(value <= previous + 1e-9, "total rose during release: {previous} -> {value}");
+        previous = value;
+    }
 }
 
 #[test]
@@ -392,4 +434,32 @@ fn set_config_applies_a_lowered_ceiling_live() {
     engine.set_config(AutomixEngineConfig { max_gain_reduction_db: 6.0, ..Default::default() });
     let after = run(&mut engine, 400, snapshot(-10.0, -90.0), true, false);
     assert!(after <= 6.0 + 1e-6, "ceiling not applied: {after}dB");
+}
+
+// ---------------------------------------------------------------------------
+// COM voice guard band
+// ---------------------------------------------------------------------------
+
+/// The guard band is applied in `AutomixProcessor` (it needs COM's measured level), so these
+/// exercise the engine's half of the contract: the state machine simply believes whatever COM
+/// flag it is handed, and the gate decides what that flag is.
+#[test]
+fn the_engine_follows_whatever_com_flag_it_is_given() {
+    let mut engine = engine_with(AutomixEngineConfig::default());
+    let snap = snapshot(-20.0, -26.0);
+
+    // Gated off -> the mixer must behave exactly as if COM were silent.
+    assert_eq!(
+        engine.process_tick(snap, false, false, TICK).state,
+        MixState::ReleaseToUnity
+    );
+    // Gated on -> normal ducking.
+    assert_eq!(engine.process_tick(snap, true, false, TICK).state, MixState::DuckToTarget);
+}
+
+#[test]
+fn the_guard_band_defaults_to_open() {
+    // -70 LUFS sits far below any real programme level, so the gate changes nothing until it is
+    // deliberately raised - existing sessions keep their behaviour.
+    assert!(AutomixEngineConfig::default().com_gate_lufs <= -70.0);
 }

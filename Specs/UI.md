@@ -3,13 +3,13 @@
 ## Implementation status
 
 Parameters (both wrappers unless noted; see `Specs/GSTdefinitions.md`/`Specs/vstDefinitions.md` for exact names):
-- **Implemented**: Com/IS distance (`target-ratio`), Over-voice ratio (`overvoice-ratio`), Speed (`speed`), Voice divergence (`divergence`, both wrappers — restricted to Left/Right/Center, see `mix_dialogue_into_bed`; GStreamer's Bed is 2-6ch dynamically negotiated, and has no audible effect below a 3ch/Center-having layout).
+- **Implemented**: IS voice ratio (`target-ratio`, formerly labelled "Com/IS distance"), Voice detect gate (`com-gate-lufs`), Over-voice ratio (`overvoice-ratio`), Speed (`speed`), Voice divergence (`divergence`, both wrappers — restricted to Left/Right/Center, see `mix_dialogue_into_bed`; GStreamer's Bed is 2-6ch dynamically negotiated, and has no audible effect below a 3ch/Center-having layout).
 - **"voice detector comm" - implemented, but not as an on/off toggle.** Real voice-activity detection (Silero VAD, via `com_is_assist_core::voice_activity::SileroVad`) gates the ratio/automix control loop directly, replacing the old flat -70dB LUFS-floor "is COM currently silent?" stand-in - see `Specs/TechnicalConcept.md` section 6. Always on, not exposed as a disable-able parameter: turning it off would just reintroduce the exact problem it fixes (Bed getting reduced in response to COM having *some* sound - room tone, static, another open mic - that isn't actually speech).
 - **"voice detector IS" - implemented.** A second, independent `SileroVad` instance runs on a mono downmix of the dry Bed. Like the COM detector it is always on rather than switchable. When it finds voice on the original while Comm is silent, the bed recovers to unity faster than normal; when both carry voice, the higher Over-voice ratio applies. Together the two detectors select the automix state (section 5.1 of `TechnicalConcept.md`).
 - **Not yet implemented**: Reset loudness.
 
 Display:
-- **Implemented (VST3 only, custom GUI — see `Specs/vstDefinitions.md`'s "GUI (custom, meters + controls)" section)**: a tall, professional-bargraph-style meter bank (left side of the window, parameters on the right) with current Gain reduction in dB as its own standalone vertical bar (top-down fill, own 0-48dB scale) next to IS LUFS momentary (pre-gain) and Comm LUFS momentary, each shown as a vertical bar filling bottom-up (cyan/orange respectively); Ratio in LU, computed against Bed's effective (post-reduction) level so it reflects what's actually audible; Voice activity Comm **and** Voice activity IS (green LEDs, under their respective bars); a live **state readout** naming which of the four automix states is currently active, and a **loop readout** showing what each of the three control loops is contributing in dB. GStreamer exposes the equivalents as read-only `voice-active`/`voice-active-is`/`current-mix-state` properties.
+- **Implemented (VST3 only, custom GUI — see `Specs/vstDefinitions.md`'s "GUI (custom, meters + controls)" section)**: a tall, professional-bargraph-style meter bank (left side of the window, parameters on the right) with current Gain reduction in dB as its own standalone vertical bar (top-down fill, own 0-36dB scale) next to IS LUFS momentary (pre-gain) and Comm LUFS momentary, each shown as a vertical bar filling bottom-up, both in the same accent colour the parameter sliders use; Ratio in LU, computed against Bed's effective (post-reduction) level so it reflects what's actually audible; Voice activity Comm **and** Voice activity IS (green LEDs, under their respective bars); a live **state readout** naming which of the four automix states is currently active, and a **loop readout** showing what each of the three control loops is contributing in dB. GStreamer exposes the equivalents as read-only `voice-active`/`voice-active-is`/`current-mix-state` properties.
 - **Deliberately not implemented**: IS/Comm LUFS-I (integrated) — tried, then dropped as an unneeded simplification (momentary is what both the control loop and this display care about; can be revisited if a concrete need comes up).
 
 ## Behavior: four states
@@ -19,7 +19,7 @@ The mixer does exactly one of four things at any moment, chosen by the two voice
 | Voice on Comm | Voice on IS | What happens |
 |---|---|---|
 | no | no | Bed recovers to unity |
-| yes | no | Bed is ducked until **Com/IS distance** is met |
+| yes | no | Bed is ducked until the **IS voice ratio** is met |
 | no | yes | Bed recovers to unity *faster* (voice on the original is worth hearing) |
 | yes | yes | Bed is ducked until the higher **Over-voice ratio** is met |
 
@@ -27,20 +27,23 @@ How *fast* each of those happens is set by **Speed**, not by per-state times.
 
 ## PARAMETERS
 
-# Com IS distance:
-0 -12 dB defines how many LUFS the com has to be on top of the IS
+# IS voice ratio
+0 -12 dB defines how many LUFS the com has to be on top of the IS. (Originally called "Com/IS distance"; the underlying parameter id is still `target-ratio`.)
 
 # Speed
-How quickly the mixer responds, as a single control. There are no separate attack/release times: the leveling is built from three control loops at different speeds (a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges), and the resulting attack and release behaviour emerges from how they interact. Long and gentle when the programme is steady, very quick when something jumps. Speed scales all three together: raise it if the mix feels sluggish, lower it if it breathes.
+How quickly the mixer responds, as a single control. There are no separate attack/release times: the leveling is built from three control loops at different speeds (a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges), and the resulting attack and release behaviour emerges from how they interact. Long and gentle when the programme is steady, very quick when something jumps. Speed scales all three together: raise it if the mix feels sluggish, lower it if it breathes. Ducking is always far quicker than recovery - the fast loop bites immediately while the recovery is carried by the slow loop - so this one control moves the whole envelope without losing that fast-down/slow-up character. The pause tolerance that keeps the bed down through sentence gaps is fixed in real time, so recovery stays cushioned even at high Speed.
 
 # Over-voice ratio
-The distance required when Comm *and* IS both have voice (a possible over-voice situation, e.g. commentary over an interview or a speaking crowd mic). An absolute value, not an offset on Com/IS distance, and normally set higher than it so the commentator stays intelligible over the competing voice.
+The distance required when Comm *and* IS both have voice (a possible over-voice situation, e.g. commentary over an interview or a speaking crowd mic). An absolute value, not an offset on the IS voice ratio, and normally set higher than it so the commentator stays intelligible over the competing voice.
 
 # voice detector comm
 Always on (not a parameter) — see Implementation status.
 
 # voice detector IS
 Always on (not a parameter) — see Implementation status. When it detects voice on the original while Comm is silent, the bed recovers to unity faster than normal. This is always active; there is no switch.
+
+# Voice detect gate
+A level below which voice detection on the Comm channel is ignored, in LUFS. The detector hears the programme bed bleeding into the commentary mic and correctly identifies it as speech - so without this the bed ducks against its own crosstalk. Spill is always far quieter than the commentator, so a level threshold separates them cleanly. Set it 20-30 dB below the commentator's normal level; the default is fully open, so it does nothing until you raise it. The region it switches detection off in is shaded grey on the Comm meter, and the Comm voice lamp shows a grey cross whenever the gate is currently suppressing detection - so you can set it by eye against the signal rather than by number.
 
 # Voice divergence
 0% = Center only up to 100% = LR only

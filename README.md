@@ -15,7 +15,7 @@ Two voice-activity detectors — one on the Dialogue (COM), one on the Bed (IS) 
 | Voice on COM | Voice on IS | What happens |
 |---|---|---|
 | no | no | Bed recovers to unity |
-| yes | no | Bed is ducked until the **target ratio** is met |
+| yes | no | Bed is ducked until the **IS voice ratio** is met |
 | no | yes | Bed recovers to unity *faster* (something on the Bed is worth hearing) |
 | yes | yes | Bed is ducked until the higher **over-voice ratio** is met |
 

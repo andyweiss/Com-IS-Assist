@@ -42,6 +42,7 @@ Settable (all live — `set_property` forwards to `AutomixProcessor::set_config`
 | `overvoice-ratio` | double (LU) | 8.0 | **Absolute** distance required while COM *and* IS both have voice |
 | `speed` | double | 1.0 | **The one timing control** - scales every loop stage's ballistics together (0.25-4.0, default 1.0). Raise if sluggish, lower if it breathes |
 | `max-gain-reduction-db` | double (dB) | 24.0 | |
+| `com-gate-lufs` | double (LUFS) | -70.0 | Guard band on COM voice detection: reported speech is ignored while COM's momentary loudness is below this, so bed crosstalk in the commentary mic cannot duck the bed against itself. Default is effectively open |
 | `automix-enable` | boolean | true | Note the polarity is inverted from VST3's `bypass` |
 | `divergence` | double (%) | 0.0 | |
 
@@ -51,7 +52,7 @@ Read-only:
 |---|---|---|
 | `current-gain-reduction-db` | double | |
 | `current-ratio-lu` | double | |
-| `voice-active` | boolean | COM-side VAD |
+| `voice-active` | boolean | COM-side VAD, **after** the `com-gate-lufs` guard band - i.e. what actually drives the mix |
 | `voice-active-is` | boolean | IS-side VAD |
 | `current-mix-state` | string | One of `release`, `duck-target`, `interview`, `duck-overvoice` |
 
