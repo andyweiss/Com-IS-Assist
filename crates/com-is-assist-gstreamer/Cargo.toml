@@ -2,6 +2,7 @@
 name = "com-is-assist-gstreamer"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 # GStreamer's plugin scanner loads a shared library and looks for a `gst_plugin_desc` symbol -
 # cdylib is all that's needed at the Rust level. Built via `cargo cbuild`/`cargo cinstall`

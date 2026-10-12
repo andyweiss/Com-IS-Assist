@@ -4,22 +4,37 @@ This project is open source (see `Specs/TechnicalConcept.md` section 1). This no
 
 ## The short version
 
-**Overall project license: GPLv3** (or a GPLv3-compatible license), driven specifically by the VST3 target — not by anything else in the stack.
+**Per-crate licensing**, because the GPLv3 obligation comes from exactly one dependency and reaches exactly one crate:
 
-## Why VST3 forces GPLv3
+| Crate | License | Why |
+|---|---|---|
+| `com-is-assist-core` | MIT | No GPL dependency anywhere in its tree |
+| `com-is-assist-gstreamer` | MIT | Same |
+| `com-is-assist-offline` | MIT | Same |
+| `xtask` | MIT | Same |
+| `com-is-assist-vst3` | **GPL-3.0-or-later** | `nih_plug`'s default `vst3` feature pulls `vst3-sys`, which is GPLv3 |
 
-The project was originally planned around JUCE (C++), which is GPLv3 for non-commercial-license users. After migrating to Rust, the plan switched to `nih-plug` for VST3 — but **this does not remove the GPLv3 obligation**:
+Root `LICENSE` is the MIT text; `crates/com-is-assist-vst3/LICENSE` carries the GPLv3 text for the one crate that needs it. Every `Cargo.toml` declares its `license` field accordingly.
 
-- `nih-plug` itself is ISC-licensed (permissive).
-- Its VST3 export path (`nih_export_vst3!()`) depends on the `vst3-sys` crate, which is **GPLv3**, because it wraps Steinberg's VST3 SDK under the SDK's older dual-license terms.
+**Verified, not assumed** (`cargo tree -p <crate> -e normal`): `com-is-assist-core`, `com-is-assist-gstreamer` and `com-is-assist-offline` pull *zero* `vst3*` crates. The GPLv3 reach really is limited to the plugin wrapper, which is what makes the split meaningful rather than cosmetic.
 
-So any VST3 plugin built with `nih-plug`'s default export must be able to comply with GPLv3, for essentially the same underlying reason the JUCE-based plan was GPLv3 — only the specific binding changed (`vst3-sys` instead of JUCE), not the obligation itself.
+**What this means in practice.** The DSP core and the GStreamer element - the broadcast deliverable - are MIT and can be used, vendored or relicensed freely. Only a distributed **VST3 binary** carries GPLv3 obligations, because that artifact links `vst3-sys`. Building the VST3 for in-house testing changes nothing; distributing it is what triggers the terms.
 
-## A relevant, evolving detail — not yet a fix
+## Why the VST3 target forces GPLv3
 
-Steinberg released VST3 SDK 3.8.0 under the **MIT** license, a significant change from the older GPLv3/proprietary dual-license terms. A newer Rust crate, `vst3` (dual MIT/Apache-2.0), exists as a more permissively-licensed alternative to `vst3-sys`, with more complete/up-to-date bindings.
+The project was originally planned around JUCE (C++), which is GPLv3 for non-commercial-license users. After migrating to Rust, the plan switched to `nih-plug` for VST3 - but **this does not remove the GPLv3 obligation**:
 
-`nih-plug` does not use the permissive `vst3` crate by default today — it still uses `vst3-sys`. If `nih-plug` migrates to the newer crate upstream, or if this project ever writes/uses a different VST3 binding layer built on `vst3`, the VST3 target could plausibly become permissively licensable too. **This is a future revisit, not resolved in the Rust migration** — don't assume it's already fixed.
+- `nih-plug` itself is ISC-licensed (permissive), and its CLAP support (`clap-sys`, MIT/Apache-2.0) is an unconditional dependency.
+- Its VST3 export path is gated behind nih-plug's `vst3` **feature**, which is on by default and pulls `vst3-sys` - **GPLv3**, because it wraps Steinberg's VST3 SDK under the SDK's older dual-license terms. Upstream is explicit that the feature exists "mostly for GPL-compliance reasons, since even if you don't use the VST3 wrapper you might otherwise still include a couple (unused) symbols from the `vst3-sys` crate."
+
+So any VST3 plugin built with `nih-plug`'s default export must be able to comply with GPLv3, for essentially the same underlying reason the JUCE-based plan was GPLv3 - only the specific binding changed, not the obligation.
+
+## Routes to a fully permissive build, if that is ever wanted
+
+Both remove the GPLv3 dependency rather than work around it:
+
+1. **Ship CLAP instead of VST3.** `clap-sys` is MIT/Apache-2.0 and is already in the tree; nih-plug exports CLAP without the `vst3` feature. This is entirely within this project's control today - it is a plugin-format decision, not a licensing workaround.
+2. **Wait for permissive VST3 bindings.** Steinberg released VST3 SDK 3.8.0 under **MIT**, a significant change from the older GPLv3/proprietary dual-license terms, and a newer Rust crate, `vst3` (dual MIT/Apache-2.0), exists with more complete bindings. `nih-plug` does not use it by default today. If it migrates upstream, or if this project supplies its own binding layer built on `vst3`, `com-is-assist-vst3` could move to MIT with the rest. **Not resolved - don't assume it is already fixed.**
 
 ## The rest of the stack (GStreamer, core DSP, offline tool)
 
@@ -32,7 +47,7 @@ Independent of the VST3 question, the non-VST3 parts of the stack are predominan
 - `ort` (ONNX Runtime bindings, used for `com_is_assist_core::voice_activity::SileroVad`) — dual MIT/Apache-2.0 (verified directly against its `Cargo.toml`). The `download-binaries` feature fetches a prebuilt ONNX Runtime **static** library at build time and statically links it in (verified directly: `otool -L` on the built VST3/GStreamer binaries shows no `libonnxruntime` runtime dependency, only system frameworks) - not a shared library the deployed artifact depends on at runtime. Network access is needed once per unique (target, feature set, ONNX Runtime version) on the *build* machine only; the download is cached afterward, and the compiled artifact itself runs fully offline. ONNX Runtime itself is Microsoft's, MIT-licensed.
 - `nnnoiseless` — permissive (verify exact license file before quoting precisely in any distribution notice) - not yet a dependency; planned for the not-yet-built denoise path (`Specs/TechnicalConcept.md` section 6)
 
-If there's ever a reason to split licensing (e.g. distribute the GStreamer element and core library under a permissive license while keeping only the VST3 crate under GPLv3), that's architecturally possible since `com-is-assist-gstreamer`/`com-is-assist-offline` don't depend on anything VST3-related. Not being pursued now — keeping one project-wide GPLv3 license is simpler and was already the plan's default before this migration.
+This is what made the per-crate split above possible: `com-is-assist-core`, `com-is-assist-gstreamer` and `com-is-assist-offline` depend on nothing VST3-related, so nothing had to be restructured to separate them - only declared.
 
 ## Third-party reference material
 

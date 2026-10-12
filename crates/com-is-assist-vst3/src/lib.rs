@@ -19,7 +19,9 @@
 // regardless of this toggle.
 
 use atomic_float::AtomicF32;
-use com_is_assist_core::automix::{mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, MixState};
+use com_is_assist_core::automix::{
+    mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, DuckDepth, MixState,
+};
 use com_is_assist_core::loudness::Ebur128Meter;
 use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use nih_plug::prelude::*;
@@ -92,12 +94,6 @@ struct Meters {
     /// An `AtomicU8` because the state machine's current state is the single most useful thing to
     /// show when the question is "why is it doing that right now?".
     mix_state: AtomicU8,
-    /// What each loop stage is contributing, in dB. The three have visibly different characters -
-    /// slow carries the programme balance, mid tracks phrases, fast catches onsets - so seeing the
-    /// split is the quickest way to tell *which* of them is responsible for what you are hearing.
-    slow_db: AtomicF32,
-    mid_db: AtomicF32,
-    fast_db: AtomicF32,
 }
 
 impl Meters {
@@ -112,9 +108,6 @@ impl Meters {
             voice_active: AtomicBool::new(false),
             is_voice_active: AtomicBool::new(false),
             mix_state: AtomicU8::new(0),
-            slow_db: AtomicF32::new(0.0),
-            mid_db: AtomicF32::new(0.0),
-            fast_db: AtomicF32::new(0.0),
         }
     }
 }
@@ -228,6 +221,21 @@ struct ComISAssistParams {
     /// if it breathes.
     #[id = "speed"]
     pub speed: FloatParam,
+    /// "Duck depth" per Bed channel *group*: how much of the computed gain reduction those
+    /// channels actually take. `1:1` is the reduction in full (6 dB of ducking reduces them by
+    /// 6 dB), `1:0` is no ducking at all. See `com_is_assist_core::automix::DuckDepth`.
+    ///
+    /// Grouped rather than per channel: Left and Right must duck by the same amount or the
+    /// difference is heard as the stereo image sliding sideways, and the same goes for the
+    /// surround pair.
+    #[id = "duck-depth-front"]
+    pub duck_depth_front: FloatParam,
+    #[id = "duck-depth-center"]
+    pub duck_depth_center: FloatParam,
+    #[id = "duck-depth-lfe"]
+    pub duck_depth_lfe: FloatParam,
+    #[id = "duck-depth-surround"]
+    pub duck_depth_surround: FloatParam,
     /// `true` bypasses automix entirely (Bed passes through at unity gain, no ducking) - `false`
     /// (default) is normal operation. Inverted from the earlier `automix-enable` naming/polarity
     /// to match the conventional meaning of a "Bypass" control.
@@ -249,6 +257,51 @@ struct ComISAssistParams {
     /// not a hypothetical one). The user can still drag the resize corner within a session; that
     /// resize just won't be remembered across a host reload/reopen anymore.
     editor_state: Arc<EguiState>,
+}
+
+/// Bed channel groups, in the order their rows are drawn.
+const BED_GROUP_LABELS: [&str; 4] = ["Front L/R", "Center", "LFE", "Surround L/R"];
+
+/// One channel group's duck-depth parameter, shown as a ratio rather than a percentage: `1:1`
+/// takes the ducking in full, `1:0` takes none of it. The ratio is what a sound engineer reads
+/// this kind of relationship in, and it is also how the control was described when it was asked
+/// for - "1:1 means 6 dB of gain reduction reduces that channel by 6 dB, 1:0 means no reduction".
+///
+/// A formatter *and* a parser, because neither direction is the default: nih-plug would otherwise
+/// render "0.50" and fail to read back the "1:0.50" it had just displayed.
+fn duck_depth_param(name: &str) -> FloatParam {
+    FloatParam::new(
+        format!("Duck Depth {name}"),
+        1.0,
+        FloatRange::Linear { min: 0.0, max: 1.0 },
+    )
+    .with_step_size(0.05)
+    .with_value_to_string(Arc::new(|value| format!("1:{value:.2}")))
+    .with_string_to_value(Arc::new(|text| {
+        // Accept what is displayed ("1:0.50") and a bare factor ("0.5") alike, so typing either
+        // works.
+        text.trim().rsplit(':').next().and_then(|factor| factor.trim().parse().ok())
+    }))
+}
+
+impl ComISAssistParams {
+    /// The four duck-depth parameters in the order their rows are drawn, matching
+    /// `BED_GROUP_LABELS`.
+    pub fn duck_depth_params(&self) -> [&FloatParam; 4] {
+        [&self.duck_depth_front, &self.duck_depth_center, &self.duck_depth_lfe, &self.duck_depth_surround]
+    }
+
+    /// Those parameters as the core takes them. Resolving groups to individual channels is the
+    /// core's job (`DuckDepth::per_channel`), since which role sits at which stream position
+    /// depends on the negotiated channel count.
+    pub fn duck_depth(&self) -> DuckDepth {
+        DuckDepth {
+            front_lr: self.duck_depth_front.value() as f64,
+            center: self.duck_depth_center.value() as f64,
+            lfe: self.duck_depth_lfe.value() as f64,
+            surround: self.duck_depth_surround.value() as f64,
+        }
+    }
 }
 
 impl Default for ComISAssist {
@@ -330,6 +383,10 @@ impl Default for ComISAssistParams {
                     format!("{value:.0}")
                 }
             })),
+            duck_depth_front: duck_depth_param("Front L/R"),
+            duck_depth_center: duck_depth_param("Center"),
+            duck_depth_lfe: duck_depth_param("LFE"),
+            duck_depth_surround: duck_depth_param("Surround L/R"),
             bypass: BoolParam::new("Bypass", false),
             mix_dialogue_to_bed: BoolParam::new("Mix Dialogue to Bed", true),
             divergence: FloatParam::new("Voice Divergence", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
@@ -352,6 +409,7 @@ impl ComISAssistParams {
             max_gain_reduction_db: self.max_gain_reduction_db.value() as f64,
             com_gate_lufs: self.com_gate_lufs.value() as f64,
             speed: self.speed.value() as f64,
+            duck_depth: self.duck_depth(),
         }
     }
 }
@@ -539,11 +597,6 @@ const METER_BANK_WIDTH: f32 = GR_COLUMN_WIDTH
     + GAP_AFTER_RATIO
     + LOUDNESS_COLUMN_WIDTH;
 
-/// Shared dB scale for the three loop-stage bars. Spans slightly below zero so the mid stage's
-/// negative trim is visible, and up to the default gain-reduction ceiling so the slow stage has
-/// room; values beyond either end simply clamp.
-const LOOP_BAR_MIN_DB: f32 = -8.0;
-const LOOP_BAR_MAX_DB: f32 = 24.0;
 
 /// Meter background - shared by every bar's unfilled portion.
 const METER_BACKGROUND: egui::Color32 = egui::Color32::from_gray(22);
@@ -826,42 +879,6 @@ fn ratio_meter(
     span
 }
 
-/// A small horizontal bar for one loop stage, for reading at a glance *which* stage is responsible
-/// for the current gain - the three have visibly different characters, and the numbers alone make
-/// that hard to see moving.
-///
-/// All three share one dB scale and one zero line, which is the point: the comparison that matters
-/// is their relative size (slow carrying the bulk while mid and fast trim around it), not each
-/// stage's own range. `mid` is signed, so the zero line sits inside the bar rather than at its edge.
-fn loop_bar(ui: &mut egui::Ui, label: &str, value_db: f32, color: egui::Color32) {
-    const WIDTH: f32 = 150.0;
-    const HEIGHT: f32 = 11.0;
-
-    ui.horizontal(|ui| {
-        ui.add_sized(egui::vec2(34.0, HEIGHT), egui::Label::new(label));
-        let (rect, _response) = ui.allocate_exact_size(egui::vec2(WIDTH, HEIGHT), egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, METER_BACKGROUND);
-
-        let x_at = |db: f32| {
-            let t = ((db - LOOP_BAR_MIN_DB) / (LOOP_BAR_MAX_DB - LOOP_BAR_MIN_DB)).clamp(0.0, 1.0);
-            rect.min.x + rect.width() * t
-        };
-        let zero_x = x_at(0.0);
-        let value_x = x_at(value_db);
-        let (left, right) = if value_x >= zero_x { (zero_x, value_x) } else { (value_x, zero_x) };
-        painter.rect_filled(
-            egui::Rect::from_min_max(egui::pos2(left, rect.min.y), egui::pos2(right, rect.max.y)),
-            2.0,
-            color,
-        );
-        painter.vline(zero_x, rect.y_range(), egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)));
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)), egui::StrokeKind::Outside);
-
-        ui.add_space(6.0);
-        ui.colored_label(color, format!("{value_db:+.1}"));
-    });
-}
 
 /// A vertical scale (tick marks + numeric labels) spanning `[min, max]` over `height` pixels.
 /// `top_down` selects the tick direction to match the bar it labels: `false` for the bottom-up
@@ -1312,29 +1329,21 @@ impl Plugin for ComISAssist {
                                 // defined entirely by which of four states it's in, showing that
                                 // state directly is the fastest answer to "why is it doing that?"
                                 // - far more legible than inferring it from the meters.
-                                ui.add_space(20.0);
+                                // Per-channel duck depth. Replaces the three loop-contribution
+                                // bars that used to sit here, which were a debugging view of the
+                                // cascade's internals rather than anything to mix with.
+                                ui.add_space(16.0);
                                 ui.separator();
-                                ui.add_space(8.0);
-                                ui.label("Loops (dB)");
-                                ui.add_space(4.0);
-                                loop_bar(
-                                    ui,
-                                    "slow",
-                                    meters.slow_db.load(Ordering::Relaxed),
-                                    egui::Color32::from_rgb(0x52, 0xFF, 0xFE),
-                                );
-                                loop_bar(
-                                    ui,
-                                    "mid",
-                                    meters.mid_db.load(Ordering::Relaxed),
-                                    egui::Color32::from_rgb(0x39, 0xC8, 0x39),
-                                );
-                                loop_bar(
-                                    ui,
-                                    "fast",
-                                    meters.fast_db.load(Ordering::Relaxed),
-                                    egui::Color32::from_rgb(224, 140, 32),
-                                );
+                                ui.add_space(10.0);
+                                ui.label("Duck depth");
+                                ui.add_space(6.0);
+                                rows_right = rows_right.max(control_grid(ui, "com-is-assist-duck-depth", |ui| {
+                                    for (label, param) in BED_GROUP_LABELS.iter().zip(params.duck_depth_params()) {
+                                        control_label(ui, label);
+                                        ui.add(ParamSlider::for_param(param, setter).with_width(CONTROL_SLIDER_WIDTH));
+                                        ui.end_row();
+                                    }
+                                }));
                                 rows_right
                             });
                             // Hand this frame's measurement to the next frame's title row: the
@@ -1467,10 +1476,6 @@ impl Plugin for ComISAssist {
             self.meters
                 .mix_state
                 .store(mix_state_index(processor.mix_state()), Ordering::Relaxed);
-            let contributions = processor.contributions();
-            self.meters.slow_db.store(contributions.slow_db as f32, Ordering::Relaxed);
-            self.meters.mid_db.store(contributions.mid_db as f32, Ordering::Relaxed);
-            self.meters.fast_db.store(contributions.fast_db as f32, Ordering::Relaxed);
         }
 
         if mix_dialogue_to_bed {
@@ -1504,3 +1509,53 @@ impl Vst3Plugin for ComISAssist {
 }
 
 nih_export_vst3!(ComISAssist);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shipped default in one assertion, pinned where a reader can see them together.
+    ///
+    /// Worth having because these have now moved more than once, and the GUI gives no clue whether
+    /// a value on screen is the default or something the host restored from a saved session - so
+    /// "is the default right?" is a question the plugin itself cannot answer by inspection.
+    #[test]
+    fn the_shipped_defaults_are_what_the_specs_say() {
+        let params = ComISAssistParams::default();
+
+        assert_eq!(params.target_ratio.default_plain_value(), 5.0);
+        assert_eq!(params.overvoice_ratio.default_plain_value(), 13.0);
+        assert_eq!(params.max_gain_reduction_db.default_plain_value(), 24.0);
+        assert_eq!(params.com_gate_lufs.default_plain_value(), -32.0);
+        assert_eq!(params.speed.default_plain_value(), 1.0);
+        // Centre-only: Dialogue is not spread into L/R unless asked for.
+        assert_eq!(params.divergence.default_plain_value(), 0.0);
+        assert!(!params.bypass.default_plain_value());
+        assert!(params.mix_dialogue_to_bed.default_plain_value());
+
+        // Every channel group takes the ducking in full, which is the pre-feature behaviour.
+        for param in params.duck_depth_params() {
+            assert_eq!(param.default_plain_value(), 1.0, "{} should default to 1:1", param.name());
+        }
+    }
+
+    /// The two wrappers must not be able to disagree about what the mixer does out of the box, so
+    /// the VST3's defaults are checked against the core's rather than just against themselves.
+    #[test]
+    fn the_defaults_match_the_shared_core() {
+        let params = ComISAssistParams::default();
+        let core = AutomixEngineConfig::default();
+
+        assert_eq!(params.target_ratio.default_plain_value() as f64, core.target_ratio_lu);
+        assert_eq!(params.overvoice_ratio.default_plain_value() as f64, core.overvoice_ratio_lu);
+        assert_eq!(params.max_gain_reduction_db.default_plain_value() as f64, core.max_gain_reduction_db);
+        assert_eq!(params.com_gate_lufs.default_plain_value() as f64, core.com_gate_lufs);
+        assert_eq!(params.speed.default_plain_value() as f64, core.speed);
+
+        let depth = params.duck_depth();
+        assert_eq!(depth.front_lr, core.duck_depth.front_lr);
+        assert_eq!(depth.center, core.duck_depth.center);
+        assert_eq!(depth.lfe, core.duck_depth.lfe);
+        assert_eq!(depth.surround, core.duck_depth.surround);
+    }
+}

@@ -6,7 +6,7 @@
 // Every tunable is overridable from the environment (see `env_f64`) so a settings sweep can be
 // scripted against real material without recompiling.
 
-use com_is_assist_core::automix::{AutomixEngineConfig, AutomixProcessor, MixState};
+use com_is_assist_core::automix::{AutomixEngineConfig, AutomixProcessor, DuckDepth, MixState};
 use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::env;
@@ -65,6 +65,29 @@ fn env_f64(name: &str, default: f64) -> f64 {
     }
 }
 
+/// Reads `COMIS_DUCK_DEPTH` - four comma-separated `1:1`..`1:0` factors, in the order
+/// `front,center,lfe,surround` - falling back to `default`. Omitted or blank fields keep their
+/// default, so `COMIS_DUCK_DEPTH=,,0` holds the LFE out without spelling out the rest.
+fn env_duck_depth(default: DuckDepth) -> DuckDepth {
+    let Ok(raw) = env::var("COMIS_DUCK_DEPTH") else {
+        return default;
+    };
+    let mut out = default;
+    let mut slots = [&mut out.front_lr, &mut out.center, &mut out.lfe, &mut out.surround];
+    for (index, field) in raw.split(',').enumerate() {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        match (slots.get_mut(index), field.parse::<f64>()) {
+            (Some(slot), Ok(value)) => **slot = value.clamp(0.0, 1.0),
+            (Some(_), Err(_)) => eprintln!("ignoring COMIS_DUCK_DEPTH field {index} ({field:?}): not a number"),
+            (None, _) => eprintln!("ignoring COMIS_DUCK_DEPTH field {index}: only four channel groups exist"),
+        }
+    }
+    out
+}
+
 /// Averages an interleaved multichannel block to mono for the IS-side voice detector (Silero is a
 /// mono model). Every wrapper does the same reduction so the detector sees identical input.
 fn downmix_to_mono(interleaved: &[f32], channels: u32) -> Vec<f32> {
@@ -105,6 +128,7 @@ fn main() -> ExitCode {
         eprintln!("Config overrides (environment variables, all optional):");
         eprintln!("  COMIS_TARGET_RATIO_LU, COMIS_OVERVOICE_RATIO_LU, COMIS_MAX_GAIN_REDUCTION_DB,");
         eprintln!("  COMIS_SPEED, COMIS_COM_GATE_LUFS,");
+        eprintln!("  COMIS_DUCK_DEPTH (front,center,lfe,surround as 0-1 factors, e.g. 1,1,0,0.5),");
         eprintln!("  COMIS_VAD_HANGOVER_SECONDS");
         return ExitCode::FAILURE;
     }
@@ -149,6 +173,7 @@ fn main() -> ExitCode {
         max_gain_reduction_db: env_f64("COMIS_MAX_GAIN_REDUCTION_DB", defaults.max_gain_reduction_db),
         com_gate_lufs: env_f64("COMIS_COM_GATE_LUFS", defaults.com_gate_lufs),
         speed: env_f64("COMIS_SPEED", defaults.speed),
+        duck_depth: env_duck_depth(defaults.duck_depth),
     };
 
     let mut processor = match AutomixProcessor::new(bed_channels, sample_rate, config, TICK_SECONDS) {

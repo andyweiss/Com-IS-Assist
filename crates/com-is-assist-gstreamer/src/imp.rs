@@ -20,6 +20,7 @@
 
 use com_is_assist_core::automix::{
     bed_lrc_channels, mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, MixState,
+    DuckDepth, MAX_BED_CHANNELS as BED_CHANNEL_SLOTS,
 };
 use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use gstreamer as gst;
@@ -42,7 +43,10 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 const TICK_SECONDS: f64 = 0.1;
 const SAMPLE_RATE: u32 = 48_000;
 const MIN_BED_CHANNELS: i32 = 2;
-const MAX_BED_CHANNELS: i32 = 6;
+/// The caps ceiling, in the `i32` GStreamer negotiates in. Derived from the core's own channel
+/// limit rather than written out again, so the widest Bed this element will negotiate cannot drift
+/// away from the widest one the DSP is sized for.
+const MAX_BED_CHANNELS: i32 = BED_CHANNEL_SLOTS as i32;
 
 /// Fixed caps for a specific channel count - used for `dialogue_sink`/`dialogue_src`, which are
 /// always mono.
@@ -114,6 +118,14 @@ struct Settings {
     /// Left/Right only. Has no audible effect for 2ch/4ch Bed, which has no Center channel to
     /// diverge from - see `mix_dialogue_into_bed`'s doc comment.
     divergence_percent: f64,
+    /// "Duck depth" per Bed channel group, 0.0-1.0: the `1:1` .. `1:0` factor from
+    /// `com_is_assist_core::automix::DuckDepth`. 1.0 means those channels take the computed gain
+    /// reduction in full; 0.0 means they are not ducked at all.
+    ///
+    /// Named by group rather than by stream position, and resolved to actual channels by the core
+    /// against the negotiated channel count - so `duck-depth-center` controls Center on every
+    /// layout that has one, and nothing on the layouts that do not.
+    duck_depth: DuckDepth,
 }
 
 impl Default for Settings {
@@ -127,6 +139,7 @@ impl Default for Settings {
             speed: automix.speed,
             automix_enabled: true,
             divergence_percent: 0.0,
+            duck_depth: automix.duck_depth,
         }
     }
 }
@@ -139,6 +152,7 @@ impl Settings {
             max_gain_reduction_db: self.max_gain_reduction_db,
             com_gate_lufs: self.com_gate_lufs,
             speed: self.speed,
+            duck_depth: self.duck_depth,
         }
     }
 }
@@ -956,6 +970,30 @@ impl ObjectImpl for ComISAssist {
                 glib::ParamSpecBoolean::builder("automix-enable")
                     .default_value(true)
                     .build(),
+                glib::ParamSpecDouble::builder("duck-depth-front")
+                    .minimum(0.0)
+                    .maximum(1.0)
+                    .default_value(1.0)
+                    .blurb("Share of the computed gain reduction taken by the front Left/Right pair; 1.0 is the full reduction, 0.0 leaves them un-ducked")
+                    .build(),
+                glib::ParamSpecDouble::builder("duck-depth-center")
+                    .minimum(0.0)
+                    .maximum(1.0)
+                    .default_value(1.0)
+                    .blurb("Share of the computed gain reduction taken by the Center channel; 1.0 is the full reduction, 0.0 leaves them un-ducked")
+                    .build(),
+                glib::ParamSpecDouble::builder("duck-depth-lfe")
+                    .minimum(0.0)
+                    .maximum(1.0)
+                    .default_value(1.0)
+                    .blurb("Share of the computed gain reduction taken by the LFE channel; 1.0 is the full reduction, 0.0 leaves them un-ducked")
+                    .build(),
+                glib::ParamSpecDouble::builder("duck-depth-surround")
+                    .minimum(0.0)
+                    .maximum(1.0)
+                    .default_value(1.0)
+                    .blurb("Share of the computed gain reduction taken by the surround pair; 1.0 is the full reduction, 0.0 leaves them un-ducked")
+                    .build(),
                 glib::ParamSpecDouble::builder("divergence")
                     .minimum(0.0)
                     .maximum(100.0)
@@ -993,6 +1031,10 @@ impl ObjectImpl for ComISAssist {
             "com-gate-lufs" => lock_recover(&self.settings).com_gate_lufs.to_value(),
             "max-gain-reduction-db" => lock_recover(&self.settings).max_gain_reduction_db.to_value(),
             "automix-enable" => lock_recover(&self.settings).automix_enabled.to_value(),
+            "duck-depth-front" => lock_recover(&self.settings).duck_depth.front_lr.to_value(),
+            "duck-depth-center" => lock_recover(&self.settings).duck_depth.center.to_value(),
+            "duck-depth-lfe" => lock_recover(&self.settings).duck_depth.lfe.to_value(),
+            "duck-depth-surround" => lock_recover(&self.settings).duck_depth.surround.to_value(),
             "divergence" => lock_recover(&self.settings).divergence_percent.to_value(),
             "current-gain-reduction-db" => lock_recover(&self.state)
                 .as_ref()
@@ -1041,6 +1083,10 @@ impl ObjectImpl for ComISAssist {
                 "com-gate-lufs" => settings.com_gate_lufs = value.get().unwrap(),
                 "max-gain-reduction-db" => settings.max_gain_reduction_db = value.get().unwrap(),
                 "automix-enable" => settings.automix_enabled = value.get().unwrap(),
+                "duck-depth-front" => settings.duck_depth.front_lr = value.get().unwrap(),
+                "duck-depth-center" => settings.duck_depth.center = value.get().unwrap(),
+                "duck-depth-lfe" => settings.duck_depth.lfe = value.get().unwrap(),
+                "duck-depth-surround" => settings.duck_depth.surround = value.get().unwrap(),
                 "divergence" => settings.divergence_percent = value.get().unwrap(),
                 _ => unimplemented!(),
             }

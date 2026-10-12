@@ -38,9 +38,9 @@ pub struct AutomixEngineConfig {
     /// cannot be is a *loudness* judgement, which is why this sits alongside the VAD rather than
     /// replacing it.
     ///
-    /// Default -70 LUFS, which is effectively open: real programme audio sits well above it, so
-    /// behaviour is unchanged until the gate is deliberately raised. Useful settings are typically
-    /// 20-30 dB below the commentator's own momentary level.
+    /// Ships **engaged** at -32 LUFS rather than parked at the bottom of its range, where it would
+    /// protect nothing. Useful settings are typically 20-30 dB below the commentator's own
+    /// momentary level.
     pub com_gate_lufs: f64,
     /// The "Speed" macro — scales every stage's ballistics together. This is the *only* timing
     /// control, replacing the five separate time parameters (`adaptation`/`attack`/`hold`/
@@ -48,6 +48,78 @@ pub struct AutomixEngineConfig {
     /// the effective attack and release are emergent, so the individual times had nothing
     /// meaningful left to set.
     pub speed: f64,
+    /// How much of the computed gain reduction each group of Bed channels receives - see
+    /// [`DuckDepth`].
+    pub duck_depth: DuckDepth,
+}
+
+/// The widest Bed this project supports (`Ebur128Meter::bed_channel_map`).
+pub const MAX_BED_CHANNELS: usize = 6;
+
+/// How much of the computed gain reduction each group of Bed channels actually takes, as a factor
+/// from `1.0` (the reduction in full - 6 dB of ducking reduces those channels by 6 dB) down to
+/// `0.0` (not ducked at all). Values scale the **decibels** linearly, so `0.5` against 6 dB of
+/// ducking is 3 dB.
+///
+/// This is a *distribution* control, not a second gain stage: the reduction itself is still
+/// computed once, from the whole Bed's loudness, by the state machine and the cascade. All it
+/// changes is how that one answer is spread - which is why leaving every group at 1.0 reproduces
+/// the pre-feature behaviour exactly.
+///
+/// It exists because the Bed is not homogeneous. Ducking the surrounds as hard as the front throws
+/// away atmosphere that was never competing with the commentator, and the LFE carries no
+/// intelligibility to protect at all; holding those back while the front ducks fully keeps the
+/// commentary clear without flattening the scene around it.
+///
+/// **Grouped, not per channel, and deliberately so.** Left and Right must duck by the same amount
+/// or the difference is heard as the image sliding sideways; the same goes for the surround pair.
+/// Independent per-channel settings make that mistake easy to reach and buy nothing, since no real
+/// use for an asymmetric front or surround duck has come up.
+#[derive(Debug, Clone, Copy)]
+pub struct DuckDepth {
+    /// Left and Right together.
+    pub front_lr: f64,
+    pub center: f64,
+    pub lfe: f64,
+    /// Left Surround and Right Surround together.
+    pub surround: f64,
+}
+
+impl Default for DuckDepth {
+    fn default() -> Self {
+        Self { front_lr: 1.0, center: 1.0, lfe: 1.0, surround: 1.0 }
+    }
+}
+
+impl DuckDepth {
+    /// Resolves the groups to a factor per channel **position** for a Bed of `bed_channels`,
+    /// against the same map the loudness meters use (`Ebur128Meter::bed_channel_map`).
+    ///
+    /// Doing it here rather than in each wrapper is what keeps the group names honest: which role
+    /// sits at a given stream position depends on the channel count (position 2 is Center on a
+    /// 3/5/6-channel Bed but Left Surround on a 4-channel one), so a wrapper exposing positional
+    /// settings would be mislabelling them on every layout but the widest. Positions past
+    /// `bed_channels`, and any count the map rejects, resolve to 1.0 and are never read.
+    pub fn per_channel(&self, bed_channels: u32) -> [f64; MAX_BED_CHANNELS] {
+        use ebur128::Channel;
+
+        let mut out = [1.0; MAX_BED_CHANNELS];
+        let Ok(map) = Ebur128Meter::bed_channel_map(bed_channels) else {
+            return out;
+        };
+        for (slot, channel) in out.iter_mut().zip(map) {
+            *slot = match channel {
+                Channel::Left | Channel::Right => self.front_lr,
+                Channel::Center => self.center,
+                // `bed_channel_map` marks the 6-channel layout's LFE as `Unused`: BS.1770 excludes
+                // it from the loudness sum, which is exactly why it is also the channel with no
+                // intelligibility to protect.
+                Channel::Unused => self.lfe,
+                _ => self.surround,
+            };
+        }
+        out
+    }
 }
 
 impl Default for AutomixEngineConfig {
@@ -62,6 +134,7 @@ impl Default for AutomixEngineConfig {
             // comfortably over the bed's bleed into the mic.
             com_gate_lufs: -32.0,
             speed: 1.0,
+            duck_depth: DuckDepth::default(),
         }
     }
 }

@@ -1,8 +1,8 @@
 use ebur128::Error as Ebur128Error;
 
 use crate::automix::{
-    apply_ramped_gain, AutomixEngine, AutomixEngineConfig, FastLoudnessMeter, LoopContributions,
-    LoudnessSnapshot, MixState,
+    apply_ramped_gain_per_channel, AutomixEngine, AutomixEngineConfig, FastLoudnessMeter,
+    LoopContributions, LoudnessSnapshot, MixState, MAX_BED_CHANNELS,
 };
 use crate::loudness::{ConfigError, Ebur128Meter};
 
@@ -49,10 +49,11 @@ pub struct AutomixProcessor {
 
     automix_engine: AutomixEngine,
 
-    /// The gain actually applied to the most recent sample, so the next chunk can ramp from it
-    /// rather than stepping. Replaces the old tick-length ramp: with the fast stage updating every
-    /// sub-chunk there is no fixed ramp window any more.
-    current_gain: f32,
+    /// The gain actually applied to the most recent sample **of each channel**, so the next chunk
+    /// can ramp from it rather than stepping. Replaces the old tick-length ramp: with the fast
+    /// stage updating every sub-chunk there is no fixed ramp window any more. Per-channel since
+    /// `AutomixEngineConfig::duck_depth` lets the channels sit at different gains.
+    current_gain: [f32; MAX_BED_CHANNELS],
     automix_enabled: bool,
 
     /// Frames fed into each side since the last control step. A new slow/mid step only runs once
@@ -68,6 +69,10 @@ pub struct AutomixProcessor {
     /// See [`AutomixEngineConfig::com_gate_lufs`]. Held here rather than in the engine because the
     /// gate needs COM's measured level, which lives on this side.
     com_gate_lufs: f64,
+    /// [`DuckDepth`] already resolved against this Bed's channel count, so the hot path never
+    /// touches the channel map. Held here rather than in the engine because it shapes how one
+    /// computed reduction is *applied*, not how it is decided.
+    duck_depth: [f64; MAX_BED_CHANNELS],
     /// The COM voice flag *after* gating - what actually drove the most recent control step, and
     /// therefore what a GUI indicator should show.
     com_voice_gated: bool,
@@ -89,7 +94,7 @@ impl AutomixProcessor {
             bed_fast: FastLoudnessMeter::new(&bed_map, sample_rate, FAST_WINDOW_SECONDS),
             dialogue_reference_lufs: Ebur128Meter::NEGATIVE_INFINITY_DB,
             automix_engine: AutomixEngine::new(automix_config),
-            current_gain: 1.0,
+            current_gain: [1.0; MAX_BED_CHANNELS],
             automix_enabled: true,
             bed_frames_since_control: 0,
             dialogue_frames_since_control: 0,
@@ -98,6 +103,7 @@ impl AutomixProcessor {
             control_ratio_lu: 0.0,
             mix_state: MixState::ReleaseToUnity,
             com_gate_lufs: automix_config.com_gate_lufs,
+            duck_depth: automix_config.duck_depth.per_channel(bed_channels),
             com_voice_gated: false,
         })
     }
@@ -110,6 +116,7 @@ impl AutomixProcessor {
     /// every block - it is a couple of struct copies, not a rebuild.
     pub fn set_config(&mut self, automix_config: AutomixEngineConfig) {
         self.com_gate_lufs = automix_config.com_gate_lufs;
+        self.duck_depth = automix_config.duck_depth.per_channel(self.bed_channels);
         self.automix_engine.set_config(automix_config);
     }
 
@@ -158,13 +165,18 @@ impl AutomixProcessor {
                     .process_fast(self.bed_fast.loudness_db(), self.dialogue_reference_lufs, dt);
             self.applied_gain_reduction_db = reduction_db;
 
-            let target_gain = if self.automix_enabled {
-                10f64.powf(-reduction_db / 20.0) as f32
-            } else {
-                1.0
-            };
+            // One reduction, distributed across the channels by `duck_depth`. Scaling in **dB**
+            // rather than scaling the linear gain is what makes the control mean what it says: at
+            // 0.5 a channel gets half the *decibels*, so the relationship between channels holds
+            // at every depth instead of drifting with the size of the reduction.
+            let mut target_gain = [1.0_f32; MAX_BED_CHANNELS];
+            if self.automix_enabled {
+                for (gain, depth) in target_gain.iter_mut().zip(self.duck_depth) {
+                    *gain = 10f64.powf(-(reduction_db * depth) / 20.0) as f32;
+                }
+            }
 
-            apply_ramped_gain(subchunk, self.bed_channels, self.current_gain, target_gain);
+            apply_ramped_gain_per_channel(subchunk, self.bed_channels, &self.current_gain, &target_gain);
             self.current_gain = target_gain;
         }
 

@@ -2,6 +2,10 @@
 name = "com-is-assist-vst3"
 version = "0.1.0"
 edition = "2021"
+# GPLv3, unlike every other crate here, and not by choice: `nih_plug`'s default `vst3` feature
+# pulls `vst3-sys`, which is GPLv3. Nothing in this crate's own code requires it - see
+# `../../docs/LICENSING.md` for what it would take to lift.
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "com_is_assist_vst3"

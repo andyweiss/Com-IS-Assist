@@ -45,6 +45,30 @@ Settable (all live — `set_property` forwards to `AutomixProcessor::set_config`
 | `com-gate-lufs` | double (LUFS) | -32.0 | Guard band on COM voice detection: reported speech is ignored while COM's momentary loudness is below this, so bed crosstalk in the commentary mic cannot duck the bed against itself. The default is engaged, not parked at the bottom of its range |
 | `automix-enable` | boolean | true | Note the polarity is inverted from VST3's `bypass` |
 | `divergence` | double (%) | 0.0 | |
+| `duck-depth-front` | double | 1.0 | Share of the computed gain reduction taken by the front Left/Right pair |
+| `duck-depth-center` | double | 1.0 | ... by the Center channel |
+| `duck-depth-lfe` | double | 1.0 | ... by the LFE channel |
+| `duck-depth-surround` | double | 1.0 | ... by the surround pair |
+
+### Duck depth per bed channel group
+
+One gain reduction is computed for the whole Bed, as before; these four decide how much of it each group of channels actually takes. `1.0` is the full figure (6 dB of ducking takes 6 dB off those channels), `0.0` leaves them at unity - the `1:1` .. `1:0` ratio the VST3 displays. Values scale the **decibels** linearly, so 0.5 against 6 dB is 3 dB, which keeps the relationship between groups fixed at every reduction depth instead of drifting with it. All four at 1.0 is the previous behaviour exactly.
+
+It exists because the Bed is not homogeneous: ducking the surrounds as hard as the front throws away atmosphere that was never competing with the commentator, and the LFE carries no intelligibility to protect at all.
+
+**Grouped, not per channel.** Left and Right must duck by the same amount or the difference is heard as the stereo image sliding sideways, and the same applies to the surround pair; independent settings make that mistake easy to reach and buy nothing.
+
+The groups are resolved to actual channels by the core (`DuckDepth::per_channel`) against the negotiated channel count, so the names hold on every layout:
+
+| Channels | Front L/R | Center | LFE | Surround L/R |
+|---|---|---|---|---|
+| 2 | idx 0,1 | - | - | - |
+| 3 | idx 0,1 | idx 2 | - | - |
+| 4 | idx 0,1 | - | - | idx 2,3 |
+| 5 | idx 0,1 | idx 2 | - | idx 3,4 |
+| 6 | idx 0,1 | idx 2 | idx 3 | idx 4,5 |
+
+A group with no channels on the current layout simply does nothing. An earlier revision exposed six *positional* properties instead; that was dropped because position 2 is Center on a 3/5/6-channel Bed but Left Surround on a 4-channel one, so the names were wrong on exactly the layouts where it mattered.
 
 Read-only:
 

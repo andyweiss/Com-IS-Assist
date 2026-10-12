@@ -6,7 +6,7 @@ A realtime broadcast mix assist/ automixer that ducks an International Sound "Be
 
 Ships as two thin wrappers around one shared Rust DSP core:
 - A **GStreamer element** (`comisassist`) — the primary broadcast deployment target. Bed is 2-6ch, dynamically negotiated via caps.
-- A **VST3 plugin** (`Com-IS-Assist`) — for DAW-based testing and validation against the original JSFX meter in Reaper. Fixed 8-channel bus (6ch Bed + mono Dialogue + 1 unused), with a mix/duck-only toggle and a live meter GUI (gain reduction, IS/COM loudness, ratio, both voice LEDs, current state and per-stage loop contributions).
+- A **VST3 plugin** (`Com-IS-Assist`) — for DAW-based testing and validation against the original JSFX meter in Reaper. Fixed 8-channel bus (6ch Bed + mono Dialogue + 1 unused), with a mix/duck-only toggle and a live meter GUI (gain reduction, IS/COM loudness, ratio, both voice LEDs and current state), plus per-channel-group duck depth controls.
 
 ## How it works
 
@@ -22,6 +22,8 @@ Two voice-activity detectors — one on the Dialogue (COM), one on the Bed (IS) 
 How much to duck is computed **feed-forward** from the dry signals. Because reducing the Bed by 1 dB raises the COM/IS ratio by exactly 1 LU, the required reduction is simply `target − (COM − BED)` — no feedback loop, so no windup and no pumping.
 
 That reduction is applied by three cascaded gain stages whose detectors see the Bed at different speeds (3 s short-term, 400 ms momentary, and a ~50 ms K-weighted detector run at audio-block rate), their reductions adding in dB. Attack and release are not configured but **emerge** from how the stages interact: long and gentle when the programme is steady, very fast when the Bed surges. A single **Speed** control scales them together.
+
+How much of that reduction each part of the Bed receives is set per channel group (**duck depth**, a ratio from 1:1 down to 1:0 for Front L/R, Center, LFE and Surround L/R), so the surrounds and LFE can be held back while the front channels duck fully. Everything at 1:1 - the default - ducks the whole Bed uniformly.
 
 Dialogue is never gained or delayed — only measured and, optionally, mixed back into the Bed's Left/Center/Right channels via a "voice divergence" equal-power pan law (Center-only at 0% up to split-L/R at 100%). Neither wrapper adds any latency.
 
@@ -66,4 +68,6 @@ Produces `target/bundled/Com-IS-Assist.vst3`.
 
 ## License
 
-GPLv3 — see `LICENSE`. Driven specifically by the VST3 build target (`nih-plug`'s VST3 export depends on the GPLv3-licensed `vst3-sys` crate); see `docs/LICENSING.md` for the full rationale and a breakdown of the (mostly permissive) licenses of the rest of the dependency stack.
+**MIT**, except the VST3 wrapper — see `LICENSE`.
+
+`com-is-assist-core`, `com-is-assist-gstreamer`, `com-is-assist-offline` and `xtask` are MIT. `com-is-assist-vst3` alone is **GPL-3.0-or-later** (`crates/com-is-assist-vst3/LICENSE`), because `nih-plug`'s default `vst3` feature pulls the GPLv3-licensed `vst3-sys` crate. Nothing in this project's own code requires that; the other crates pull no VST3 dependency at all, so only a distributed VST3 binary carries GPLv3 obligations. See `docs/LICENSING.md` for the full rationale, the rest of the dependency stack, and what it would take to make the plugin permissive too.

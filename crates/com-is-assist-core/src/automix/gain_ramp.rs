@@ -28,6 +28,32 @@ pub fn apply_ramped_gain(samples: &mut [f32], channels: u32, gain_start: f32, ga
     }
 }
 
+/// As [`apply_ramped_gain`], but with a gain per channel rather than one shared by all of them -
+/// how `AutomixEngineConfig::duck_depth` reaches the audio. `gain_start`/`gain_end` are indexed by
+/// position in the interleaved frame and must each cover `channels`; a channel beyond their length
+/// is left untouched rather than silenced, so a mis-sized slice can never zero audio.
+pub fn apply_ramped_gain_per_channel(samples: &mut [f32], channels: u32, gain_start: &[f32], gain_end: &[f32]) {
+    let channels = channels as usize;
+    if channels == 0 || samples.is_empty() {
+        return;
+    }
+    let frame_count = samples.len() / channels;
+    if frame_count == 0 {
+        return;
+    }
+    let last_frame = (frame_count.saturating_sub(1)) as f32;
+    for frame in 0..frame_count {
+        // A single-frame chunk has no span to ramp across, so it simply lands on the end value.
+        let t = if frame_count > 1 { frame as f32 / last_frame } else { 1.0 };
+        for channel in 0..channels {
+            let (Some(start), Some(end)) = (gain_start.get(channel), gain_end.get(channel)) else {
+                continue;
+            };
+            samples[frame * channels + channel] *= start + (end - start) * t;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
