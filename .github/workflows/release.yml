@@ -1,0 +1,100 @@
+name: Release
+
+# Builds the VST3 for macOS, Windows and Linux and attaches them to the GitHub release.
+#
+# Triggered by pushing a `v*` tag, which is what "draft a new release" does when you publish it.
+# The tag is also the version: it is passed through as COMIS_RELEASE_VERSION, which `build.rs`
+# stamps into the plugin's help page. A build made any other way reports "dev build" instead, so a
+# published artifact can always be told apart from a local one.
+
+on:
+  push:
+    tags: ['v*']
+  # Lets the build be exercised without cutting a release. Nothing is published in that case, and
+  # the artifacts report themselves as dev builds, because they are.
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64,  os: macos-latest   }
+          - { name: windows-x64,  os: windows-latest }
+          - { name: linux-x64,    os: ubuntu-22.04   }
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # baseview/egui need these to build on Linux. Taken from nih-plug's own CI rather than
+      # assembled by trial and error.
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libgl-dev libjack-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Build and bundle the VST3
+        env:
+          # Empty on workflow_dispatch, which build.rs treats as unset - hence "dev build".
+          COMIS_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          # The oldest macOS this will load on. Only affects the macOS runner.
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+        run: cargo xtask bundle com-is-assist-vst3 --release
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Com-IS-Assist-${{ matrix.name }}
+          path: target/bundled/
+          if-no-files-found: error
+
+  publish:
+    name: Attach builds to the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to create/update the release and upload assets to it.
+      contents: write
+    steps:
+      - name: Download every platform's bundle
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # One zip per platform. `actions/download-artifact` unpacks what `upload-artifact` zipped, so
+      # the archives are rebuilt here rather than passed through - that way each one is named for
+      # its platform and contains the .vst3 bundle at its root.
+      - name: Zip each platform's bundle
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            (cd "$dir" && zip -r "$GITHUB_WORKSPACE/release/$name.zip" .)
+          done
+          ls -l release
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
+          # Keeps whatever release notes were drafted for the tag.
+          fail_on_unmatched_files: true

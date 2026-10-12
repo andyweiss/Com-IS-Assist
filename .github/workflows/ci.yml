@@ -1,8 +1,7 @@
 name: CI
 
-# Deployment is Linux (Specs/TechnicalConcept.md section 1) while development happens on macOS, so
-# the point of this pass is proving the workspace builds and tests clean on the deployment platform
-# rather than only on the machine it was written on.
+# Development happens on macOS, so the point of this pass is proving the workspace builds and tests
+# clean on a second platform rather than only on the machine it was written on.
 #
 # This replaced a GStreamer-specific "Build Linux" workflow - cargo-c build, gst-inspect smoke test
 # and plugin artifact upload - which went when the GStreamer element did.

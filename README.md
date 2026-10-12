@@ -59,6 +59,18 @@ cargo xtask bundle com-is-assist-vst3 --release
 ```
 Produces `target/bundled/Com-IS-Assist.vst3`.
 
+## Releases
+
+Pushing a `v*` tag (which is what publishing a GitHub release does) runs `.github/workflows/release.yml`: it builds the VST3 for macOS, Windows and Linux, and attaches one zip per platform to the release. The tag is passed to the build as `COMIS_RELEASE_VERSION` and shown on the plugin's help page, so a published build always names its version and any other build says "dev build".
+
+| Artifact | Target |
+|---|---|
+| `Com-IS-Assist-macos-arm64.zip` | macOS, Apple Silicon only |
+| `Com-IS-Assist-windows-x64.zip` | Windows x86-64 |
+| `Com-IS-Assist-linux-x64.zip` | Linux x86-64 |
+
+**No Intel macOS build.** `ort` publishes no prebuilt ONNX Runtime for `x86_64-apple-darwin` — its download list covers `aarch64-apple-darwin` and not the Intel equivalent — so the Silero VAD dependency cannot be built for Intel Macs without supplying an ONNX Runtime by hand. A universal binary is therefore not possible as things stand.
+
 ## License
 
 **MIT**, except the VST3 wrapper — see `LICENSE`.
