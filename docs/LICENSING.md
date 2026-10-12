@@ -9,16 +9,15 @@ This project is open source (see `Specs/TechnicalConcept.md` section 1). This no
 | Crate | License | Why |
 |---|---|---|
 | `com-is-assist-core` | MIT | No GPL dependency anywhere in its tree |
-| `com-is-assist-gstreamer` | MIT | Same |
 | `com-is-assist-offline` | MIT | Same |
 | `xtask` | MIT | Same |
 | `com-is-assist-vst3` | **GPL-3.0-or-later** | `nih_plug`'s default `vst3` feature pulls `vst3-sys`, which is GPLv3 |
 
 Root `LICENSE` is the MIT text; `crates/com-is-assist-vst3/LICENSE` carries the GPLv3 text for the one crate that needs it. Every `Cargo.toml` declares its `license` field accordingly.
 
-**Verified, not assumed** (`cargo tree -p <crate> -e normal`): `com-is-assist-core`, `com-is-assist-gstreamer` and `com-is-assist-offline` pull *zero* `vst3*` crates. The GPLv3 reach really is limited to the plugin wrapper, which is what makes the split meaningful rather than cosmetic.
+**Verified, not assumed** (`cargo tree -p <crate> -e normal`): `com-is-assist-core` and `com-is-assist-offline` pull *zero* `vst3*` crates. The GPLv3 reach really is limited to the plugin wrapper, which is what makes the split meaningful rather than cosmetic.
 
-**What this means in practice.** The DSP core and the GStreamer element - the broadcast deliverable - are MIT and can be used, vendored or relicensed freely. Only a distributed **VST3 binary** carries GPLv3 obligations, because that artifact links `vst3-sys`. Building the VST3 for in-house testing changes nothing; distributing it is what triggers the terms.
+**What this means in practice.** The DSP core - where all the signal processing actually lives - is MIT and can be used, vendored or relicensed freely. Only a distributed **VST3 binary** carries GPLv3 obligations, because that artifact links `vst3-sys`. Building the VST3 for in-house testing changes nothing; distributing it is what triggers the terms.
 
 ## Why the VST3 target forces GPLv3
 
@@ -36,18 +35,17 @@ Both remove the GPLv3 dependency rather than work around it:
 1. **Ship CLAP instead of VST3.** `clap-sys` is MIT/Apache-2.0 and is already in the tree; nih-plug exports CLAP without the `vst3` feature. This is entirely within this project's control today - it is a plugin-format decision, not a licensing workaround.
 2. **Wait for permissive VST3 bindings.** Steinberg released VST3 SDK 3.8.0 under **MIT**, a significant change from the older GPLv3/proprietary dual-license terms, and a newer Rust crate, `vst3` (dual MIT/Apache-2.0), exists with more complete bindings. `nih-plug` does not use it by default today. If it migrates upstream, or if this project supplies its own binding layer built on `vst3`, `com-is-assist-vst3` could move to MIT with the rest. **Not resolved - don't assume it is already fixed.**
 
-## The rest of the stack (GStreamer, core DSP, offline tool)
+## The rest of the stack (core DSP, offline tool)
 
 Independent of the VST3 question, the non-VST3 parts of the stack are predominantly permissively licensed:
 
 - `ebur128` — MIT
-- `gstreamer-rs`/`gst-plugins-rs` — dual MIT/Apache-2.0
 - `hound` — Apache-2.0
 - `rubato` — MIT (verified directly against its `Cargo.toml`)
-- `ort` (ONNX Runtime bindings, used for `com_is_assist_core::voice_activity::SileroVad`) — dual MIT/Apache-2.0 (verified directly against its `Cargo.toml`). The `download-binaries` feature fetches a prebuilt ONNX Runtime **static** library at build time and statically links it in (verified directly: `otool -L` on the built VST3/GStreamer binaries shows no `libonnxruntime` runtime dependency, only system frameworks) - not a shared library the deployed artifact depends on at runtime. Network access is needed once per unique (target, feature set, ONNX Runtime version) on the *build* machine only; the download is cached afterward, and the compiled artifact itself runs fully offline. ONNX Runtime itself is Microsoft's, MIT-licensed.
+- `ort` (ONNX Runtime bindings, used for `com_is_assist_core::voice_activity::SileroVad`) — dual MIT/Apache-2.0 (verified directly against its `Cargo.toml`). The `download-binaries` feature fetches a prebuilt ONNX Runtime **static** library at build time and statically links it in (verified directly: `otool -L` on the built VST3 binary shows no `libonnxruntime` runtime dependency, only system frameworks) - not a shared library the deployed artifact depends on at runtime. Network access is needed once per unique (target, feature set, ONNX Runtime version) on the *build* machine only; the download is cached afterward, and the compiled artifact itself runs fully offline. ONNX Runtime itself is Microsoft's, MIT-licensed.
 - `nnnoiseless` — permissive (verify exact license file before quoting precisely in any distribution notice) - not yet a dependency; planned for the not-yet-built denoise path (`Specs/TechnicalConcept.md` section 6)
 
-This is what made the per-crate split above possible: `com-is-assist-core`, `com-is-assist-gstreamer` and `com-is-assist-offline` depend on nothing VST3-related, so nothing had to be restructured to separate them - only declared.
+This is what made the per-crate split above possible: `com-is-assist-core` and `com-is-assist-offline` depend on nothing VST3-related, so nothing had to be restructured to separate them - only declared.
 
 ## Third-party reference material
 

@@ -1,6 +1,6 @@
-// Com-IS-Assist's VST3 plugin: same shared `com_is_assist_core::automix::AutomixProcessor` as the GStreamer
-// element, wrapped in a single fixed 8-channel-in/8-channel-out bus instead of the GStreamer
-// element's 2-sink/3-src multi-pad layout.
+// Com-IS-Assist's VST3 plugin: a wrapper around the shared
+// `com_is_assist_core::automix::AutomixProcessor`, in a single fixed 8-channel-in/8-channel-out
+// bus.
 //
 // Channel layout (fixed, both input and output): 0-5 = Bed (6ch, Left/Right/Center/LFE/Ls/Rs), 6 =
 // Dialogue (mono), 7 = unused (silent). A single fixed bus (rather than nih-plug's named multi-bus
@@ -12,10 +12,9 @@
 //
 // `mix-dialogue-to-bed` (the "bus insert mode" toggle): when on, output channels 0-2
 // (Left/Right/Center) carry leveled Bed + Dialogue mixed in via `mix_dialogue_into_bed`'s
-// divergence-based pan law (matches the GStreamer element's `mix_src`, restricted to L/R/C -
-// Dialogue never touches LFE or surrounds); when off, output channels 0-5 are leveled Bed alone
-// (matches `is_leveled_src` - for inserting directly on a Bed/IS channel strip where the console
-// sums in commentary separately downstream). Channel 6 always carries the dry Dialogue passthrough
+// divergence-based pan law (restricted to L/R/C - Dialogue never touches LFE or surrounds); when
+// off, output channels 0-5 are leveled Bed alone, for inserting directly on a Bed/IS channel strip
+// where the console sums in commentary separately downstream. Channel 6 always carries the dry Dialogue passthrough
 // regardless of this toggle.
 
 use atomic_float::AtomicF32;
@@ -1523,7 +1522,7 @@ impl Plugin for ComISAssist {
             return ProcessStatus::Error("expected a fixed 8-channel bus");
         }
 
-        // com-is-assist-core works with interleaved audio (matching the GStreamer element's convention);
+        // com-is-assist-core works with interleaved audio;
         // nih-plug hands us planar per-channel slices, so de-interleave Bed for the shared
         // processor and re-interleave on the way back out.
         let mut interleaved_bed = vec![0.0f32; num_samples * BED_CHANNELS as usize];

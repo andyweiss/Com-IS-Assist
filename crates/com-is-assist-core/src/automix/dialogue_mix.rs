@@ -1,14 +1,3 @@
-/// The Left/Right/Center channel indices for a Bed layout with the given channel count, matching
-/// `Ebur128Meter::bed_channel_map`'s ordering: Left is always index 0 and Right always index 1,
-/// but Center only exists for layouts that have one (3, 5, and 6 channels) - stereo (2) and quad
-/// (4) don't. `None` for center tells `mix_dialogue_into_bed` to use its no-Center fallback.
-pub fn bed_lrc_channels(bed_channels: u32) -> (usize, usize, Option<usize>) {
-    match bed_channels {
-        3 | 5 | 6 => (0, 1, Some(2)),
-        _ => (0, 1, None),
-    }
-}
-
 /// Mixes dry Dialogue into a Bed buffer, constrained to the Left/Center/Right channels only (never
 /// LFE or surrounds), with an equal-power "divergence" crossfade between Center-only and split-LR
 /// placement - matches `Specs/Ressouces/UI.md`'s "Voice divergence: 0% = Center only up to 100% =
@@ -20,8 +9,8 @@ pub fn bed_lrc_channels(bed_channels: u32) -> (usize, usize, Option<usize>) {
 /// and Right each receive Dialogue at `1/sqrt(2)` (~-3dB), not full amplitude - two channels each
 /// at -3dB sum to the same power as one channel at 0dB, matching Center-only at `divergence = 0.0`.
 ///
-/// `center_channel` is `None` for Bed layouts with no dedicated Center channel (stereo, quad - see
-/// `bed_lrc_channels`). There's only one physically sensible way to place a mono signal "in the
+/// `center_channel` is `None` for Bed layouts with no dedicated Center channel (stereo, quad).
+/// There's only one physically sensible way to place a mono signal "in the
 /// middle" of just Left/Right - send it to both equally - so `divergence` has nothing left to
 /// control in that case; the fixed equal-power split is used regardless of its value.
 pub fn mix_dialogue_into_bed(
@@ -109,14 +98,5 @@ mod tests {
             assert!((bed[0] - expected).abs() < 1e-6, "divergence={divergence}");
             assert!((bed[1] - expected).abs() < 1e-6, "divergence={divergence}");
         }
-    }
-
-    #[test]
-    fn bed_lrc_channels_has_center_only_for_layouts_that_have_one() {
-        assert_eq!(bed_lrc_channels(2), (0, 1, None)); // stereo
-        assert_eq!(bed_lrc_channels(3), (0, 1, Some(2)));
-        assert_eq!(bed_lrc_channels(4), (0, 1, None)); // quad
-        assert_eq!(bed_lrc_channels(5), (0, 1, Some(2)));
-        assert_eq!(bed_lrc_channels(6), (0, 1, Some(2)));
     }
 }

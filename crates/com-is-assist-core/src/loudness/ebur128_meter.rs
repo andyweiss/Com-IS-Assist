@@ -4,7 +4,7 @@ use ebur128::{Channel, EbuR128, Error as Ebur128Error, Mode};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
     /// `channel_count` isn't one of the layouts this project's `bed_channel_map` knows how to
-    /// build (expected 1-6). Production wrappers (GStreamer/VST3) should prefer mapping from the
+    /// build (expected 1-6). Production wrappers should prefer mapping from the
     /// host's actual channel position metadata over this default table where available.
     UnsupportedChannelCount(u32),
     /// The `ebur128` crate itself rejected the configuration (e.g. an invalid sample rate).
@@ -46,7 +46,7 @@ impl Ebur128Meter {
 
     /// Pushes one block of interleaved `f32` samples. Safe to call with any block size across
     /// calls; the underlying meter accumulates internally, so it's naturally block-size
-    /// independent (required for GStreamer and VST3 hosts, which deliver variable-size buffers).
+    /// independent (required for VST3 hosts, which deliver variable-size buffers).
     ///
     /// Returns an error only if `interleaved.len()` isn't a multiple of the configured channel
     /// count — a caller bug, not a runtime signal condition.

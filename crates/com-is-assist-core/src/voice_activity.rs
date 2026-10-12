@@ -6,7 +6,7 @@ use std::fmt;
 /// Vendored directly into the binary (not read from disk at runtime) - see
 /// `crates/com-is-assist-core/assets/silero_vad.onnx` and `docs/LICENSING.md`'s "Third-party
 /// reference material" section for provenance/license (MIT, snakers4/silero-vad). Embedding it
-/// means a GStreamer plugin or VST3 bundle never has to locate/ship a separate data file, or care
+/// means a VST3 bundle never has to locate/ship a separate data file, or care
 /// what the process's working directory happens to be at load time.
 const SILERO_VAD_MODEL_BYTES: &[u8] = include_bytes!("../assets/silero_vad.onnx");
 
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn handles_odd_sized_feed_chunks_without_erroring() {
-        // Real wrappers won't hand over conveniently-sized blocks - GStreamer buffers and VST3
+        // Real wrappers won't hand over conveniently-sized blocks - VST3
         // host blocks are both arbitrary sizes. Exercises the internal raw/resampled buffering
         // logic across many small, oddly-sized calls rather than one large aligned one.
         let mut vad = SileroVad::new(44_100, VoiceActivityConfig::default()).expect("model should load and construct");

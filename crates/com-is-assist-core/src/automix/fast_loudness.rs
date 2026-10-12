@@ -33,7 +33,7 @@ impl Biquad {
 }
 
 /// The two K-weighting sections from BS.1770, derived from the analog prototypes at the actual
-/// sample rate rather than hardcoding the published 48kHz coefficients - VST3 hosts and GStreamer
+/// sample rate rather than hardcoding the published 48kHz coefficients - VST3 hosts and offline
 /// pipelines both run at other rates, and using 48kHz coefficients at 44.1kHz would put this
 /// detector on a subtly different scale from the `ebur128` loops it has to agree with.
 ///

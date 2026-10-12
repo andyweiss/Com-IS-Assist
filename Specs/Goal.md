@@ -25,3 +25,4 @@ The voice is usually very dirty with IS spill on it hence a voice cleaner is nee
 
 A scond focus is on the fade in and fade out times of the bed the goal is to have an adaptive and smooth leveling as possible: fast to duck the bed down, then hold, then a slow, smooth recovery back to unity, so the leveling doesn't pump or flutter.
 
+> **Scope change since this was written:** the GStreamer element was built, then removed - the deployment need it existed for went away. The VST3 plugin is the only wrapper now. See `TechnicalConcept.md` section 7. This brief is kept as the original statement of intent rather than edited to match.

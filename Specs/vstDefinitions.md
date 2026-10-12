@@ -8,7 +8,7 @@ VST3 bus/parameter definitions for the Com-IS-Assist plugin, built with `nih-plu
 
 | Channel (0-indexed) | Role | Notes |
 |---|---|---|
-| 0 | Bed Left | Fixed 6-channel Bed layout (not the dynamic 2-6ch range the GStreamer element supports): Left, Right, Center, LFE (unused), LeftSurround, RightSurround |
+| 0 | Bed Left | Fixed 6-channel Bed layout: Left, Right, Center, LFE (unused), LeftSurround, RightSurround. (`com_is_assist_core` itself still handles 1-6 channels - `com-is-assist-offline` takes whatever the WAV has - but the plugin's bus is fixed.) |
 | 1 | Bed Right | |
 | 2 | Bed Center | |
 | 3 | Bed LFE | Unused for Dialogue mixing - passes through leveled Bed content only |
@@ -21,7 +21,7 @@ VST3 bus/parameter definitions for the Com-IS-Assist plugin, built with `nih-plu
 
 A bool parameter selecting what channels 0-5 carry on output:
 
-- **On** (default): channels 0-2 (Left/Right/Center) carry leveled Bed + Dialogue mixed in via the `divergence` pan law below; channels 3-5 (LFE/surrounds) are leveled Bed only, Dialogue never reaches them — matches the GStreamer element's `mix_src`, restricted to L/R/C.
+- **On** (default): channels 0-2 (Left/Right/Center) carry leveled Bed + Dialogue mixed in via the `divergence` pan law below; channels 3-5 (LFE/surrounds) are leveled Bed only, Dialogue never reaches them — restricted to L/R/C.
 - **Off**: all of channels 0-5 are leveled Bed alone, Dialogue not folded in anywhere — matches `is_leveled_src`, for inserting directly on a Bed/IS channel strip where Dialogue is summed in separately downstream.
 
 Channel 6 (Dialogue passthrough) is unaffected by this toggle either way.
@@ -52,7 +52,7 @@ Channel 6 (Dialogue passthrough) is unaffected by this toggle either way.
 
   **Four groups, not six channels.** Left and Right must duck by the same amount or the difference is heard as the stereo image sliding sideways, and the same goes for the surround pair. An earlier revision exposed all six positionally and was dropped for that reason - and because which role sits at a given stream position depends on the channel count, so positional names mislabel themselves on every layout but the widest. `DuckDepth::per_channel` resolves groups to channels in the core, against the same map the loudness meters use, so both wrappers inherit one definition.
 
-- `bypass` — `true` disables automix entirely (Bed passes through at unity gain); `false` (default) is normal operation. Inverted polarity from the GStreamer element's `automix-enable` (`true` = active) — a deliberate wrapper-specific naming choice, matching the conventional meaning of a "Bypass" control in a DAW plugin.
+- `bypass` — `true` disables automix entirely (Bed passes through at unity gain); `false` (default) is normal operation. Named for the conventional meaning of a "Bypass" control in a DAW plugin, which is why its polarity is inverted from the core's `automix_enabled`.
 - `mix-dialogue-to-bed`, `divergence` — see above
 
 **Not exposed anywhere**: the per-stage time constants and authorities of the three loop stages, and the release hold. These are properties of speech and of the R128 window structure rather than matters of taste - see `Specs/TechnicalConcept.md` sections 5.2/5.3. The `speed` macro scales the former as a group. Real voice-activity detection is implemented on **both** sides (`com_is_assist_core::voice_activity::SileroVad`, see `Specs/TechnicalConcept.md` section 6) but always-on: neither detector has an on/off parameter. The IS detector is fed a mono downmix of the dry Bed; the two behaviours it unlocks (fast recovery when only IS has voice, and the higher `overvoice-ratio` when both do) are part of the state machine rather than switchable features.
@@ -110,7 +110,7 @@ Implemented via `nih_plug_egui` (`create_egui_editor`):
   | `InterviewPassthrough` | **Voice Passthrough** | green, as the VAD LEDs |
   | `DuckToOvervoice` | **Overvoice Mix** | purple |
 
-  Note these are *display* labels only. The GStreamer `current-mix-state` property and the offline CSV keep their stable machine-readable tokens (`release`/`duck-target`/`interview`/`duck-overvoice`), which anything parsing them depends on.
+  Note these are *display* labels only. The offline CSV keeps its stable machine-readable tokens (`release`/`duck-target`/`interview`/`duck-overvoice`), which anything parsing them depends on.
 
 Integrated LUFS (`AutomixProcessor::bed_integrated_lufs`/`dialogue_integrated_lufs` from an earlier iteration of this GUI) was dropped as a deliberate simplification, not a gap - momentary is what the automix control loop and this display both care about; `UI.md`'s "IS LUFS-I"/"Comm LUFS-I" wishlist items are considered out of scope unless a concrete need for them comes up later.
 

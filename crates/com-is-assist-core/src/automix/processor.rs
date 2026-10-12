@@ -18,7 +18,7 @@ const FAST_SUBCHUNK_FRAMES: usize = 64;
 const FAST_WINDOW_SECONDS: f64 = 0.05;
 
 /// Bundles the loudness detectors, the multi-loop gain computer and the output delay that every
-/// wrapper (GStreamer element, VST3 plugin, `com-is-assist-offline`) needs byte-for-byte
+/// wrapper (the VST3 plugin and `com-is-assist-offline`) needs byte-for-byte
 /// identically. This is what actually enforces "no DSP divergence between wrappers"
 /// (`Specs/TechnicalConcept.md` section 8): there is exactly one implementation of how audio gets
 /// measured and gained, and every wrapper calls into it.
@@ -31,7 +31,7 @@ const FAST_WINDOW_SECONDS: f64 = 0.05;
 ///
 /// Deliberately decoupled from how audio is chunked or how often each side is fed: Bed and Dialogue
 /// can arrive together every call (a VST3 host's synchronous `process()`) or independently on their
-/// own schedules (a GStreamer element's two sink pads, each on its own streaming thread).
+/// own schedules, which is what `com-is-assist-offline` does when the two WAVs differ in length.
 pub struct AutomixProcessor {
     bed_channels: u32,
     sample_rate: u32,
@@ -140,7 +140,7 @@ impl AutomixProcessor {
     /// Order matters and is the whole feed-forward idea: audio is *measured* before any gain is
     /// applied to it, so the control value that reaches a given sample was derived from that same
     /// sample rather than from one three seconds old. Nothing is buffered or held back, so this
-    /// path adds exactly zero latency - a property the GStreamer deployment depends on (see
+    /// path adds exactly zero latency - a property broadcast deployment depends on (see
     /// `Specs/TechnicalConcept.md` section 7).
     pub fn process_bed(&mut self, bed: &mut [f32]) -> Result<(), Ebur128Error> {
         let channels = self.bed_channels as usize;
