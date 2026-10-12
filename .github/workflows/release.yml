@@ -32,8 +32,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # baseview/egui need these to build on Linux. Taken from nih-plug's own CI rather than
-      # assembled by trial and error.
+      # baseview/egui/winit need these to build on Linux. The first three lines are nih-plug's own
+      # CI list; the rest were added because that list alone is not sufficient here - the `x11`
+      # crate's build script runs `pkg-config gl`, and `libgl-dev` on ubuntu-22.04 does not provide
+      # `gl.pc`. `mesa-common-dev`/`libgl1-mesa-dev` do.
       - name: Install Linux build dependencies
         if: startsWith(matrix.os, 'ubuntu')
         run: |
@@ -41,7 +43,25 @@ jobs:
           sudo apt-get install -y \
             libasound2-dev libgl-dev libjack-dev libx11-xcb-dev libxcb1-dev \
             libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            pkg-config mesa-common-dev libgl1-mesa-dev libglu1-mesa-dev \
+            libx11-dev libxext-dev libxrender-dev libxrandr-dev libxi-dev \
+            libxinerama-dev libxkbcommon-x11-dev libwayland-dev
+
+      # Fails here with a readable message rather than two minutes into a compile with a build
+      # script panic, which is how this list came to be wrong in the first place.
+      - name: Verify the pkg-config packages the build needs are present
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          missing=()
+          for pkg in gl x11 xcb xcursor xkbcommon; do
+            pkg-config --exists "$pkg" || missing+=("$pkg")
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::missing pkg-config packages: ${missing[*]}"
+            exit 1
+          fi
+          echo "gl $(pkg-config --modversion gl), x11 $(pkg-config --modversion x11)"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

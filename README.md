@@ -1,7 +1,5 @@
 # Com-IS-Assist
 
-[![CI](https://github.com/andyweiss/Com-IS-Assist/actions/workflows/ci.yml/badge.svg)](https://github.com/andyweiss/Com-IS-Assist/actions/workflows/ci.yml)
-
 A realtime broadcast mix assist/ automixer that ducks an International Sound "Bed" (2-6 channels) against a Dialogue "Com" (mono commentary) channel, based on a measured COM/IS loudness ratio. The concept follows Jonas Engel's bachelor thesis at Hochschule Darmstadt, and the reference implementation it grew out of is included under `Specs/Ressouces/Com-IS Plugin/` (a Reaper JSFX loudness meter, LGPL-licensed, Copyright Cockos Incorporated / Jonas Engel).
 
 Ships as a **VST3 plugin** (`Com-IS-Assist`) wrapping a shared Rust DSP core. Fixed 8-channel bus (6ch Bed + mono Dialogue + 1 unused), with a mix/duck-only toggle and a live meter GUI (gain reduction, IS/COM loudness, ratio, both voice LEDs and current state), plus per-channel-group duck depth controls.
@@ -61,7 +59,7 @@ Produces `target/bundled/Com-IS-Assist.vst3`.
 
 ## Releases
 
-Pushing a `v*` tag (which is what publishing a GitHub release does) runs `.github/workflows/release.yml`: it builds the VST3 for macOS, Windows and Linux, and attaches one zip per platform to the release. The tag is passed to the build as `COMIS_RELEASE_VERSION` and shown on the plugin's help page, so a published build always names its version and any other build says "dev build".
+Pushing a `v*` tag (which is what publishing a GitHub release does) runs `.github/workflows/release.yml` — the only workflow in the repo, so nothing runs on an ordinary commit. It: it builds the VST3 for macOS, Windows and Linux, and attaches one zip per platform to the release. The tag is passed to the build as `COMIS_RELEASE_VERSION` and shown on the plugin's help page, so a published build always names its version and any other build says "dev build".
 
 | Artifact | Target |
 |---|---|
