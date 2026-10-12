@@ -30,6 +30,11 @@ How *fast* each of those happens is set by **Speed**, not by per-state times.
 # IS voice ratio
 0 -12 dB defines how many LUFS the com has to be on top of the IS. (Originally called "Com/IS distance"; the underlying parameter id is still `target-ratio`.)
 
+# Help page
+The **? Help** button next to Bypass opens an about/help overlay: the running version, who made it and whose idea it was based on, which channels carry what (bed on 1-6, commentary on 7), and a one-line description of every control. It opens over the mixer rather than replacing it, so the meters stay visible and in place while you read.
+
+The version is the GitHub release tag for a released build; a build made locally says "dev build" instead, so it is always clear which one is running.
+
 # Speed
 How quickly the mixer responds, as a single control. There are no separate attack/release times: the leveling is built from three control loops at different speeds (a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges), and the resulting attack and release behaviour emerges from how they interact. Long and gentle when the programme is steady, very quick when something jumps. Speed scales all three together: raise it if the mix feels sluggish, lower it if it breathes. Ducking is always far quicker than recovery - the fast loop bites immediately while the recovery is carried by the slow loop - so this one control moves the whole envelope without losing that fast-down/slow-up character. The pause tolerance that keeps the bed down through sentence gaps is fixed in real time, so recovery stays cushioned even at high Speed. The range runs from 0.25x to 8x with 1x at the centre of the control. Towards the top end the slow loop stops being the limit - its 3-second loudness measurement only changes so fast - so the highest settings mainly sharpen the two faster loops.
 

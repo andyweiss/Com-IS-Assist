@@ -63,6 +63,9 @@ Point `GST_PLUGIN_PATH` at the resulting build directory and load it with `gst-i
 **Build and bundle the VST3 plugin:**
 ```shell
 cargo xtask bundle com-is-assist-vst3 --release
+
+# Stamp a release build with its tag (otherwise it reports "dev build"):
+# COMIS_RELEASE_VERSION=v1.2.0 cargo xtask bundle com-is-assist-vst3 --release
 ```
 Produces `target/bundled/Com-IS-Assist.vst3`.
 

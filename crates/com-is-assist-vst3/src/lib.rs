@@ -31,6 +31,11 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
+/// What the help page reports as the running version: the GitHub release tag CI stamped this build
+/// with, or `dev build (<crate version>)` locally. Produced by `build.rs` - see there for why it is
+/// a build script rather than an `option_env!` in this file.
+const DISPLAY_VERSION: &str = env!("COMIS_DISPLAY_VERSION");
+
 const BED_CHANNELS: u32 = 6;
 const TOTAL_CHANNELS: usize = 8; // 6 Bed + 1 Dialogue + 1 unused
 const DIALOGUE_CHANNEL: usize = BED_CHANNELS as usize; // index 6 (the 7th channel)
@@ -577,6 +582,14 @@ const LAMP_GLYPH_OVERSHOOT: f32 = 3.0;
 const LAMP_BLOCK_HEIGHT: f32 =
     LAMP_GLYPH_OVERSHOOT + LAMP_DIAMETER + LAMP_CAPTION_GAP + LAMP_CAPTION_HEIGHT;
 
+/// Height of the caption's name line.
+const CAPTION_NAME_HEIGHT: f32 = 16.0;
+/// Total height every column's caption block occupies - name line plus the smaller channel line
+/// beneath it. **Fixed for all four columns**, including the two that have no channel line to show,
+/// because the bars start directly below it and the Ratio bar's leader lines (`ratio_leader_lines`)
+/// are only exact while every bar shares one top edge.
+const CAPTION_BLOCK_HEIGHT: f32 = CAPTION_NAME_HEIGHT + 11.0;
+
 /// Breathing room between a column's caption and the top of its bar. Also used for the vertical
 /// steps below the bars (bar -> voice lamp, lamp -> state badge), so the column reads on one rhythm.
 const CAPTION_GAP: f32 = 7.0;
@@ -624,17 +637,30 @@ const METER_BACKGROUND: egui::Color32 = egui::Color32::from_gray(22);
 /// `center_on_column` picks what the text centres on: the Ratio column's bar is centred within a
 /// column wider than itself, while a loudness column's bar sits at the column's left edge with the
 /// scale beside it.
-fn meter_caption(ui: &mut egui::Ui, text: &str, center_on_column: bool) {
+fn meter_caption(ui: &mut egui::Ui, text: &str, channels: Option<&str>, center_on_column: bool) {
     let width = ui.available_width();
-    let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, 16.0), egui::Sense::hover());
+    let (rect, _response) =
+        ui.allocate_exact_size(egui::vec2(width, CAPTION_BLOCK_HEIGHT), egui::Sense::hover());
     let center_x = if center_on_column { rect.center().x } else { rect.min.x + METER_BAR_WIDTH / 2.0 };
-    ui.painter().text(
-        egui::pos2(center_x, rect.center().y),
+    let painter = ui.painter();
+    painter.text(
+        egui::pos2(center_x, rect.min.y + CAPTION_NAME_HEIGHT / 2.0),
         egui::Align2::CENTER_CENTER,
         text,
         egui::FontId::proportional(13.0),
         ui.visuals().text_color(),
     );
+    // The channel line is drawn smaller and dimmer than the name: it answers "which inputs am I
+    // patching?", which is a setup question asked once, not something to read while mixing.
+    if let Some(channels) = channels {
+        painter.text(
+            egui::pos2(center_x, rect.min.y + CAPTION_NAME_HEIGHT),
+            egui::Align2::CENTER_TOP,
+            channels,
+            egui::FontId::proportional(9.0),
+            egui::Color32::from_gray(130),
+        );
+    }
 }
 
 /// Everything that distinguishes one loudness column from another. A struct rather than a long
@@ -642,6 +668,10 @@ fn meter_caption(ui: &mut egui::Ui, text: &str, center_on_column: bool) {
 /// tails are exactly the kind of thing that gets mis-wired silently.
 struct LoudnessMeter<'a> {
     label: &'a str,
+    /// Which input channels feed this meter, shown under the name. The plugin's bus is fixed
+    /// (see the module doc comment), so these are constant - and worth stating, because a host
+    /// gives no indication of which of the eight channels the plugin expects what on.
+    channels: &'a str,
     lufs: f32,
     color: egui::Color32,
     /// `Some` on the IS bar only: carves the applied reduction out of the top of the fill.
@@ -654,10 +684,10 @@ struct LoudnessMeter<'a> {
 /// Returns the bar's rect so the Ratio column's leader lines can be drawn to its edge from
 /// outside the column (see `ratio_leader_lines`).
 fn loudness_meter(ui: &mut egui::Ui, spec: LoudnessMeter) -> egui::Rect {
-    let LoudnessMeter { label, lufs, color, gain_reduction_db, voice, gate_lufs } = spec;
+    let LoudnessMeter { label, channels, lufs, color, gain_reduction_db, voice, gate_lufs } = spec;
     let mut bar_rect = egui::Rect::NOTHING;
     fixed_width_column(ui, LOUDNESS_COLUMN_WIDTH, |ui| {
-        meter_caption(ui, label, false);
+        meter_caption(ui, label, Some(channels), false);
         ui.add_space(CAPTION_GAP);
         let mut rect = egui::Rect::NOTHING;
         ui.horizontal(|ui| {
@@ -742,7 +772,7 @@ fn loudness_meter(ui: &mut egui::Ui, spec: LoudnessMeter) -> egui::Rect {
 /// over a wider range than the IS bar's carve-out alone would show, while tuning attack/hold/release.
 fn gain_reduction_meter(ui: &mut egui::Ui, gain_reduction_db: f32) {
     fixed_width_column(ui, GR_COLUMN_WIDTH, |ui| {
-        meter_caption(ui, "GR", false);
+        meter_caption(ui, "GR", None, false);
         ui.add_space(CAPTION_GAP);
         let mut rect = egui::Rect::NOTHING;
         ui.horizontal(|ui| {
@@ -838,7 +868,7 @@ fn ratio_meter(
     fixed_width_column(ui, RATIO_COLUMN_WIDTH, |ui| {
         // The Ratio column is just the bar, centred in a column wider than it, so its caption
         // centres on the column rather than on a bar sitting at the column's left edge.
-        meter_caption(ui, "Ratio", true);
+        meter_caption(ui, "Ratio", None, true);
         ui.add_space(CAPTION_GAP);
         let (rect, _response) = ui.allocate_exact_size(egui::vec2(METER_BAR_WIDTH, METER_BAR_HEIGHT), egui::Sense::hover());
         let painter = ui.painter();
@@ -1015,6 +1045,65 @@ fn control_grid(ui: &mut egui::Ui, id: &str, add_rows: impl FnOnce(&mut egui::Ui
         .right()
 }
 
+/// What each control does, in one line, for the help page. Deliberately written for someone sitting
+/// at the desk rather than reading the source: the trade each control makes, not what it is wired
+/// to. `Specs/UI.md` is the longer form of the same material.
+const PARAMETER_HELP: &[(&str, &str)] = &[
+    ("IS voice ratio", "How far the commentary should sit above the bed while the commentator alone is talking. Higher means the bed ducks further."),
+    ("Over-voice ratio", "The same, for when there is voice on the bed too - an interview under the commentary needs more headroom to stay intelligible. An absolute target, not an offset."),
+    ("Max gain reduction", "A hard floor on how far the bed may ever be pushed down, whatever the ratios ask for."),
+    ("Speed", "How quickly the mixer reacts, as one control. Raise it if it feels sluggish, lower it if it breathes. Ducking is always quicker than recovery; this moves both without losing that."),
+    ("Voice detect gate", "A level below which voice on the commentary channel is ignored, so bed spill in the commentary mic cannot duck the bed against its own bleed. Set it 20-30 dB under the commentator's normal level - the shaded area on the COM meter shows where it is off."),
+    ("Duck depth", "How much of the ducking each part of the bed takes. 1:1 is the full amount, 1:0 none at all. Holding the surrounds and LFE back keeps the commentary clear without flattening the scene."),
+    ("Mix dialogue to bed", "Folds the commentary into the bed output, for running the plugin as a bus insert rather than alongside a separate commentary path."),
+    ("Voice divergence", "Where the mixed-in commentary sits: centre only at 0%, spread across left and right at 100%. Only does anything with the mix above switched on."),
+    ("Bypass", "Passes the bed through untouched. Metering keeps running."),
+];
+
+/// The about/help overlay. A window rather than a panel so it can be opened over the mixer without
+/// the layout underneath moving - the meters stay where they were while it is being read.
+fn help_window(ctx: &egui::Context, open: &mut bool) {
+    egui::Window::new("About Com-IS-Assist")
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(430.0)
+        .show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("Com-IS-Assist").size(17.0).strong());
+            ui.label(egui::RichText::new(DISPLAY_VERSION).color(egui::Color32::from_gray(150)));
+            ui.add_space(8.0);
+            ui.label("By Andreas Weiss.");
+            ui.label("Based on an idea by Jonas Engel and Felix Krückels.");
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(
+                "Ducks the international sound bed against the mono commentary, holding a chosen \
+                 loudness distance between them. The commentary itself is never touched - it is \
+                 only measured, and passed through as a reference.",
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Bed on channels 1-6, commentary on channel 7. Channel 8 is unused.")
+                    .color(egui::Color32::from_gray(150)),
+            );
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Controls").strong());
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for (name, description) in PARAMETER_HELP {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(*name).strong());
+                    ui.label(egui::RichText::new(*description).color(egui::Color32::from_gray(185)));
+                }
+            });
+            ui.add_space(4.0);
+        });
+}
+
 /// `nih_plug_egui` has no built-in bool-parameter widget (`ParamSlider` treats everything as a
 /// continuous/stepped slider) - a checkbox reads far more naturally for a two-state toggle like
 /// `bypass`/`mix-dialogue-to-bed`, so this drives one directly through `ParamSetter`, the same
@@ -1072,12 +1161,17 @@ impl Plugin for ComISAssist {
         // is drawn before it. Measuring the previous frame is exact in every frame but the first,
         // and the layout is otherwise static.
         let controls_width = Arc::new(AtomicF32::new(CONTROLS_COLUMN_WIDTH));
+        // Whether the about/help overlay is showing. GUI-only state, so it lives with the editor
+        // rather than in `Meters` or the parameters - nothing outside the window needs to know,
+        // and it should not end up in a saved session.
+        let show_help = Arc::new(AtomicBool::new(false));
         create_egui_editor(
             self.params.editor_state.clone(),
             (),
             |_, _| {},
             move |egui_ctx, setter, _state| {
                 let controls_width = &controls_width;
+                let show_help = &show_help;
                 ResizableWindow::new("com-is-assist-editor-window")
                     .min_size(egui::Vec2::new(760.0, 650.0))
                     .show(egui_ctx, egui_state.as_ref(), |ui| {
@@ -1100,7 +1194,17 @@ impl Plugin for ComISAssist {
                             ui.scope(|ui| {
                                 ui.set_width(controls_width.load(Ordering::Relaxed));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    // Right-to-left, so the first widget added is the rightmost:
+                                    // Bypass keeps the aligned edge and Help sits just inside it.
                                     bool_param_checkbox(ui, setter, &params.bypass, "Bypass");
+                                    ui.add_space(12.0);
+                                    // Labelled, not just "?": the glyph alone is a guess until you
+                                    // hover it, and this is the one control a new operator most
+                                    // needs to find.
+                                    if ui.button("? Help").on_hover_text("About and help").clicked() {
+                                        let showing = show_help.load(Ordering::Relaxed);
+                                        show_help.store(!showing, Ordering::Relaxed);
+                                    }
                                 });
                             });
                         });
@@ -1195,6 +1299,7 @@ impl Plugin for ComISAssist {
                                         ui,
                                         LoudnessMeter {
                                             label: "IS",
+                                            channels: "Ch 1-6",
                                             lufs: is_lufs,
                                             color: accent,
                                             gain_reduction_db: Some(gain_reduction_db),
@@ -1220,6 +1325,7 @@ impl Plugin for ComISAssist {
                                         ui,
                                         LoudnessMeter {
                                             label: "COM",
+                                            channels: "Ch 7",
                                             lufs: com_lufs,
                                             color: accent,
                                             gain_reduction_db: None,
@@ -1356,6 +1462,13 @@ impl Plugin for ComISAssist {
                         });
                         ui.add_space(14.0);
                     });
+
+                let mut showing = show_help.load(Ordering::Relaxed);
+                if showing {
+                    // `Window::open` writes the close button's result back into `showing`.
+                    help_window(egui_ctx, &mut showing);
+                    show_help.store(showing, Ordering::Relaxed);
+                }
             },
         )
     }
@@ -1513,6 +1626,21 @@ nih_export_vst3!(ComISAssist);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The help page's version string has to actually say something. A stamped release build
+    /// should carry its tag; an unstamped one should say it is a dev build rather than go blank or
+    /// claim a release that was never cut.
+    #[test]
+    fn the_display_version_is_never_empty() {
+        assert!(!DISPLAY_VERSION.is_empty(), "DISPLAY_VERSION resolved to an empty string");
+        match std::env::var("COMIS_RELEASE_VERSION") {
+            Ok(tag) if !tag.trim().is_empty() => assert_eq!(DISPLAY_VERSION, tag),
+            _ => assert!(
+                DISPLAY_VERSION.starts_with("dev build"),
+                "an unstamped build should say so, got {DISPLAY_VERSION:?}"
+            ),
+        }
+    }
 
     /// Every shipped default in one assertion, pinned where a reader can see them together.
     ///
