@@ -1,5 +1,7 @@
 # Com-IS-Assist
 
+![UI](https://github.com/andyweiss/Com-IS-Assist/blob/main/docs/PluginUI.png "UI")
+
 A realtime broadcast mix assist/ automixer that ducks an International Sound "Bed" (2-6 channels) against a Dialogue "Com" (mono commentary) channel, based on a measured COM/IS loudness ratio. The concept follows Jonas Engel's bachelor thesis at Hochschule Darmstadt, and the reference implementation it grew out of is included under `Specs/Ressouces/Com-IS Plugin/` (a Reaper JSFX loudness meter, LGPL-licensed, Copyright Cockos Incorporated / Jonas Engel).
 
 Ships as a **VST3 plugin** (`Com-IS-Assist`) wrapping a shared Rust DSP core. Fixed 8-channel bus (6ch Bed + mono Dialogue + 1 unused), with a mix/duck-only toggle and a live meter GUI (gain reduction, IS/COM loudness, ratio, both voice LEDs and current state), plus per-channel-group duck depth controls.
