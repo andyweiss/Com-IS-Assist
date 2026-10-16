@@ -1,3 +1,6 @@
+mod background;
+pub use background::BackgroundVad;
+
 use ort::session::Session;
 use ort::value::Tensor;
 use rubato::{FftFixedIn, Resampler};
@@ -8,7 +11,7 @@ use std::fmt;
 /// reference material" section for provenance/license (MIT, snakers4/silero-vad). Embedding it
 /// means a VST3 bundle never has to locate/ship a separate data file, or care
 /// what the process's working directory happens to be at load time.
-const SILERO_VAD_MODEL_BYTES: &[u8] = include_bytes!("../assets/silero_vad.onnx");
+const SILERO_VAD_MODEL_BYTES: &[u8] = include_bytes!("../../assets/silero_vad.onnx");
 
 /// Silero's ONNX graph operates at 16kHz (or 8kHz) regardless of the project's own sample rate -
 /// audio is resampled down to this before every inference.
@@ -36,6 +39,8 @@ fn native_chunk_frames(sample_rate: u32) -> usize {
 #[derive(Debug)]
 pub enum VoiceActivityError {
     Ort(ort::Error),
+    /// The [`BackgroundVad`] worker thread could not be started.
+    WorkerSpawn(std::io::Error),
     ResamplerConstruction(rubato::ResamplerConstructionError),
     Resample(rubato::ResampleError),
 }
@@ -44,6 +49,7 @@ impl fmt::Display for VoiceActivityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VoiceActivityError::Ort(e) => write!(f, "ONNX Runtime error: {e}"),
+            VoiceActivityError::WorkerSpawn(e) => write!(f, "could not start the VAD worker thread: {e}"),
             VoiceActivityError::ResamplerConstruction(e) => write!(f, "resampler construction error: {e}"),
             VoiceActivityError::Resample(e) => write!(f, "resample error: {e}"),
         }

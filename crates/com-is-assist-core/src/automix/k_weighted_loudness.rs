@@ -112,7 +112,7 @@ fn channel_weight(channel: Channel) -> f64 {
 /// for its gating blocks. For a trim stage this is the better choice - it is cheaper, needs no
 /// history buffer, and produces a continuously-moving value instead of one that steps as samples
 /// age out of a rectangular window.
-pub struct FastLoudnessMeter {
+pub struct KWeightedLoudnessMeter {
     channels: usize,
     weights: Vec<f64>,
     /// Two sections per channel, in cascade.
@@ -121,9 +121,126 @@ pub struct FastLoudnessMeter {
     mean_square: Vec<f64>,
     /// EMA coefficient derived from the window length and sample rate.
     coeff: f64,
+
+    /// Rectangular sliding windows - R128 momentary (400ms) and short-term (3s) - sharing this
+    /// meter's single K-weighting pass. See [`SlidingWindows`].
+    windows: SlidingWindows,
 }
 
-impl FastLoudnessMeter {
+/// R128's momentary and short-term readings, maintained as **incrementally-updated rectangular
+/// sliding windows** rather than recomputed on demand.
+///
+/// This exists for one reason: cost. `libebur128` (and therefore the `ebur128` crate) recomputes
+/// the sum of squares across the *whole* window every time it is asked, which measures at ~700us
+/// for short-term and ~100us for momentary on a 6-channel bed. The control step asks three times
+/// per tick, so a ~1.3ms spike landed on one audio block in every seventy-five - enough to blow a
+/// 64-sample real-time budget (1.33ms) on its own, while the mean load sat near 2%.
+///
+/// The window semantics are **deliberately unchanged**: still rectangular, still the same lengths,
+/// so the cascade's tuning carries over exactly. Only the arithmetic differs - energy is summed
+/// into short blocks, and a running total adds the newest block and subtracts the one ageing out,
+/// which is O(1) per query instead of O(window). An exponential average would have been simpler
+/// still and was rejected: it changes the detector's character, and the loop timings were dialled
+/// in by ear against rectangular R128 windows.
+struct SlidingWindows {
+    /// Samples per accumulation block. The window edge is quantised to this, which at ~1ms against
+    /// a 400ms window is far below anything the control loop can respond to.
+    block_samples: usize,
+    /// Weighted energy per elapsed block, oldest-to-newest in a ring.
+    ring: Vec<f64>,
+    write: usize,
+    /// Blocks written since construction, saturating at `ring.len()` - distinguishes "warming up"
+    /// from "full", so a partly-filled window normalises by what it actually has.
+    filled: usize,
+
+    /// Energy accumulating into the block currently being filled, and how many frames are in it.
+    current: f64,
+    current_frames: usize,
+
+    momentary_blocks: usize,
+    momentary_sum: f64,
+    short_term_blocks: usize,
+    short_term_sum: f64,
+}
+
+impl SlidingWindows {
+    const MOMENTARY_SECONDS: f64 = 0.4;
+    const SHORT_TERM_SECONDS: f64 = 3.0;
+    const BLOCK_SECONDS: f64 = 0.001;
+
+    fn new(sample_rate: u32) -> Self {
+        let rate = sample_rate.max(1) as f64;
+        let block_samples = ((Self::BLOCK_SECONDS * rate).round() as usize).max(1);
+        let blocks_for = |seconds: f64| ((seconds * rate / block_samples as f64).round() as usize).max(1);
+        let short_term_blocks = blocks_for(Self::SHORT_TERM_SECONDS);
+        Self {
+            block_samples,
+            ring: vec![0.0; short_term_blocks],
+            write: 0,
+            filled: 0,
+            current: 0.0,
+            current_frames: 0,
+            momentary_blocks: blocks_for(Self::MOMENTARY_SECONDS),
+            momentary_sum: 0.0,
+            short_term_blocks,
+            short_term_sum: 0.0,
+        }
+    }
+
+    /// Adds one frame's weighted sum of squares, closing the block when it is full.
+    fn push_frame(&mut self, weighted_energy: f64) {
+        self.current += weighted_energy;
+        self.current_frames += 1;
+        if self.current_frames < self.block_samples {
+            return;
+        }
+
+        let entering = self.current;
+        self.current = 0.0;
+        self.current_frames = 0;
+
+        // Subtract whatever is about to be overwritten or to age out, then add the new block. Both
+        // running sums index backwards from the write position, so the ring only has to be as long
+        // as the longest window.
+        let len = self.ring.len();
+        if self.filled >= self.momentary_blocks {
+            self.momentary_sum -= self.ring[(self.write + len - self.momentary_blocks) % len];
+        }
+        if self.filled >= self.short_term_blocks {
+            self.short_term_sum -= self.ring[self.write];
+        }
+        self.ring[self.write] = entering;
+        self.write = (self.write + 1) % len;
+        self.filled = (self.filled + 1).min(len);
+        self.momentary_sum += entering;
+        self.short_term_sum += entering;
+
+        // Floating-point subtraction leaves a slowly-drifting residue over hours of audio; energy
+        // can never be negative, so clamping is enough to stop it turning into a bogus reading.
+        self.momentary_sum = self.momentary_sum.max(0.0);
+        self.short_term_sum = self.short_term_sum.max(0.0);
+    }
+
+    fn mean_square(&self, sum: f64, window_blocks: usize) -> f64 {
+        let blocks = self.filled.min(window_blocks);
+        if blocks == 0 {
+            return 0.0;
+        }
+        sum / (blocks * self.block_samples) as f64
+    }
+
+    fn reset(&mut self) {
+        self.ring.iter_mut().for_each(|e| *e = 0.0);
+        self.write = 0;
+        self.filled = 0;
+        self.current = 0.0;
+        self.current_frames = 0;
+        self.momentary_sum = 0.0;
+        self.short_term_sum = 0.0;
+    }
+}
+
+impl KWeightedLoudnessMeter {
     /// `channel_map` uses the same `ebur128::Channel` values as [`crate::loudness::Ebur128Meter`],
     /// so both sides of a ratio can be built from the same map. `window_seconds` is the EMA time
     /// constant (~0.03 for the fast stage).
@@ -136,6 +253,7 @@ impl FastLoudnessMeter {
             filters: vec![sections; channels],
             mean_square: vec![0.0; channels],
             coeff: (-1.0 / (window_seconds.max(1e-6) * sample_rate as f64)).exp(),
+            windows: SlidingWindows::new(sample_rate),
         }
     }
 
@@ -146,6 +264,7 @@ impl FastLoudnessMeter {
             return;
         }
         for frame in interleaved.chunks_exact(self.channels) {
+            let mut frame_energy = 0.0;
             for (channel, sample) in frame.iter().enumerate() {
                 let sample = *sample as f64;
                 // Guard against a non-finite input poisoning the filter state permanently - the
@@ -153,16 +272,20 @@ impl FastLoudnessMeter {
                 let sample = if sample.is_finite() { sample } else { 0.0 };
                 let (shelf, highpass) = &mut self.filters[channel];
                 let weighted = highpass.process(shelf.process(sample));
+                let squared = weighted * weighted;
                 self.mean_square[channel] =
-                    self.mean_square[channel] * self.coeff + weighted * weighted * (1.0 - self.coeff);
+                    self.mean_square[channel] * self.coeff + squared * (1.0 - self.coeff);
+                frame_energy += self.weights[channel] * squared;
             }
+            // One K-weighting pass serves the fast EMA above and both rectangular windows.
+            self.windows.push_frame(frame_energy);
         }
     }
 
     /// Current loudness in LUFS, on the same scale as `Ebur128Meter`'s readings. Returns
     /// [`crate::loudness::Ebur128Meter::NEGATIVE_INFINITY_DB`] for silence, matching that type's
     /// sentinel so consumers need only one silence check.
-    pub fn loudness_db(&self) -> f64 {
+    pub fn fast_loudness_db(&self) -> f64 {
         let sum: f64 = self
             .mean_square
             .iter()
@@ -180,12 +303,35 @@ impl FastLoudnessMeter {
         }
     }
 
+    /// R128 momentary (400ms rectangular), in LUFS. O(1) - see [`SlidingWindows`].
+    pub fn momentary_loudness_db(&self) -> f64 {
+        Self::to_lufs(self.windows.mean_square(self.windows.momentary_sum, self.windows.momentary_blocks))
+    }
+
+    /// R128 short-term (3s rectangular), in LUFS. O(1) - see [`SlidingWindows`].
+    pub fn short_term_loudness_db(&self) -> f64 {
+        Self::to_lufs(self.windows.mean_square(self.windows.short_term_sum, self.windows.short_term_blocks))
+    }
+
+    fn to_lufs(mean_square: f64) -> f64 {
+        if mean_square <= 0.0 {
+            return crate::loudness::Ebur128Meter::NEGATIVE_INFINITY_DB;
+        }
+        let db = -0.691 + 10.0 * mean_square.log10();
+        if db.is_finite() {
+            db.max(crate::loudness::Ebur128Meter::NEGATIVE_INFINITY_DB)
+        } else {
+            crate::loudness::Ebur128Meter::NEGATIVE_INFINITY_DB
+        }
+    }
+
     pub fn reset(&mut self) {
         for (shelf, highpass) in &mut self.filters {
             shelf.reset();
             highpass.reset();
         }
         self.mean_square.iter_mut().for_each(|ms| *ms = 0.0);
+        self.windows.reset();
     }
 }
 
@@ -202,9 +348,59 @@ mod tests {
 
     #[test]
     fn silence_reads_as_the_negative_infinity_sentinel() {
-        let mut meter = FastLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), 48_000, 0.03);
+        let mut meter = KWeightedLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), 48_000, 0.03);
         meter.push_frames(&vec![0.0_f32; 4800]);
-        assert_eq!(meter.loudness_db(), Ebur128Meter::NEGATIVE_INFINITY_DB);
+        assert_eq!(meter.fast_loudness_db(), Ebur128Meter::NEGATIVE_INFINITY_DB);
+    }
+
+    /// The sliding windows replaced `Ebur128Meter` in the control path, so "do they read the same?"
+    /// is the question that decides whether the DSP changed. A steady tone is the easy case.
+    #[test]
+    fn the_sliding_windows_agree_with_the_r128_meter_on_a_steady_tone() {
+        let rate = 48_000;
+        let map = Ebur128Meter::bed_channel_map(6).unwrap();
+        let mono = sine(1_000.0, 0.4, rate, rate as usize * 5);
+        let interleaved: Vec<f32> = mono.iter().flat_map(|s| std::iter::repeat_n(*s, 6)).collect();
+
+        let mut ours = KWeightedLoudnessMeter::new(&map, rate, 0.05);
+        ours.push_frames(&interleaved);
+        let mut r128 = Ebur128Meter::new(&map, rate).unwrap();
+        r128.push_frames(&interleaved).unwrap();
+
+        let m = (ours.momentary_loudness_db() - r128.momentary_loudness_db()).abs();
+        let s = (ours.short_term_loudness_db() - r128.short_term_loudness_db()).abs();
+        assert!(m < 0.1, "momentary: ours {} vs r128 {}", ours.momentary_loudness_db(), r128.momentary_loudness_db());
+        assert!(s < 0.1, "short-term: ours {} vs r128 {}", ours.short_term_loudness_db(), r128.short_term_loudness_db());
+    }
+
+    /// The case that actually matters: a level that *changes*. A rectangular window and an
+    /// exponential average read a steady tone identically and a moving one quite differently, so
+    /// this is what proves the replacement kept R128's window shape rather than just its scale.
+    #[test]
+    fn the_sliding_windows_track_the_r128_meter_through_level_changes() {
+        let rate = 48_000;
+        let map = Ebur128Meter::bed_channel_map(6).unwrap();
+        let mut ours = KWeightedLoudnessMeter::new(&map, rate, 0.05);
+        let mut r128 = Ebur128Meter::new(&map, rate).unwrap();
+
+        let mut worst_momentary = 0.0_f64;
+        let mut worst_short_term = 0.0_f64;
+        // Steps up and down every 250ms, so both windows are repeatedly caught mid-transition.
+        for step in 0..40 {
+            let amplitude = if step % 2 == 0 { 0.5 } else { 0.05 };
+            let mono = sine(440.0, amplitude, rate, rate as usize / 4);
+            let interleaved: Vec<f32> = mono.iter().flat_map(|s| std::iter::repeat_n(*s, 6)).collect();
+            ours.push_frames(&interleaved);
+            r128.push_frames(&interleaved).unwrap();
+            if step > 12 {
+                worst_momentary =
+                    worst_momentary.max((ours.momentary_loudness_db() - r128.momentary_loudness_db()).abs());
+                worst_short_term =
+                    worst_short_term.max((ours.short_term_loudness_db() - r128.short_term_loudness_db()).abs());
+            }
+        }
+        assert!(worst_momentary < 0.5, "momentary drifted {worst_momentary:.2} dB from R128");
+        assert!(worst_short_term < 0.5, "short-term drifted {worst_short_term:.2} dB from R128");
     }
 
     /// The whole point of K-weighting this detector: it has to agree with `Ebur128Meter` on the
@@ -215,18 +411,18 @@ mod tests {
         let sample_rate = 48_000;
         let tone = sine(1_000.0, 0.5, sample_rate, sample_rate as usize * 2);
 
-        let mut fast = FastLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate, 0.03);
+        let mut fast = KWeightedLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate, 0.03);
         fast.push_frames(&tone);
 
         let mut r128 = Ebur128Meter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate).unwrap();
         r128.push_frames(&tone).unwrap();
 
-        let difference = (fast.loudness_db() - r128.momentary_loudness_db()).abs();
+        let difference = (fast.fast_loudness_db() - r128.momentary_loudness_db()).abs();
         assert!(
             difference < 0.5,
             "fast detector reads {:.2} LUFS, R128 reads {:.2} LUFS - a scale mismatch would make the \
              fast loop's trim meaningless",
-            fast.loudness_db(),
+            fast.fast_loudness_db(),
             r128.momentary_loudness_db()
         );
     }
@@ -237,16 +433,16 @@ mod tests {
         let sample_rate = 48_000;
         let burst = sine(1_000.0, 0.5, sample_rate, (sample_rate as f64 * 0.05) as usize);
 
-        let mut fast = FastLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate, 0.03);
+        let mut fast = KWeightedLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate, 0.03);
         fast.push_frames(&burst);
 
         let mut r128 = Ebur128Meter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate).unwrap();
         r128.push_frames(&burst).unwrap();
 
         assert!(
-            fast.loudness_db() > r128.momentary_loudness_db() + 3.0,
+            fast.fast_loudness_db() > r128.momentary_loudness_db() + 3.0,
             "after only 50ms the fast detector ({:.1}) should have risen well above momentary ({:.1})",
-            fast.loudness_db(),
+            fast.fast_loudness_db(),
             r128.momentary_loudness_db()
         );
     }

@@ -351,6 +351,7 @@ name = "com-is-assist-core"
 version = "0.1.0"
 dependencies = [
  "ebur128",
+ "hound",
  "ort",
  "rubato",
 ]

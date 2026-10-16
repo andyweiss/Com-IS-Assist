@@ -1,7 +1,7 @@
 use ebur128::Error as Ebur128Error;
 
 use crate::automix::{
-    apply_ramped_gain_per_channel, AutomixEngine, AutomixEngineConfig, FastLoudnessMeter,
+    apply_ramped_gain_per_channel, AutomixEngine, AutomixEngineConfig, KWeightedLoudnessMeter,
     LoopContributions, LoudnessSnapshot, MixState, MAX_BED_CHANNELS,
 };
 use crate::loudness::{ConfigError, Ebur128Meter};
@@ -36,13 +36,18 @@ pub struct AutomixProcessor {
     bed_channels: u32,
     sample_rate: u32,
 
-    /// Dry Bed and Dialogue at R128 windows. One instance per signal serves *both* the slow (3s
-    /// short-term) and mid (400ms momentary) stages, since a single meter exposes both.
-    bed_meter: Ebur128Meter,
-    dialogue_meter: Ebur128Meter,
-    /// Dry Bed at ~50ms, for the fast stage. There is deliberately no Dialogue equivalent - see
-    /// [`LoudnessSnapshot`] for why only the Bed is read fast.
-    bed_fast: FastLoudnessMeter,
+    /// Dry Bed and Dialogue. One instance per signal serves every stage: the slow (3s short-term)
+    /// and mid (400ms momentary) R128 windows, and on the Bed side the fast detector too - all
+    /// from a single K-weighting pass.
+    ///
+    /// These were `Ebur128Meter`s until the real-time cost was measured. That crate recomputes a
+    /// window's sum of squares on every query, which cost ~700us for short-term on a 6-channel bed
+    /// and put a ~1.3ms spike on one audio block in seventy-five - more than a 64-sample budget
+    /// allows, by itself. `KWeightedLoudnessMeter` keeps the same rectangular windows but maintains
+    /// them incrementally, so a query is O(1). `Ebur128Meter` remains the conformance reference
+    /// the two are tested against.
+    bed_meter: KWeightedLoudnessMeter,
+    dialogue_meter: KWeightedLoudnessMeter,
     /// COM short-term, cached at each control step so the fast stage can use it between ticks
     /// without re-querying the meter per sub-chunk.
     dialogue_reference_lufs: f64,
@@ -89,9 +94,12 @@ impl AutomixProcessor {
         Ok(Self {
             bed_channels,
             sample_rate,
-            bed_meter: Ebur128Meter::new(&bed_map, sample_rate)?,
-            dialogue_meter: Ebur128Meter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate)?,
-            bed_fast: FastLoudnessMeter::new(&bed_map, sample_rate, FAST_WINDOW_SECONDS),
+            bed_meter: KWeightedLoudnessMeter::new(&bed_map, sample_rate, FAST_WINDOW_SECONDS),
+            dialogue_meter: KWeightedLoudnessMeter::new(
+                &Ebur128Meter::dialogue_channel_map(),
+                sample_rate,
+                FAST_WINDOW_SECONDS,
+            ),
             dialogue_reference_lufs: Ebur128Meter::NEGATIVE_INFINITY_DB,
             automix_engine: AutomixEngine::new(automix_config),
             current_gain: [1.0; MAX_BED_CHANNELS],
@@ -129,7 +137,7 @@ impl AutomixProcessor {
     /// Dialogue is never gained and never delayed, so there is no equivalent of `process_bed` on
     /// this side - the caller forwards its own buffer untouched.
     pub fn feed_dialogue(&mut self, dry_dialogue: &[f32]) -> Result<(), Ebur128Error> {
-        self.dialogue_meter.push_frames(dry_dialogue)?;
+        self.dialogue_meter.push_frames(dry_dialogue);
         self.dialogue_frames_since_control += dry_dialogue.len() as u64;
         Ok(())
     }
@@ -149,20 +157,20 @@ impl AutomixProcessor {
         }
 
         // Dry measurement, before anything is applied.
-        self.bed_meter.push_frames(bed)?;
+
         self.bed_frames_since_control += bed.len() as u64 / channels as u64;
 
         let subchunk_samples = FAST_SUBCHUNK_FRAMES * channels;
 
         for subchunk in bed.chunks_mut(subchunk_samples) {
-            self.bed_fast.push_frames(subchunk);
+            self.bed_meter.push_frames(subchunk);
 
             // The final sub-chunk of a block is usually short, so derive dt from its real length
             // rather than assuming a full one - the fast stage's ballistics are in seconds.
             let dt = (subchunk.len() / channels) as f64 / self.sample_rate as f64;
             let reduction_db =
                 self.automix_engine
-                    .process_fast(self.bed_fast.loudness_db(), self.dialogue_reference_lufs, dt);
+                    .process_fast(self.bed_meter.fast_loudness_db(), self.dialogue_reference_lufs, dt);
             self.applied_gain_reduction_db = reduction_db;
 
             // One reduction, distributed across the channels by `duck_depth`. Scaling in **dB**

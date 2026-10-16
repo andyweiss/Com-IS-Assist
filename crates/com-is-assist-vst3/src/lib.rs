@@ -22,7 +22,7 @@ use com_is_assist_core::automix::{
     mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, DuckDepth, MixState,
 };
 use com_is_assist_core::loudness::Ebur128Meter;
-use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
+use com_is_assist_core::voice_activity::{BackgroundVad, VoiceActivityConfig};
 use nih_plug::prelude::*;
 use nih_plug_egui::widgets::ParamSlider;
 use nih_plug_egui::{create_egui_editor, egui, resizable_window::ResizableWindow, EguiState};
@@ -58,14 +58,22 @@ struct ComISAssist {
     /// construction ever fails (e.g. the ONNX Runtime binary couldn't be obtained), so `process()`
     /// can fail open (treat COM as always voice-active, matching the old pre-VAD behavior) rather
     /// than silently never ducking at all.
-    voice_activity: Option<SileroVad>,
+    voice_activity: Option<BackgroundVad>,
+
+    /// Preallocated working buffers for `process()`. The audio thread must not allocate - a
+    /// `vec![]` per block is a potential lock and an unbounded pause, which is precisely what a
+    /// real-time thread cannot take. Sized at `initialize()` from the host's declared maximum
+    /// block size and only ever re-sized if a host exceeds it (which the spec says it will not).
+    interleaved_bed: Vec<f32>,
+    dialogue_scratch: Vec<f32>,
+    mono_bed_scratch: Vec<f32>,
     /// The second, Bed-side voice-activity detector (`Specs/UI.md`'s "voice detector IS"). Fed a
     /// mono downmix of the dry Bed; together with `voice_activity` above it selects the automix
     /// state (`com_is_assist_core::automix::MixState`) - which is what makes the interview
     /// passthrough and over-voice cases possible at all. `None` on the same fail-open terms as the
     /// COM detector, in which case IS is treated as never having voice (i.e. only the ordinary
     /// release/duck states can be reached).
-    is_voice_activity: Option<SileroVad>,
+    is_voice_activity: Option<BackgroundVad>,
     /// Live R128/gain-reduction readouts, shared between the audio thread (`process()`, writer)
     /// and the GUI thread (`editor()`, reader). This is the one thing `nih-plug` genuinely
     /// requires a custom GUI for - its parameter setter is deliberately private, so a plugin
@@ -314,6 +322,9 @@ impl Default for ComISAssist {
             params: Arc::new(ComISAssistParams::default()),
             processor: None,
             voice_activity: None,
+            interleaved_bed: Vec::new(),
+            dialogue_scratch: Vec::new(),
+            mono_bed_scratch: Vec::new(),
             is_voice_activity: None,
             meters: Arc::new(Meters::new()),
         }
@@ -1488,11 +1499,16 @@ impl Plugin for ComISAssist {
         // `.ok()`, not `.expect(...)`: if this fails (e.g. the ONNX Runtime binary couldn't be
         // obtained), `process()` fails open rather than the whole plugin refusing to initialize
         // over what's ultimately just a display/gating refinement, not the core automix path.
-        self.voice_activity = SileroVad::new(buffer_config.sample_rate as u32, VoiceActivityConfig::default()).ok();
+        // Off the audio thread: a Silero inference is a ~600-900us spike landing on one block in
+        // twenty-four at a 64-sample buffer, which no real-time budget absorbs. `BackgroundVad`
+        // leaves a bounded copy here and runs the model on a worker. `idle_state` is the fail-safe
+        // answer until the first inference lands - open on COM, so the mix still ducks.
+        self.voice_activity =
+            BackgroundVad::new(buffer_config.sample_rate as u32, VoiceActivityConfig::default(), true).ok();
         // A second, independent detector instance for the Bed - same model and settings, its own
         // recurrent state and hangover timer (see `is_voice_activity`'s doc comment).
         self.is_voice_activity =
-            SileroVad::new(buffer_config.sample_rate as u32, VoiceActivityConfig::default()).ok();
+            BackgroundVad::new(buffer_config.sample_rate as u32, VoiceActivityConfig::default(), false).ok();
         self.processor.is_some()
     }
 
@@ -1525,32 +1541,40 @@ impl Plugin for ComISAssist {
         // com-is-assist-core works with interleaved audio;
         // nih-plug hands us planar per-channel slices, so de-interleave Bed for the shared
         // processor and re-interleave on the way back out.
-        let mut interleaved_bed = vec![0.0f32; num_samples * BED_CHANNELS as usize];
-        for frame in 0..num_samples {
-            for ch in 0..BED_CHANNELS as usize {
-                interleaved_bed[frame * BED_CHANNELS as usize + ch] = channels[ch][frame];
-            }
-        }
-        let dialogue: Vec<f32> = channels[DIALOGUE_CHANNEL][..num_samples].to_vec();
+        // `resize` only touches the allocator if the host hands over a bigger block than it said
+        // it would; in steady state these are already the right length and this is a no-op.
+        self.interleaved_bed.resize(num_samples * BED_CHANNELS as usize, 0.0);
+        self.dialogue_scratch.resize(num_samples, 0.0);
+        self.mono_bed_scratch.resize(num_samples, 0.0);
+        let interleaved_bed = &mut self.interleaved_bed[..num_samples * BED_CHANNELS as usize];
+        let dialogue = &mut self.dialogue_scratch[..num_samples];
+        let mono_bed = &mut self.mono_bed_scratch[..num_samples];
 
-        // Mono downmix of the *dry* Bed for the IS-side detector - Silero is a mono model, and
-        // "is anyone speaking anywhere on the Bed" is a whole-Bed question, so averaging the
-        // channels is the right reduction. Taken before `process_bed` mutates `interleaved_bed`.
-        let mono_bed: Vec<f32> = interleaved_bed
-            .chunks_exact(BED_CHANNELS as usize)
-            .map(|frame| frame.iter().sum::<f32>() / BED_CHANNELS as f32)
-            .collect();
+        for frame in 0..num_samples {
+            // Mono downmix of the *dry* Bed for the IS-side detector - Silero is a mono model, and
+            // "is anyone speaking anywhere on the Bed" is a whole-Bed question, so averaging the
+            // channels is the right reduction. Accumulated here, in the de-interleave pass that
+            // has the samples in hand anyway, rather than in a second pass afterwards.
+            let mut sum = 0.0;
+            for ch in 0..BED_CHANNELS as usize {
+                let sample = channels[ch][frame];
+                interleaved_bed[frame * BED_CHANNELS as usize + ch] = sample;
+                sum += sample;
+            }
+            mono_bed[frame] = sum / BED_CHANNELS as f32;
+            dialogue[frame] = channels[DIALOGUE_CHANNEL][frame];
+        }
 
         // Feed-forward: Dialogue is measured dry, before anything is applied to it.
         // A mismatched channel count here would be a caller bug in this fixed-layout plugin, not a
         // runtime condition - deliberately ignored rather than crashing the audio thread over it.
-        let _ = processor.feed_dialogue(&dialogue);
+        let _ = processor.feed_dialogue(dialogue);
 
         // Fails open (treats COM as always voice-active) if VAD couldn't be constructed at
         // `initialize()` time - see `voice_activity`'s doc comment.
         let voice_active = match self.voice_activity.as_mut() {
             Some(vad) => {
-                let _ = vad.feed(&dialogue);
+                vad.feed(dialogue);
                 vad.voice_active()
             }
             None => true,
@@ -1560,7 +1584,7 @@ impl Plugin for ComISAssist {
         // falls back to the ordinary duck/release behavior rather than inventing a state.
         let is_voice_active = match self.is_voice_activity.as_mut() {
             Some(vad) => {
-                let _ = vad.feed(&mono_bed);
+                vad.feed(mono_bed);
                 vad.voice_active()
             }
             None => false,
@@ -1568,7 +1592,7 @@ impl Plugin for ComISAssist {
         // Measures the dry Bed, then steps the fast stage and applies the resulting gain in
         // sub-chunks - all inside the shared core, so every wrapper gets identical DSP. In place
         // and unbuffered, so the plugin adds no latency and reports none.
-        let _ = processor.process_bed(&mut interleaved_bed);
+        let _ = processor.process_bed(interleaved_bed);
         processor.maybe_run_control_step(voice_active, is_voice_active);
 
         // Only bother publishing to the meters while the GUI is actually open - matches
@@ -1592,8 +1616,8 @@ impl Plugin for ComISAssist {
 
         if mix_dialogue_to_bed {
             mix_dialogue_into_bed(
-                &mut interleaved_bed,
-                &dialogue,
+                interleaved_bed,
+                dialogue,
                 BED_CHANNELS,
                 LEFT_CHANNEL,
                 RIGHT_CHANNEL,
