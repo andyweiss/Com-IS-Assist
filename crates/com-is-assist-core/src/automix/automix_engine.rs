@@ -260,6 +260,24 @@ impl AutomixEngine {
         self.result(state)
     }
 
+    /// Adopts the state the two detectors currently imply, without waiting for the next control
+    /// tick.
+    ///
+    /// The tick runs at ~100ms because that is the rate at which R128 loudness carries new
+    /// information. The *state*, though, comes from the VADs, which say something new as soon as
+    /// they are asked - and letting a state change wait for the tick added up to 100ms on top of
+    /// the detector's own latency, which was audible as the bed ducking a syllable late. Called
+    /// per audio block, the fast stage starts ducking within a sub-chunk of the detector firing
+    /// while the slow and mid stages still update on the tick, which is the cascade behaving as
+    /// designed - fast first, slow taking over.
+    ///
+    /// Returns the state now in force.
+    pub fn set_state_from_vad(&mut self, com_voice_active: bool, is_voice_active: bool) -> MixState {
+        self.previous_state = MixState::from_vad(com_voice_active, is_voice_active);
+        self.loops.set_releasing(!self.previous_state.is_ducking());
+        self.previous_state
+    }
+
     /// Steps the fast stage between control ticks, at audio sub-chunk rate, from the fast
     /// K-weighted **Bed** detector against the stable COM reference (see [`LoudnessSnapshot`] for
     /// why COM is not read fast). Uses the state the last control tick resolved to — the state

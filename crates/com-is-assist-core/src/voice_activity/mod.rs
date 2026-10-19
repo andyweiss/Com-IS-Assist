@@ -27,13 +27,21 @@ const VAD_CONTEXT_SAMPLES: usize = 64;
 const VAD_STATE_LEN: usize = 2 * 128;
 
 /// How many native-rate frames are pulled through the resampler per call. Not tied to
-/// `VAD_CHUNK_SAMPLES` in any exact way (resampled output is buffered and drained in
-/// `VAD_CHUNK_SAMPLES`-sized pieces regardless of how much a given resampler call produces) -
-/// chosen as a round ~100ms at the native rate, matching this project's own control-tick
-/// granularity, purely so the resampler isn't invoked on tiny buffers when a wrapper feeds audio
-/// in small blocks.
+/// `VAD_CHUNK_SAMPLES` in any exact way - resampled output is buffered and drained in
+/// `VAD_CHUNK_SAMPLES`-sized pieces regardless of how much a given resampler call produces.
+///
+/// **This is a latency figure, not just a batching convenience.** Audio reaches the model only in
+/// multiples of this, so the detector cannot report an onset that happened less than one chunk
+/// ago. It was ~100ms (matching the control-tick granularity), which measured as a 99/199ms
+/// quantisation of detection latency on real commentary - the bed visibly ducking a syllable or
+/// two late. At 10ms that quantisation drops below Silero's own 32ms inference hop, which is then
+/// the floor.
+///
+/// Smaller is not free: the resampler runs ten times as often. It is an FFT whose cost is roughly
+/// linear in total samples, so the change is close to cost-neutral, and it happens on the VAD
+/// worker rather than the audio thread either way.
 fn native_chunk_frames(sample_rate: u32) -> usize {
-    (sample_rate as usize / 10).max(1)
+    (sample_rate as usize / 100).max(1)
 }
 
 #[derive(Debug)]

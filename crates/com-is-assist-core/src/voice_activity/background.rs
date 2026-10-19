@@ -5,10 +5,12 @@ use std::thread::JoinHandle;
 
 /// How long the worker sleeps when it finds the ring empty.
 ///
-/// Pure added detection latency, and deliberately generous: the detector already carries a 32ms
-/// inference hop and an 800ms hangover, so ten more milliseconds cannot change a mix decision. In
-/// exchange the thread wakes ~100 times a second instead of spinning on an empty queue.
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// Pure added detection latency, so it is kept well under the detector's own 32ms inference hop -
+/// at which point it stops being the thing anyone can hear. It was 10ms on the argument that the
+/// 800ms hangover made it irrelevant; that argument is wrong for the *onset*, which is the edge
+/// the mix reacts to and the one that was audibly late. Waking 500 times a second to find an
+/// empty queue costs almost nothing next to the inference it is waiting for.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// One second of mono audio at 48kHz. The worker only has to keep up *on average*, and this
 /// absorbs about a hundred poll intervals of scheduling jitter before anything is dropped.

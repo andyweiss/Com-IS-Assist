@@ -224,6 +224,31 @@ impl LoopBank {
 
     /// Steps the fast stage. Call at audio sub-chunk rate with the reduction required by the ~30ms
     /// detector. Trims whatever slow+mid currently contribute, within `fast_authority_db`.
+    /// Switches the cascade between ducking and releasing as soon as the state machine says so,
+    /// rather than at the next control tick.
+    ///
+    /// `update_fast` runs per audio sub-chunk but keys off this flag, so while it lagged a tick
+    /// the fast stage went on releasing for up to 100ms after the detector had already reported
+    /// voice - the gain sat at zero while the state read `DuckToTarget`. That was the largest
+    /// remaining slice of "the bed ducks a syllable late".
+    ///
+    /// Only the flag moves here. The slow and mid stages still retarget on the tick, because what
+    /// they follow is R128 loudness, which genuinely has nothing new to say in between.
+    pub fn set_releasing(&mut self, releasing: bool) {
+        if releasing == self.releasing {
+            return;
+        }
+        self.releasing = releasing;
+        if !releasing {
+            // Entering a ducking state performs the same reset `update_slow_mid` does, so the
+            // hold window is whole again the next time the mixer releases rather than carrying
+            // over whatever the last release had consumed.
+            self.interview_release = false;
+            self.release_speedup = 1.0;
+            self.hold_remaining_seconds = RELEASE_HOLD_SECONDS;
+        }
+    }
+
     pub fn update_fast(&mut self, required_fast_db: Option<f64>, dt_seconds: f64) {
         let target = match (self.releasing, required_fast_db) {
             // Releasing: head for unity at this stage's own (short) release constant. Done here

@@ -312,6 +312,28 @@ Three periodic spikes, all now removed:
 
 `Ebur128Meter` is no longer in the audio path at all. It remains as the conformance reference the incremental meter is tested against.
 
+## 9b. Detection latency
+
+Reported as the bed ducking audibly late. Measured on real commentary by splicing speech at a known sample after silence (`cargo run --release --example detect_latency -- <mono.wav>`), the delay from speech onset to the bed starting to move was **~150-300ms**. Four causes, three of them ours:
+
+| Cause | Was | Now |
+|---|---|---|
+| Resampler input chunk | 100ms | 10ms |
+| Mix state only adopted on the control tick | up to 100ms | 0 |
+| `LoopBank::releasing` only flipped on the control tick | up to 100ms | 0 |
+| `BackgroundVad` poll interval | up to 10ms | up to 2ms |
+| Silero's own 32ms inference hop + confidence | ~32-180ms | unchanged |
+
+Measured result: **onset-to-duck median 99ms -> 49ms, mean 140ms -> 85ms**, and the control path now adds *nothing* on top of the detector - the gain starts moving on the same block the flag rises.
+
+Two of these were the same mistake in different places: a value that only changes at the ~100ms control tick being consulted by code that runs per audio sub-chunk. The tick is 100ms because that is how often **R128 loudness** carries new information; the VAD and the state machine have something new to say far sooner, and should not have been quantised to it. `dialogue_reference_lufs` was a third instance, cached at tick rate purely because querying `ebur128` was expensive (§9a) - a reason that no longer existed.
+
+**The remaining ~49ms is Silero's**, and cannot be optimised away: the model consumes 512 samples at 16kHz, so no answer exists until 32ms of audio has arrived, plus however long it takes to commit (the slowest onsets measured ~209ms on soft speech). Going below that needs look-ahead, which is **not** implemented and was rejected rather than deferred:
+
+- Delaying only the Bed desynchronises it from picture. The Bed is the match sound; a 40ms offset against video is a lip-sync error.
+- Delaying everything puts latency in the commentator's own monitor path, which is the one place a live operator will not accept it.
+- Zero added latency is otherwise a property of the whole signal path (§7), relied on in live use.
+
 ## 10. Testing and validation
 
 The numbered items below are what the design is actually held to; 3 and 4 run on every change. Two `examples/` in the core are the real-time tooling: `bench_realtime` reports per-block cost against the budget by percentile (the *worst* block is what a host is killed by, not the mean), and `compare_meters` checks the incremental loudness windows against `ebur128` on a real file.

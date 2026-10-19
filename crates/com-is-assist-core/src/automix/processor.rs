@@ -48,8 +48,14 @@ pub struct AutomixProcessor {
     /// the two are tested against.
     bed_meter: KWeightedLoudnessMeter,
     dialogue_meter: KWeightedLoudnessMeter,
-    /// COM short-term, cached at each control step so the fast stage can use it between ticks
-    /// without re-querying the meter per sub-chunk.
+    /// COM short-term, the stable reference the fast stage measures the Bed against (see
+    /// [`LoudnessSnapshot`] for why only the Bed is read fast).
+    ///
+    /// Refreshed every block by [`Self::set_voice_activity`], not once per control tick. It was
+    /// cached at tick rate purely because querying `ebur128` cost ~700us; with the windows now
+    /// O(1) that saving is gone, and the staleness was costing up to 100ms of ducking latency -
+    /// at a speech onset the fast stage had no current COM level to compute a target from, so it
+    /// could not act until the next tick however early the detector fired.
     dialogue_reference_lufs: f64,
 
     automix_engine: AutomixEngine,
@@ -191,6 +197,28 @@ impl AutomixProcessor {
         Ok(())
     }
 
+    /// Publishes the detectors' current answer, so a state change takes effect on the next audio
+    /// sub-chunk instead of waiting for the control tick.
+    ///
+    /// Call this every block, before [`Self::process_bed`]. Doing so is what keeps the mixer's
+    /// reaction tied to the detector's latency rather than to the ~100ms tick - see
+    /// [`AutomixEngine::set_state_from_vad`]. Applies the COM guard band, which is cheap now that
+    /// the loudness windows are O(1) to query.
+    pub fn set_voice_activity(&mut self, com_voice_active: bool, is_voice_active: bool) {
+        let com_voice_active = self.gate_com(com_voice_active);
+        self.mix_state = self.automix_engine.set_state_from_vad(com_voice_active, is_voice_active);
+        self.dialogue_reference_lufs = self.dialogue_meter.short_term_loudness_db();
+    }
+
+    /// Guard band: ignore reported speech on COM while COM itself is too quiet to be the
+    /// commentator - see `AutomixEngineConfig::com_gate_lufs`. Momentary (400ms) rather than
+    /// short-term, so the gate tracks the talker rather than lagging seconds behind them.
+    fn gate_com(&mut self, com_voice_active: bool) -> bool {
+        let gated = com_voice_active && self.dialogue_meter.momentary_loudness_db() >= self.com_gate_lufs;
+        self.com_voice_gated = gated;
+        gated
+    }
+
     /// Recomputes the slow and mid stages once enough new audio has been fed into both sides since
     /// the last control step. A no-op otherwise, so it is safe to call after every chunk from
     /// either side.
@@ -207,12 +235,7 @@ impl AutomixProcessor {
         self.bed_frames_since_control = 0;
         self.dialogue_frames_since_control = 0;
 
-        // Guard band: ignore reported speech on COM while COM itself is too quiet to be the
-        // commentator - see `AutomixEngineConfig::com_gate_lufs`. Momentary (400ms) rather than
-        // short-term, so the gate tracks the talker rather than lagging seconds behind them.
-        let com_voice_active =
-            com_voice_active && self.dialogue_meter.momentary_loudness_db() >= self.com_gate_lufs;
-        self.com_voice_gated = com_voice_active;
+        let com_voice_active = self.gate_com(com_voice_active);
 
         let loudness = LoudnessSnapshot {
             bed_short_term_lufs: self.bed_meter.short_term_loudness_db(),

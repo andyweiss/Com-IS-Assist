@@ -1129,7 +1129,7 @@ fn bool_param_checkbox(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolPara
 
 impl Plugin for ComISAssist {
     const NAME: &'static str = "Com-IS-Assist";
-    const VENDOR: &'static str = "Com-IS-Assist";
+    const VENDOR: &'static str = "Andy Weiss";
     const URL: &'static str = "https://github.com/andyweiss/Com-IS-Assist";
     const EMAIL: &'static str = "info@example.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -1589,6 +1589,10 @@ impl Plugin for ComISAssist {
             }
             None => false,
         };
+        // Published before `process_bed` so the fast stage sees a state change on this block
+        // rather than at the next ~100ms control tick - see `set_voice_activity`.
+        processor.set_voice_activity(voice_active, is_voice_active);
+
         // Measures the dry Bed, then steps the fast stage and applies the resulting gain in
         // sub-chunks - all inside the shared core, so every wrapper gets identical DSP. In place
         // and unbuffered, so the plugin adds no latency and reports none.

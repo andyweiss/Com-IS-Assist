@@ -266,6 +266,9 @@ ratio_lu,target_lu,r_slow,r_mid,r_fast,gain_reduction_db"
         processor.feed_dialogue(dry_dialogue).expect("feed dialogue meters");
 
         let mut leveled_bed = dry_bed.to_vec();
+        // Same ordering as the VST3 wrapper, so the offline measurements describe the plugin's
+        // real timing rather than a slower variant of it.
+        processor.set_voice_activity(com_voice_active, is_voice_active);
         processor.process_bed(&mut leveled_bed).expect("process bed");
 
         processor.maybe_run_control_step(com_voice_active, is_voice_active);
