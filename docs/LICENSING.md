@@ -23,7 +23,7 @@ Root `LICENSE` is the MIT text; `crates/com-is-assist-vst3/LICENSE` carries the 
 
 The project was originally planned around JUCE (C++), which is GPLv3 for non-commercial-license users. After migrating to Rust, the plan switched to `nih-plug` for VST3 - but **this does not remove the GPLv3 obligation**:
 
-- `nih-plug` itself is ISC-licensed (permissive), and its CLAP support (`clap-sys`, MIT/Apache-2.0) is an unconditional dependency.
+- `nih-plug` itself is ISC-licensed (permissive). This is also why the patched copy in `vendor/nih_plug` (see `PATCHED.md` there) can be carried in this repository, as long as its `LICENSE` file stays with it. Its CLAP support (`clap-sys`, MIT/Apache-2.0) is an unconditional dependency.
 - Its VST3 export path is gated behind nih-plug's `vst3` **feature**, which is on by default and pulls `vst3-sys` - **GPLv3**, because it wraps Steinberg's VST3 SDK under the SDK's older dual-license terms. Upstream is explicit that the feature exists "mostly for GPL-compliance reasons, since even if you don't use the VST3 wrapper you might otherwise still include a couple (unused) symbols from the `vst3-sys` crate."
 
 So any VST3 plugin built with `nih-plug`'s default export must be able to comply with GPLv3, for essentially the same underlying reason the JUCE-based plan was GPLv3 - only the specific binding changed, not the obligation.

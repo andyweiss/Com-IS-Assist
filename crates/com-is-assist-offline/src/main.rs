@@ -7,6 +7,7 @@
 // scripted against real material without recompiling.
 
 use com_is_assist_core::automix::{AutomixEngineConfig, AutomixProcessor, DuckDepth, MixState};
+use com_is_assist_core::loudness::BedLayout;
 use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::env;
@@ -65,15 +66,26 @@ fn env_f64(name: &str, default: f64) -> f64 {
     }
 }
 
-/// Reads `COMIS_DUCK_DEPTH` - four comma-separated `1:1`..`1:0` factors, in the order
-/// `front,center,lfe,surround` - falling back to `default`. Omitted or blank fields keep their
-/// default, so `COMIS_DUCK_DEPTH=,,0` holds the LFE out without spelling out the rest.
+/// Reads `COMIS_DUCK_DEPTH` - up to eight comma-separated `1:1`..`1:0` factors, in the order
+/// `front,center,lfe,surround,side,top_front,top_rear,top_side` - falling back to `default`.
+/// Omitted or blank fields keep their default, so `COMIS_DUCK_DEPTH=,,0` holds the LFE out without
+/// spelling out the rest. `side`/`top_side` only affect a 7.1.2 Bed, `top_front`/`top_rear` a 5.1.4
+/// one.
 fn env_duck_depth(default: DuckDepth) -> DuckDepth {
     let Ok(raw) = env::var("COMIS_DUCK_DEPTH") else {
         return default;
     };
     let mut out = default;
-    let mut slots = [&mut out.front_lr, &mut out.center, &mut out.lfe, &mut out.surround];
+    let mut slots = [
+        &mut out.front_lr,
+        &mut out.center,
+        &mut out.lfe,
+        &mut out.surround,
+        &mut out.side,
+        &mut out.top_front,
+        &mut out.top_rear,
+        &mut out.top_side,
+    ];
     for (index, field) in raw.split(',').enumerate() {
         let field = field.trim();
         if field.is_empty() {
@@ -82,7 +94,7 @@ fn env_duck_depth(default: DuckDepth) -> DuckDepth {
         match (slots.get_mut(index), field.parse::<f64>()) {
             (Some(slot), Ok(value)) => **slot = value.clamp(0.0, 1.0),
             (Some(_), Err(_)) => eprintln!("ignoring COMIS_DUCK_DEPTH field {index} ({field:?}): not a number"),
-            (None, _) => eprintln!("ignoring COMIS_DUCK_DEPTH field {index}: only four channel groups exist"),
+            (None, _) => eprintln!("ignoring COMIS_DUCK_DEPTH field {index}: only eight channel groups exist"),
         }
     }
     out
@@ -128,7 +140,9 @@ fn main() -> ExitCode {
         eprintln!("Config overrides (environment variables, all optional):");
         eprintln!("  COMIS_TARGET_RATIO_LU, COMIS_OVERVOICE_RATIO_LU, COMIS_MAX_GAIN_REDUCTION_DB,");
         eprintln!("  COMIS_SPEED, COMIS_COM_GATE_LUFS,");
-        eprintln!("  COMIS_DUCK_DEPTH (front,center,lfe,surround as 0-1 factors, e.g. 1,1,0,0.5),");
+        eprintln!("  COMIS_DUCK_DEPTH (front,center,lfe,surround,side,top_front,top_rear,top_side as 0-1 factors,");
+        eprintln!("    e.g. 1,1,0,0.5),");
+        eprintln!("  COMIS_BED_LAYOUT (7.1.2 to read a 10-channel bed as 7.1.2 rather than 5.1.4),");
         eprintln!("  COMIS_VAD_HANGOVER_SECONDS");
         return ExitCode::FAILURE;
     }
@@ -176,8 +190,18 @@ fn main() -> ExitCode {
         duck_depth: env_duck_depth(defaults.duck_depth),
     };
 
-    let mut processor = match AutomixProcessor::new(bed_channels, sample_rate, config, TICK_SECONDS) {
-        Ok(p) => p,
+    // The channel count picks the layout, except that ten channels is ambiguous: 5.1.4 unless
+    // `COMIS_BED_LAYOUT=7.1.2` says otherwise.
+    let bed_layout = match (bed_channels, env::var("COMIS_BED_LAYOUT").as_deref()) {
+        (10, Ok("7.1.2")) => Ok(BedLayout::Surround712),
+        (_, Ok(other)) if !other.is_empty() && other != "5.1.4" => {
+            eprintln!("COMIS_BED_LAYOUT={other:?} is not supported (only 7.1.2 / 5.1.4 for a 10-channel bed)");
+            return ExitCode::FAILURE;
+        }
+        _ => BedLayout::from_channel_count(bed_channels),
+    };
+    let mut processor = match bed_layout {
+        Ok(layout) => AutomixProcessor::with_layout(layout, sample_rate, config, TICK_SECONDS),
         Err(e) => {
             eprintln!("unsupported bed channel count {bed_channels}: {e:?}");
             return ExitCode::FAILURE;

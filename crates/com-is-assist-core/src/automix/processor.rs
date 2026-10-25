@@ -4,7 +4,7 @@ use crate::automix::{
     apply_ramped_gain_per_channel, AutomixEngine, AutomixEngineConfig, KWeightedLoudnessMeter,
     LoopContributions, LoudnessSnapshot, MixState, MAX_BED_CHANNELS,
 };
-use crate::loudness::{ConfigError, Ebur128Meter};
+use crate::loudness::{BedLayout, ConfigError, Ebur128Meter};
 
 /// The fast stage is stepped once per this many frames rather than once per audio block. At 48kHz
 /// that is ~1.3ms, so a 5ms attack is actually realisable; stepping once per block would quantise
@@ -33,6 +33,7 @@ const FAST_WINDOW_SECONDS: f64 = 0.05;
 /// can arrive together every call (a VST3 host's synchronous `process()`) or independently on their
 /// own schedules, which is what `com-is-assist-offline` does when the two WAVs differ in length.
 pub struct AutomixProcessor {
+    bed_layout: BedLayout,
     bed_channels: u32,
     sample_rate: u32,
 
@@ -90,14 +91,32 @@ pub struct AutomixProcessor {
 }
 
 impl AutomixProcessor {
+    /// A Bed of `bed_channels`, taken as [`BedLayout::from_channel_count`] reads it - so 10 is
+    /// 5.1.4. Use [`Self::with_layout`] for 7.1.2.
     pub fn new(
         bed_channels: u32,
         sample_rate: u32,
         automix_config: AutomixEngineConfig,
         tick_seconds: f64,
     ) -> Result<Self, ConfigError> {
-        let bed_map = Ebur128Meter::bed_channel_map(bed_channels)?;
-        Ok(Self {
+        Ok(Self::with_layout(
+            BedLayout::from_channel_count(bed_channels)?,
+            sample_rate,
+            automix_config,
+            tick_seconds,
+        ))
+    }
+
+    pub fn with_layout(
+        bed_layout: BedLayout,
+        sample_rate: u32,
+        automix_config: AutomixEngineConfig,
+        tick_seconds: f64,
+    ) -> Self {
+        let bed_map = bed_layout.channel_map();
+        let bed_channels = bed_map.len() as u32;
+        Self {
+            bed_layout,
             bed_channels,
             sample_rate,
             bed_meter: KWeightedLoudnessMeter::new(&bed_map, sample_rate, FAST_WINDOW_SECONDS),
@@ -117,9 +136,9 @@ impl AutomixProcessor {
             control_ratio_lu: 0.0,
             mix_state: MixState::ReleaseToUnity,
             com_gate_lufs: automix_config.com_gate_lufs,
-            duck_depth: automix_config.duck_depth.per_channel(bed_channels),
+            duck_depth: automix_config.duck_depth.per_channel_for(bed_layout),
             com_voice_gated: false,
-        })
+        }
     }
 
     pub fn bed_channels(&self) -> u32 {
@@ -130,7 +149,7 @@ impl AutomixProcessor {
     /// every block - it is a couple of struct copies, not a rebuild.
     pub fn set_config(&mut self, automix_config: AutomixEngineConfig) {
         self.com_gate_lufs = automix_config.com_gate_lufs;
-        self.duck_depth = automix_config.duck_depth.per_channel(self.bed_channels);
+        self.duck_depth = automix_config.duck_depth.per_channel_for(self.bed_layout);
         self.automix_engine.set_config(automix_config);
     }
 

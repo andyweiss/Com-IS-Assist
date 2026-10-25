@@ -60,4 +60,30 @@ fn bed_channel_map_rejects_unsupported_channel_counts() {
         Err(ConfigError::UnsupportedChannelCount(7))
     );
     assert!(Ebur128Meter::bed_channel_map(6).is_ok());
+    assert!(Ebur128Meter::bed_channel_map(10).is_ok(), "5.1.4");
+}
+
+/// 7.1.2's side pair sits at M±090 and its Ls/Rs at M±135, so BS.1770's +1.5 dB surround weight
+/// moves from Ls/Rs to Sl/Sr: identical noise reads louder on the side pair than on Ls/Rs.
+#[test]
+fn seven_one_two_weights_the_side_pair_not_ls_rs() {
+    use com_is_assist_core::loudness::BedLayout;
+
+    let map = BedLayout::Surround712.channel_map();
+    assert_eq!(map.len(), 10);
+    let loudness_with_signal_on = |channels: [usize; 2]| {
+        let mut meter = Ebur128Meter::new(&map, 48_000).unwrap();
+        let mut frames = vec![0.0_f32; 48_000 * 10];
+        for (i, frame) in frames.chunks_mut(10).enumerate() {
+            let s = 0.1 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48_000.0).sin();
+            for c in channels {
+                frame[c] = s;
+            }
+        }
+        meter.push_frames(&frames).unwrap();
+        meter.momentary_loudness_db()
+    };
+    let ls_rs = loudness_with_signal_on([4, 5]);
+    let sl_sr = loudness_with_signal_on([6, 7]);
+    assert!((sl_sr - ls_rs - 1.49).abs() < 0.05, "Ls/Rs {ls_rs}, Sl/Sr {sl_sr}");
 }

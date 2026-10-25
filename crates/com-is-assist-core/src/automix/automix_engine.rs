@@ -1,6 +1,6 @@
 use super::loop_bank::{LoopBank, LoopBankConfig, LoopContributions};
 use super::mix_state::MixState;
-use crate::loudness::Ebur128Meter;
+use crate::loudness::{BedLayout, Ebur128Meter};
 
 /// The feed-forward identity at the heart of the design: reducing the Bed by 1 dB raises the
 /// COM/IS ratio by exactly 1 LU, so the reduction needed to put the ratio on target is simply
@@ -53,8 +53,8 @@ pub struct AutomixEngineConfig {
     pub duck_depth: DuckDepth,
 }
 
-/// The widest Bed this project supports (`Ebur128Meter::bed_channel_map`).
-pub const MAX_BED_CHANNELS: usize = 6;
+/// The widest Bed this project supports (`BedLayout`): 5.1.4 and 7.1.2.
+pub const MAX_BED_CHANNELS: usize = 10;
 
 /// How much of the computed gain reduction each group of Bed channels actually takes, as a factor
 /// from `1.0` (the reduction in full - 6 dB of ducking reduces those channels by 6 dB) down to
@@ -72,42 +72,69 @@ pub const MAX_BED_CHANNELS: usize = 6;
 /// commentary clear without flattening the scene around it.
 ///
 /// **Grouped, not per channel, and deliberately so.** Left and Right must duck by the same amount
-/// or the difference is heard as the image sliding sideways; the same goes for the surround pair.
-/// Independent per-channel settings make that mistake easy to reach and buy nothing, since no real
-/// use for an asymmetric front or surround duck has come up.
+/// or the difference is heard as the image sliding sideways; the same goes for the surround, side
+/// and height pairs. Independent per-channel settings make that mistake easy to reach and buy
+/// nothing, since no real use for an asymmetric duck has come up.
+///
+/// A group only resolves to anything on a layout that has those channels (see the field docs); on
+/// the others it is carried but never read.
 #[derive(Debug, Clone, Copy)]
 pub struct DuckDepth {
     /// Left and Right together.
     pub front_lr: f64,
     pub center: f64,
     pub lfe: f64,
-    /// Left Surround and Right Surround together.
+    /// Left Surround and Right Surround together - VST3's `Ls`/`Rs` on every layout, which on
+    /// 7.1.2 are the rear pair.
     pub surround: f64,
+    /// Side Left and Side Right together (7.1.2 only).
+    pub side: f64,
+    /// Top Front Left and Top Front Right together (5.1.4 only).
+    pub top_front: f64,
+    /// Top Rear Left and Top Rear Right together (5.1.4 only).
+    pub top_rear: f64,
+    /// Top Side Left and Top Side Right together (7.1.2 only).
+    pub top_side: f64,
 }
 
 impl Default for DuckDepth {
     fn default() -> Self {
-        Self { front_lr: 1.0, center: 1.0, lfe: 1.0, surround: 1.0 }
+        Self {
+            front_lr: 1.0,
+            center: 1.0,
+            lfe: 1.0,
+            surround: 1.0,
+            side: 1.0,
+            top_front: 1.0,
+            top_rear: 1.0,
+            top_side: 1.0,
+        }
     }
 }
 
 impl DuckDepth {
-    /// Resolves the groups to a factor per channel **position** for a Bed of `bed_channels`,
-    /// against the same map the loudness meters use (`Ebur128Meter::bed_channel_map`).
+    /// Resolves the groups to a factor per channel **position** for a Bed of `bed_channels`, taken
+    /// as [`BedLayout::from_channel_count`] reads it. See [`Self::per_channel_for`].
+    pub fn per_channel(&self, bed_channels: u32) -> [f64; MAX_BED_CHANNELS] {
+        match BedLayout::from_channel_count(bed_channels) {
+            Ok(layout) => self.per_channel_for(layout),
+            Err(_) => [1.0; MAX_BED_CHANNELS],
+        }
+    }
+
+    /// Resolves the groups to a factor per channel **position** for `layout`, against the same map
+    /// the loudness meters use ([`BedLayout::channel_map`]).
     ///
     /// Doing it here rather than in each wrapper is what keeps the group names honest: which role
     /// sits at a given stream position depends on the channel count (position 2 is Center on a
     /// 3/5/6-channel Bed but Left Surround on a 4-channel one), so a wrapper exposing positional
-    /// settings would be mislabelling them on every layout but the widest. Positions past
-    /// `bed_channels`, and any count the map rejects, resolve to 1.0 and are never read.
-    pub fn per_channel(&self, bed_channels: u32) -> [f64; MAX_BED_CHANNELS] {
+    /// settings would be mislabelling them on every layout but the widest. Positions past the
+    /// layout's width resolve to 1.0 and are never read.
+    pub fn per_channel_for(&self, layout: BedLayout) -> [f64; MAX_BED_CHANNELS] {
         use ebur128::Channel;
 
         let mut out = [1.0; MAX_BED_CHANNELS];
-        let Ok(map) = Ebur128Meter::bed_channel_map(bed_channels) else {
-            return out;
-        };
-        for (slot, channel) in out.iter_mut().zip(map) {
+        for (slot, channel) in out.iter_mut().zip(layout.channel_map()) {
             *slot = match channel {
                 Channel::Left | Channel::Right => self.front_lr,
                 Channel::Center => self.center,
@@ -115,6 +142,11 @@ impl DuckDepth {
                 // it from the loudness sum, which is exactly why it is also the channel with no
                 // intelligibility to protect.
                 Channel::Unused => self.lfe,
+                Channel::Mp090 | Channel::Mm090 => self.side,
+                Channel::Up030 | Channel::Um030 => self.top_front,
+                Channel::Up110 | Channel::Um110 => self.top_rear,
+                Channel::Up090 | Channel::Um090 => self.top_side,
+                // Ls/Rs, wherever the layout puts them (M±110 on 5.1, M±135 on 7.1.2).
                 _ => self.surround,
             };
         }

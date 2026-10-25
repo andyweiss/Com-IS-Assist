@@ -30,7 +30,7 @@ How *fast* each of those happens is set by **Speed**, not by per-state times.
 0 -12 dB defines how many LUFS the com has to be on top of the IS. (Originally called "Com/IS distance"; the underlying parameter id is still `target-ratio`.)
 
 # Help page
-The **? Help** button next to Bypass opens an about/help overlay: the running version, who made it and whose idea it was based on, which channels carry what (bed on 1-6, commentary on 7), and a one-line description of every control. It opens over the mixer rather than replacing it, so the meters stay visible and in place while you read.
+The **? Help** button next to Bypass opens an about/help overlay: the running version, who made it and whose idea it was based on, which inputs carry what (the bed on the main input, in that format's channel order, and the commentary on the mono sidechain; the output is the ducked bed, with the commentary mixed in when "Mix dialogue to bed" is on), and a one-line description of every control. It opens over the mixer rather than replacing it, so the meters stay visible and in place while you read.
 
 The version is the GitHub release tag for a released build; a build made locally says "dev build" instead, so it is always clear which one is running.
 
@@ -40,7 +40,7 @@ How quickly the mixer responds, as a single control. There are no separate attac
 # Duck depth (per bed channel group)
 How much of the ducking each group of bed channels gets, as a ratio. At 1:1 the group takes the full reduction - if the mixer decides on 6 dB, those channels come down 6 dB. At 1:0 they are left alone entirely, however hard the rest of the bed is being held down. Anything between scales it proportionally, so 1:0.5 of a 6 dB reduction is 3 dB.
 
-There are four: **Front L/R**, **Center**, **LFE** and **Surround L/R**. They are grouped rather than per channel on purpose - ducking Left differently from Right is heard as the image sliding sideways rather than as less ducking, and the same goes for the surrounds.
+The 5.1 version has four groups: **Front L/R**, **Center**, **LFE** and **Surround L/R**. The 5.1.4 version adds **Top Front L/R** and **Top Rear L/R** for the height layer. The 7.1.2 version adds **Side L/R** and **Top Side L/R**; on 7.1.2, Surround L/R is the rear pair. The 2.0 version has no duck depth at all: with a single pair there is nothing to distribute the ducking across, so it would only be a weaker duck, which is what the ratios are for. They are grouped rather than per channel on purpose: ducking Left differently from Right is heard as the image sliding sideways rather than as less ducking, and the same goes for the surround, side and height pairs.
 
 The amount of ducking is still worked out once, for the bed as a whole; this only decides how it is shared out. Leaving every group at 1:1 behaves exactly as before.
 

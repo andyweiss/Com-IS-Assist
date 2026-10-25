@@ -6,3 +6,10 @@ members = [
     "crates/com-is-assist-vst3",
     "xtask",
 ]
+# The vendored nih_plug is a patched dependency, not one of our crates.
+exclude = ["vendor"]
+
+# nih_plug with VST3 speaker arrangements fixed for 5.1.4 - see `vendor/nih_plug/PATCHED.md`.
+# Applies to every crate from the nih-plug repository that depends on it (nih_plug_egui too).
+[patch."https://github.com/robbert-vdh/nih-plug.git"]
+nih_plug = { path = "vendor/nih_plug" }

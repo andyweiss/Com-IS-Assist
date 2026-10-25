@@ -1,31 +1,43 @@
 // Com-IS-Assist's VST3 plugin: a wrapper around the shared
-// `com_is_assist_core::automix::AutomixProcessor`, in a single fixed 8-channel-in/8-channel-out
-// bus.
+// `com_is_assist_core::automix::AutomixProcessor`.
 //
-// Channel layout (fixed, both input and output): 0-5 = Bed (6ch, Left/Right/Center/LFE/Ls/Rs), 6 =
-// Dialogue (mono), 7 = unused (silent). A single fixed bus (rather than nih-plug's named multi-bus
-// model, which `Specs/Ressouces/vstDefinitions.md` had flagged as an open question - `nih-plug`'s
-// bus model is "one main input + one main output, plus anonymous aux ports," which doesn't map
-// cleanly onto this project's originally-planned 2-named-input/3-named-output layout) sidesteps
-// that uncertainty entirely and avoids the multi-output-bus host-compatibility risk multi-bus VST3
-// plugins can have.
+// Bus layout: the Bed (IS) is the **main** input and output bus, and the commentary (COM) arrives
+// on a mono **sidechain** (VST3 aux input). The Bed's width is the only thing that differs between
+// formats, so one binary exports four plugins - 2.0, 5.1, 5.1.4 and 7.1.2 (see `BedFormat`) - each
+// with exactly one fixed layout, rather than one plugin offering all of them and leaving the choice
+// to the host's bus negotiation:
 //
-// `mix-dialogue-to-bed` (the "bus insert mode" toggle): when on, output channels 0-2
-// (Left/Right/Center) carry leveled Bed + Dialogue mixed in via `mix_dialogue_into_bed`'s
-// divergence-based pan law (restricted to L/R/C - Dialogue never touches LFE or surrounds); when
-// off, output channels 0-5 are leveled Bed alone, for inserting directly on a Bed/IS channel strip
-// where the console sums in commentary separately downstream. Channel 6 always carries the dry Dialogue passthrough
-// regardless of this toggle.
+// - Every host already knows how to put a fixed-width insert with a sidechain on a track of that
+//   width. Hosts differ widely in whether, and how, they renegotiate a multi-layout VST3 to the
+//   track's width, and getting it wrong there fails silently (a 5.1 bed processed as stereo).
+// - Each plugin then reports, and only accepts, one exact VST3 speaker arrangement: `kStereo`,
+//   `k51`, `k51_4` or `k71_2`, plus `kMono` for the sidechain. That needs a patched nih-plug
+//   (`vendor/nih_plug/PATCHED.md`); upstream matches on channel count alone, which cannot tell
+//   5.1.4 from 7.1.2 (both ten channels).
+// - The parameter set can be trimmed to the format: a stereo bed has no duck depth or divergence
+//   to automate, and the height and side groups exist only where those channels do.
+//
+// All four share every line of DSP and GUI code; they are the same generic type instantiated with
+// a different `BedFormat`.
+//
+// `mix-dialogue-to-bed` (the "bus insert mode" toggle): when on, the Left/Right/Center outputs
+// carry leveled Bed + Dialogue mixed in via `mix_dialogue_into_bed`'s divergence-based pan law
+// (restricted to L/R/C - Dialogue never touches LFE, surrounds, sides or heights; on 2.0, an equal-power
+// L/R split); when off, the output is the leveled Bed alone, for inserting directly on a Bed/IS
+// channel strip where the console sums in commentary separately downstream. The sidechain is
+// input-only: COM is never passed through, since it already has its own path in the host.
 
 use atomic_float::AtomicF32;
 use com_is_assist_core::automix::{
     mix_dialogue_into_bed, AutomixEngineConfig, AutomixProcessor, DuckDepth, MixState,
 };
-use com_is_assist_core::loudness::Ebur128Meter;
+use com_is_assist_core::loudness::{BedLayout, Ebur128Meter};
 use com_is_assist_core::voice_activity::{BackgroundVad, VoiceActivityConfig};
 use nih_plug::prelude::*;
+use nih_plug::wrapper::vst3::vst3_sys::vst::{k51, k51_4, k71_2, kStereo};
 use nih_plug_egui::widgets::ParamSlider;
 use nih_plug_egui::{create_egui_editor, egui, resizable_window::ResizableWindow, EguiState};
+use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -35,18 +47,97 @@ use std::sync::Arc;
 /// a build script rather than an `option_env!` in this file.
 const DISPLAY_VERSION: &str = env!("COMIS_DISPLAY_VERSION");
 
-const BED_CHANNELS: u32 = 6;
-const TOTAL_CHANNELS: usize = 8; // 6 Bed + 1 Dialogue + 1 unused
-const DIALOGUE_CHANNEL: usize = BED_CHANNELS as usize; // index 6 (the 7th channel)
-const UNUSED_CHANNEL: usize = TOTAL_CHANNELS - 1; // index 7 (the 8th channel)
-// Bed channel indices, per `Ebur128Meter::bed_channel_map`'s 6-channel layout: Left, Right,
-// Center, Unused (LFE), LeftSurround, RightSurround.
+// Bed channel indices, per `BedLayout::channel_map`. Left and Right lead every layout; Center is
+// third everywhere but 2.0, which has none.
 const LEFT_CHANNEL: usize = 0;
 const RIGHT_CHANNEL: usize = 1;
 const CENTER_CHANNEL: usize = 2;
 const TICK_SECONDS: f64 = 0.1;
 
-struct ComISAssist {
+/// The one thing that differs between the exported plugins: the Bed's layout. See the module doc
+/// comment for why this is one plugin per layout rather than one with several.
+trait BedFormat: 'static + Send + Sync {
+    const LAYOUT: BedLayout;
+    /// The exact VST3 speaker arrangement of the main bus - the only one the plugin accepts.
+    const ARRANGEMENT: u64;
+    const PLUGIN_NAME: &'static str;
+    /// Shown beside the title and used as the host-facing layout name.
+    const LABEL: &'static str;
+    /// Each format needs its own: a host identifies a plugin by this, not by its name.
+    const CLASS_ID: [u8; 16];
+    /// The channel order the main bus expects, for the help page.
+    const CHANNEL_ORDER: &'static str;
+    /// Which of `BED_GROUP_LABELS` exist on this layout (as indices, in drawing order). Empty
+    /// means the format has no duck-depth controls at all.
+    const DUCK_GROUPS: &'static [usize];
+    /// The IS meter's channel caption.
+    const IS_CAPTION: &'static str;
+
+    /// Main-bus width, in `BedLayout::channel_map` order.
+    const CHANNELS: usize = Self::ARRANGEMENT.count_ones() as usize;
+    const HAS_CENTER: bool = Self::CHANNELS >= 3;
+}
+
+struct Stereo;
+struct Surround51;
+struct Surround514;
+struct Surround712;
+
+impl BedFormat for Stereo {
+    const LAYOUT: BedLayout = BedLayout::Stereo;
+    const ARRANGEMENT: u64 = kStereo;
+    const PLUGIN_NAME: &'static str = "Com-IS-Assist 2.0";
+    const LABEL: &'static str = "2.0";
+    const CLASS_ID: [u8; 16] = *b"ComISAssistDuk20";
+    const CHANNEL_ORDER: &'static str = "L R";
+    // None: with only one pair there is nothing to distribute the reduction across - holding
+    // Front L/R back would just be a weaker duck, which is what the ratios are for.
+    const DUCK_GROUPS: &'static [usize] = &[];
+    const IS_CAPTION: &'static str = "Ch 1-2";
+}
+
+impl BedFormat for Surround51 {
+    const LAYOUT: BedLayout = BedLayout::Surround51;
+    const ARRANGEMENT: u64 = k51;
+    const PLUGIN_NAME: &'static str = "Com-IS-Assist 5.1";
+    const LABEL: &'static str = "5.1";
+    /// The class ID the single 8-channel plugin shipped with, kept so existing sessions reopen
+    /// on this format with their settings intact. (Reaper maps the old 7th input pin, COM, onto
+    /// the sidechain - the first pin after the six main ones - so the routing carries over too.)
+    const CLASS_ID: [u8; 16] = *b"ComISAssistDuck1";
+    const CHANNEL_ORDER: &'static str = "L R C LFE Ls Rs";
+    const DUCK_GROUPS: &'static [usize] = &[GROUP_FRONT, GROUP_CENTER, GROUP_LFE, GROUP_SURROUND];
+    const IS_CAPTION: &'static str = "Ch 1-6";
+}
+
+impl BedFormat for Surround514 {
+    const LAYOUT: BedLayout = BedLayout::Surround514;
+    const ARRANGEMENT: u64 = k51_4;
+    const PLUGIN_NAME: &'static str = "Com-IS-Assist 5.1.4";
+    const LABEL: &'static str = "5.1.4";
+    const CLASS_ID: [u8; 16] = *b"ComISAssistDk514";
+    const CHANNEL_ORDER: &'static str = "L R C LFE Ls Rs Ltf Rtf Ltr Rtr";
+    const DUCK_GROUPS: &'static [usize] =
+        &[GROUP_FRONT, GROUP_CENTER, GROUP_LFE, GROUP_SURROUND, GROUP_TOP_FRONT, GROUP_TOP_REAR];
+    const IS_CAPTION: &'static str = "Ch 1-10";
+}
+
+impl BedFormat for Surround712 {
+    const LAYOUT: BedLayout = BedLayout::Surround712;
+    const ARRANGEMENT: u64 = k71_2;
+    const PLUGIN_NAME: &'static str = "Com-IS-Assist 7.1.2";
+    const LABEL: &'static str = "7.1.2";
+    const CLASS_ID: [u8; 16] = *b"ComISAssistDk712";
+    const CHANNEL_ORDER: &'static str = "L R C LFE Ls Rs Sl Sr Tsl Tsr";
+    // Side before Surround would match the speakers front to back, but Surround stays fourth on
+    // every layout so the same control sits in the same place whichever plugin is open.
+    const DUCK_GROUPS: &'static [usize] =
+        &[GROUP_FRONT, GROUP_CENTER, GROUP_LFE, GROUP_SURROUND, GROUP_SIDE, GROUP_TOP_SIDE];
+    const IS_CAPTION: &'static str = "Ch 1-10";
+}
+
+struct ComISAssist<F: BedFormat> {
+    format: PhantomData<F>,
     params: Arc<ComISAssistParams>,
     /// `None` until `initialize()` supplies the host's sample rate - `AutomixProcessor` needs it
     /// at construction time (for the `ebur128` meters), which isn't known any earlier than that.
@@ -248,6 +339,17 @@ struct ComISAssistParams {
     pub duck_depth_lfe: FloatParam,
     #[id = "duck-depth-surround"]
     pub duck_depth_surround: FloatParam,
+    /// Height pairs, 5.1.4 only. Present (hidden) on every format so the parameter set - and with
+    /// it every ID - is the same type everywhere.
+    #[id = "duck-depth-top-front"]
+    pub duck_depth_top_front: FloatParam,
+    #[id = "duck-depth-top-rear"]
+    pub duck_depth_top_rear: FloatParam,
+    /// 7.1.2 only, likewise present (hidden) everywhere else.
+    #[id = "duck-depth-side"]
+    pub duck_depth_side: FloatParam,
+    #[id = "duck-depth-top-side"]
+    pub duck_depth_top_side: FloatParam,
     /// `true` bypasses automix entirely (Bed passes through at unity gain, no ducking) - `false`
     /// (default) is normal operation. Inverted from the earlier `automix-enable` naming/polarity
     /// to match the conventional meaning of a "Bypass" control.
@@ -271,8 +373,27 @@ struct ComISAssistParams {
     editor_state: Arc<EguiState>,
 }
 
-/// Bed channel groups, in the order their rows are drawn.
-const BED_GROUP_LABELS: [&str; 4] = ["Front L/R", "Center", "LFE", "Surround L/R"];
+/// Every Bed channel group, indexed by the `GROUP_*` constants. Each format draws the subset it
+/// has (`BedFormat::DUCK_GROUPS`). On 7.1.2 "Surround" is VST3's Ls/Rs, which there are the rear
+/// pair - the same speakers as on 5.1, so the same control.
+const BED_GROUP_LABELS: [&str; 8] = [
+    "Front L/R",
+    "Center",
+    "LFE",
+    "Surround L/R",
+    "Top Front L/R",
+    "Top Rear L/R",
+    "Side L/R",
+    "Top Side L/R",
+];
+const GROUP_FRONT: usize = 0;
+const GROUP_CENTER: usize = 1;
+const GROUP_LFE: usize = 2;
+const GROUP_SURROUND: usize = 3;
+const GROUP_TOP_FRONT: usize = 4;
+const GROUP_TOP_REAR: usize = 5;
+const GROUP_SIDE: usize = 6;
+const GROUP_TOP_SIDE: usize = 7;
 
 /// One channel group's duck-depth parameter, shown as a ratio rather than a percentage: `1:1`
 /// takes the ducking in full, `1:0` takes none of it. The ratio is what a sound engineer reads
@@ -297,10 +418,19 @@ fn duck_depth_param(name: &str) -> FloatParam {
 }
 
 impl ComISAssistParams {
-    /// The four duck-depth parameters in the order their rows are drawn, matching
-    /// `BED_GROUP_LABELS`.
-    pub fn duck_depth_params(&self) -> [&FloatParam; 4] {
-        [&self.duck_depth_front, &self.duck_depth_center, &self.duck_depth_lfe, &self.duck_depth_surround]
+    /// Every duck-depth parameter, indexed like `BED_GROUP_LABELS`. Callers pick a format's
+    /// groups out of it with `BedFormat::DUCK_GROUPS`.
+    pub fn duck_depth_params(&self) -> [&FloatParam; 8] {
+        [
+            &self.duck_depth_front,
+            &self.duck_depth_center,
+            &self.duck_depth_lfe,
+            &self.duck_depth_surround,
+            &self.duck_depth_top_front,
+            &self.duck_depth_top_rear,
+            &self.duck_depth_side,
+            &self.duck_depth_top_side,
+        ]
     }
 
     /// Those parameters as the core takes them. Resolving groups to individual channels is the
@@ -312,14 +442,19 @@ impl ComISAssistParams {
             center: self.duck_depth_center.value() as f64,
             lfe: self.duck_depth_lfe.value() as f64,
             surround: self.duck_depth_surround.value() as f64,
+            top_front: self.duck_depth_top_front.value() as f64,
+            top_rear: self.duck_depth_top_rear.value() as f64,
+            side: self.duck_depth_side.value() as f64,
+            top_side: self.duck_depth_top_side.value() as f64,
         }
     }
 }
 
-impl Default for ComISAssist {
+impl<F: BedFormat> Default for ComISAssist<F> {
     fn default() -> Self {
         Self {
-            params: Arc::new(ComISAssistParams::default()),
+            format: PhantomData,
+            params: Arc::new(ComISAssistParams::for_format::<F>()),
             processor: None,
             voice_activity: None,
             interleaved_bed: Vec::new(),
@@ -331,8 +466,28 @@ impl Default for ComISAssist {
     }
 }
 
-impl Default for ComISAssistParams {
-    fn default() -> Self {
+impl ComISAssistParams {
+    /// The parameter set for one format. Every parameter exists on every format, but those a
+    /// format has no use for are hidden from the host: a stereo bed offers no duck depth (one pair
+    /// has nothing to distribute across) and no divergence (which only steers between Center and
+    /// L/R), and each surround format only the groups it has channels for.
+    fn for_format<F: BedFormat>() -> Self {
+        let mut params = Self::all_visible();
+        let hide = |param: FloatParam, present: bool| if present { param } else { param.hide() };
+        let present = |group| F::DUCK_GROUPS.contains(&group);
+        params.duck_depth_front = hide(params.duck_depth_front, present(GROUP_FRONT));
+        params.duck_depth_center = hide(params.duck_depth_center, present(GROUP_CENTER));
+        params.duck_depth_lfe = hide(params.duck_depth_lfe, present(GROUP_LFE));
+        params.duck_depth_surround = hide(params.duck_depth_surround, present(GROUP_SURROUND));
+        params.duck_depth_top_front = hide(params.duck_depth_top_front, present(GROUP_TOP_FRONT));
+        params.duck_depth_top_rear = hide(params.duck_depth_top_rear, present(GROUP_TOP_REAR));
+        params.duck_depth_side = hide(params.duck_depth_side, present(GROUP_SIDE));
+        params.duck_depth_top_side = hide(params.duck_depth_top_side, present(GROUP_TOP_SIDE));
+        params.divergence = hide(params.divergence, F::HAS_CENTER);
+        params
+    }
+
+    fn all_visible() -> Self {
         let automix = AutomixEngineConfig::default();
         Self {
             target_ratio: FloatParam::new(
@@ -402,6 +557,10 @@ impl Default for ComISAssistParams {
             duck_depth_center: duck_depth_param("Center"),
             duck_depth_lfe: duck_depth_param("LFE"),
             duck_depth_surround: duck_depth_param("Surround L/R"),
+            duck_depth_top_front: duck_depth_param("Top Front L/R"),
+            duck_depth_top_rear: duck_depth_param("Top Rear L/R"),
+            duck_depth_side: duck_depth_param("Side L/R"),
+            duck_depth_top_side: duck_depth_param("Top Side L/R"),
             bypass: BoolParam::new("Bypass", false),
             mix_dialogue_to_bed: BoolParam::new("Mix Dialogue to Bed", true),
             divergence: FloatParam::new("Voice Divergence", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
@@ -1064,7 +1223,7 @@ const PARAMETER_HELP: &[(&str, &str)] = &[
     ("Max gain reduction", "A hard floor on how far the bed may ever be pushed down, whatever the ratios ask for."),
     ("Speed", "How quickly the mixer reacts, as one control. Raise it if it feels sluggish, lower it if it breathes. Ducking is always quicker than recovery; this moves both without losing that."),
     ("Voice detect gate", "A level below which voice on the commentary channel is ignored, so bed spill in the commentary mic cannot duck the bed against its own bleed. Set it 20-30 dB under the commentator's normal level - the shaded area on the COM meter shows where it is off."),
-    ("Duck depth", "How much of the ducking each part of the bed takes. 1:1 is the full amount, 1:0 none at all. Holding the surrounds and LFE back keeps the commentary clear without flattening the scene."),
+    ("Duck depth", "How much of the ducking each part of the bed takes. 1:1 is the full amount, 1:0 none at all. Holding the surrounds, heights and LFE back keeps the commentary clear without flattening the scene. Only the groups this format has are shown."),
     ("Mix dialogue to bed", "Folds the commentary into the bed output, for running the plugin as a bus insert rather than alongside a separate commentary path."),
     ("Voice divergence", "Where the mixed-in commentary sits: centre only at 0%, spread across left and right at 100%. Only does anything with the mix above switched on."),
     ("Bypass", "Passes the bed through untouched. Metering keeps running."),
@@ -1072,7 +1231,7 @@ const PARAMETER_HELP: &[(&str, &str)] = &[
 
 /// The about/help overlay. A window rather than a panel so it can be opened over the mixer without
 /// the layout underneath moving - the meters stay where they were while it is being read.
-fn help_window(ctx: &egui::Context, open: &mut bool) {
+fn help_window<F: BedFormat>(ctx: &egui::Context, open: &mut bool) {
     egui::Window::new("About Com-IS-Assist")
         .open(open)
         .collapsible(false)
@@ -1080,7 +1239,7 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
         .default_width(430.0)
         .show(ctx, |ui| {
             ui.add_space(2.0);
-            ui.label(egui::RichText::new("Com-IS-Assist").size(17.0).strong());
+            ui.label(egui::RichText::new(F::PLUGIN_NAME).size(17.0).strong());
             ui.label(egui::RichText::new(DISPLAY_VERSION).color(egui::Color32::from_gray(150)));
             ui.add_space(8.0);
             ui.label("By Andreas Weiss.");
@@ -1090,13 +1249,19 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
             ui.add_space(8.0);
             ui.label(
                 "Ducks the international sound bed against the mono commentary, holding a chosen \
-                 loudness distance between them. The commentary itself is never touched - it is \
-                 only measured, and passed through as a reference.",
+                 loudness distance between them. The commentary itself is never changed - it is \
+                 only measured and, depending on the mode, mixed into the bed.",
             );
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Bed on channels 1-6, commentary on channel 7. Channel 8 is unused.")
-                    .color(egui::Color32::from_gray(150)),
+                egui::RichText::new(format!(
+                    "Bed ({}) on the main input, in the order {}. Commentary on the mono \
+                     sidechain input. The output is the ducked bed, with the commentary mixed \
+                     in when \"Mix dialogue to bed\" is on.",
+                    F::LABEL,
+                    F::CHANNEL_ORDER
+                ))
+                .color(egui::Color32::from_gray(150)),
             );
             ui.add_space(10.0);
             ui.separator();
@@ -1104,7 +1269,15 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
             ui.label(egui::RichText::new("Controls").strong());
             ui.add_space(4.0);
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                for (name, description) in PARAMETER_HELP {
+                // Only controls this format actually shows: divergence steers between Center and
+                // L/R, and duck depth distributes the reduction across channel groups, so neither
+                // has anything to do on 2.0.
+                let entries = PARAMETER_HELP.iter().filter(|(name, _)| match *name {
+                    "Voice divergence" => F::HAS_CENTER,
+                    "Duck depth" => !F::DUCK_GROUPS.is_empty(),
+                    _ => true,
+                });
+                for (name, description) in entries {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(*name).strong());
                     ui.label(egui::RichText::new(*description).color(egui::Color32::from_gray(185)));
@@ -1127,21 +1300,27 @@ fn bool_param_checkbox(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolPara
     }
 }
 
-impl Plugin for ComISAssist {
-    const NAME: &'static str = "Com-IS-Assist";
+impl<F: BedFormat> Plugin for ComISAssist<F> {
+    const NAME: &'static str = F::PLUGIN_NAME;
     const VENDOR: &'static str = "Andy Weiss";
     const URL: &'static str = "https://github.com/andyweiss/Com-IS-Assist";
     const EMAIL: &'static str = "info@example.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-    // Single fixed 8-in/8-out bus - see the module doc comment for why this replaces the
-    // originally-planned named multi-bus layout.
+    // Bed in and out on the main bus, COM on a mono sidechain - exactly one layout per format, see
+    // the module doc comment.
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(TOTAL_CHANNELS as u32),
-        main_output_channels: NonZeroU32::new(TOTAL_CHANNELS as u32),
-        aux_input_ports: &[],
+        main_input_channels: NonZeroU32::new(F::CHANNELS as u32),
+        main_output_channels: NonZeroU32::new(F::CHANNELS as u32),
+        aux_input_ports: &[new_nonzero_u32(1)],
         aux_output_ports: &[],
-        names: PortNames::const_default(),
+        names: PortNames {
+            layout: Some(F::LABEL),
+            main_input: Some("IS"),
+            main_output: Some("IS"),
+            aux_inputs: &["COM"],
+            aux_outputs: &[],
+        },
     }];
 
     const MIDI_INPUT: MidiConfig = MidiConfig::None;
@@ -1193,6 +1372,13 @@ impl Plugin for ComISAssist {
                             ui.scope(|ui| {
                                 ui.set_width(METER_BANK_WIDTH);
                                 ui.label(egui::RichText::new("Com-IS-Assist").size(23.0).strong());
+                                // The format, since the four plugins are otherwise identical on
+                                // screen and loading the wrong width is an easy patching mistake.
+                                ui.label(
+                                    egui::RichText::new(F::LABEL)
+                                        .size(15.0)
+                                        .color(egui::Color32::from_gray(150)),
+                                );
                             });
                             meters_to_controls_gutter(ui, false);
                             // Bypass sits in the title row rather than among the tuning parameters
@@ -1309,7 +1495,7 @@ impl Plugin for ComISAssist {
                                         ui,
                                         LoudnessMeter {
                                             label: "IS",
-                                            channels: "Ch 1-6",
+                                            channels: F::IS_CAPTION,
                                             lufs: is_lufs,
                                             color: accent,
                                             gain_reduction_db: Some(gain_reduction_db),
@@ -1335,7 +1521,7 @@ impl Plugin for ComISAssist {
                                         ui,
                                         LoudnessMeter {
                                             label: "COM",
-                                            channels: "Ch 7",
+                                            channels: "Sidechain",
                                             lufs: com_lufs,
                                             color: accent,
                                             gain_reduction_db: None,
@@ -1426,20 +1612,23 @@ impl Plugin for ComISAssist {
 
                                 let mix_to_bed = params.mix_dialogue_to_bed.value();
                                 bool_param_checkbox(ui, setter, &params.mix_dialogue_to_bed, "Mix dialogue to bed");
-                                ui.add_space(8.0);
                                 // Divergence only places Dialogue *within* the Bed, so with the mix
                                 // off it controls nothing. Greyed out rather than hidden, so the
-                                // relationship between the two stays visible.
-                                rows_right = rows_right.max(
-                                    ui.add_enabled_ui(mix_to_bed, |ui| {
-                                        control_grid(ui, "com-is-assist-divergence", |ui| {
-                                            control_label(ui, "Voice divergence");
-                                            ui.add(ParamSlider::for_param(&params.divergence, setter).with_width(CONTROL_SLIDER_WIDTH));
-                                            ui.end_row();
+                                // relationship between the two stays visible. Left out entirely on
+                                // 2.0, though: with no Center there is nothing to diverge from.
+                                if F::HAS_CENTER {
+                                    ui.add_space(8.0);
+                                    rows_right = rows_right.max(
+                                        ui.add_enabled_ui(mix_to_bed, |ui| {
+                                            control_grid(ui, "com-is-assist-divergence", |ui| {
+                                                control_label(ui, "Voice divergence");
+                                                ui.add(ParamSlider::for_param(&params.divergence, setter).with_width(CONTROL_SLIDER_WIDTH));
+                                                ui.end_row();
+                                            })
                                         })
-                                    })
-                                    .inner,
-                                );
+                                        .inner,
+                                    );
+                                }
 
                                 // The live state-machine readout. With the mixer's behavior now
                                 // defined entirely by which of four states it's in, showing that
@@ -1448,18 +1637,25 @@ impl Plugin for ComISAssist {
                                 // Per-channel duck depth. Replaces the three loop-contribution
                                 // bars that used to sit here, which were a debugging view of the
                                 // cascade's internals rather than anything to mix with.
-                                ui.add_space(16.0);
-                                ui.separator();
-                                ui.add_space(10.0);
-                                ui.label("Duck depth");
-                                ui.add_space(6.0);
-                                rows_right = rows_right.max(control_grid(ui, "com-is-assist-duck-depth", |ui| {
-                                    for (label, param) in BED_GROUP_LABELS.iter().zip(params.duck_depth_params()) {
-                                        control_label(ui, label);
-                                        ui.add(ParamSlider::for_param(param, setter).with_width(CONTROL_SLIDER_WIDTH));
-                                        ui.end_row();
-                                    }
-                                }));
+                                // The whole section, rule included, is left out on formats with
+                                // no groups (2.0).
+                                if !F::DUCK_GROUPS.is_empty() {
+                                    ui.add_space(16.0);
+                                    ui.separator();
+                                    ui.add_space(10.0);
+                                    ui.label("Duck depth");
+                                    ui.add_space(6.0);
+                                    rows_right = rows_right.max(control_grid(ui, "com-is-assist-duck-depth", |ui| {
+                                        let all_params = params.duck_depth_params();
+                                        for (label, param) in
+                                            F::DUCK_GROUPS.iter().map(|&group| (BED_GROUP_LABELS[group], all_params[group]))
+                                        {
+                                            control_label(ui, label);
+                                            ui.add(ParamSlider::for_param(param, setter).with_width(CONTROL_SLIDER_WIDTH));
+                                            ui.end_row();
+                                        }
+                                    }));
+                                }
                                 rows_right
                             });
                             // Hand this frame's measurement to the next frame's title row: the
@@ -1476,7 +1672,7 @@ impl Plugin for ComISAssist {
                 let mut showing = show_help.load(Ordering::Relaxed);
                 if showing {
                     // `Window::open` writes the close button's result back into `showing`.
-                    help_window(egui_ctx, &mut showing);
+                    help_window::<F>(egui_ctx, &mut showing);
                     show_help.store(showing, Ordering::Relaxed);
                 }
             },
@@ -1489,13 +1685,12 @@ impl Plugin for ComISAssist {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.processor = AutomixProcessor::new(
-            BED_CHANNELS,
+        self.processor = Some(AutomixProcessor::with_layout(
+            F::LAYOUT,
             buffer_config.sample_rate as u32,
             self.params.automix_config(),
             TICK_SECONDS,
-        )
-        .ok();
+        ));
         // `.ok()`, not `.expect(...)`: if this fails (e.g. the ONNX Runtime binary couldn't be
         // obtained), `process()` fails open rather than the whole plugin refusing to initialize
         // over what's ultimately just a display/gating refinement, not the core automix path.
@@ -1515,7 +1710,7 @@ impl Plugin for ComISAssist {
     fn process(
         &mut self,
         buffer: &mut Buffer,
-        _aux: &mut AuxiliaryBuffers,
+        aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let Some(processor) = self.processor.as_mut() else {
@@ -1532,10 +1727,11 @@ impl Plugin for ComISAssist {
         let mix_dialogue_to_bed = self.params.mix_dialogue_to_bed.value();
         let divergence = self.params.divergence.value() / 100.0;
 
+        let bed_channels = F::CHANNELS;
         let num_samples = buffer.samples();
         let channels = buffer.as_slice();
-        if channels.len() < TOTAL_CHANNELS {
-            return ProcessStatus::Error("expected a fixed 8-channel bus");
+        if channels.len() < bed_channels {
+            return ProcessStatus::Error("main bus narrower than this format's bed");
         }
 
         // com-is-assist-core works with interleaved audio;
@@ -1543,12 +1739,21 @@ impl Plugin for ComISAssist {
         // processor and re-interleave on the way back out.
         // `resize` only touches the allocator if the host hands over a bigger block than it said
         // it would; in steady state these are already the right length and this is a no-op.
-        self.interleaved_bed.resize(num_samples * BED_CHANNELS as usize, 0.0);
+        self.interleaved_bed.resize(num_samples * bed_channels, 0.0);
         self.dialogue_scratch.resize(num_samples, 0.0);
         self.mono_bed_scratch.resize(num_samples, 0.0);
-        let interleaved_bed = &mut self.interleaved_bed[..num_samples * BED_CHANNELS as usize];
+        let interleaved_bed = &mut self.interleaved_bed[..num_samples * bed_channels];
         let dialogue = &mut self.dialogue_scratch[..num_samples];
         let mono_bed = &mut self.mono_bed_scratch[..num_samples];
+
+        // COM from the sidechain. An unconnected sidechain reads as silence - which, through the
+        // guard band, simply means "nobody is commentating" and the bed stays at unity - rather
+        // than as an error: inserting the plugin before wiring its sidechain is the normal order
+        // of doing things, not a fault.
+        match aux.inputs.first().and_then(|sidechain| sidechain.as_slice_immutable().first()) {
+            Some(com) if com.len() >= num_samples => dialogue.copy_from_slice(&com[..num_samples]),
+            _ => dialogue.fill(0.0),
+        }
 
         for frame in 0..num_samples {
             // Mono downmix of the *dry* Bed for the IS-side detector - Silero is a mono model, and
@@ -1556,13 +1761,12 @@ impl Plugin for ComISAssist {
             // channels is the right reduction. Accumulated here, in the de-interleave pass that
             // has the samples in hand anyway, rather than in a second pass afterwards.
             let mut sum = 0.0;
-            for ch in 0..BED_CHANNELS as usize {
+            for ch in 0..bed_channels {
                 let sample = channels[ch][frame];
-                interleaved_bed[frame * BED_CHANNELS as usize + ch] = sample;
+                interleaved_bed[frame * bed_channels + ch] = sample;
                 sum += sample;
             }
-            mono_bed[frame] = sum / BED_CHANNELS as f32;
-            dialogue[frame] = channels[DIALOGUE_CHANNEL][frame];
+            mono_bed[frame] = sum / bed_channels as f32;
         }
 
         // Feed-forward: Dialogue is measured dry, before anything is applied to it.
@@ -1622,33 +1826,36 @@ impl Plugin for ComISAssist {
             mix_dialogue_into_bed(
                 interleaved_bed,
                 dialogue,
-                BED_CHANNELS,
+                bed_channels as u32,
                 LEFT_CHANNEL,
                 RIGHT_CHANNEL,
-                Some(CENTER_CHANNEL),
+                F::HAS_CENTER.then_some(CENTER_CHANNEL),
                 divergence,
             );
         }
 
         for frame in 0..num_samples {
-            for ch in 0..BED_CHANNELS as usize {
-                channels[ch][frame] = interleaved_bed[frame * BED_CHANNELS as usize + ch];
+            for ch in 0..bed_channels {
+                channels[ch][frame] = interleaved_bed[frame * bed_channels + ch];
             }
-            channels[DIALOGUE_CHANNEL][frame] = dialogue[frame];
         }
-        // Channel 8 (index 7) is always unused/silent, regardless of what the host sent in.
-        channels[UNUSED_CHANNEL][..num_samples].fill(0.0);
 
         ProcessStatus::Normal
     }
 }
 
-impl Vst3Plugin for ComISAssist {
-    const VST3_CLASS_ID: [u8; 16] = *b"ComISAssistDuck1";
+impl<F: BedFormat> Vst3Plugin for ComISAssist<F> {
+    const VST3_CLASS_ID: [u8; 16] = F::CLASS_ID;
+    const VST3_MAIN_BUS_ARRANGEMENT: Option<u64> = Some(F::ARRANGEMENT);
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx, Vst3SubCategory::Dynamics];
 }
 
-nih_export_vst3!(ComISAssist);
+nih_export_vst3!(
+    ComISAssist<Stereo>,
+    ComISAssist<Surround51>,
+    ComISAssist<Surround514>,
+    ComISAssist<Surround712>
+);
 
 #[cfg(test)]
 mod tests {
@@ -1676,7 +1883,7 @@ mod tests {
     /// "is the default right?" is a question the plugin itself cannot answer by inspection.
     #[test]
     fn the_shipped_defaults_are_what_the_specs_say() {
-        let params = ComISAssistParams::default();
+        let params = ComISAssistParams::for_format::<Surround514>();
 
         assert_eq!(params.target_ratio.default_plain_value(), 5.0);
         assert_eq!(params.overvoice_ratio.default_plain_value(), 13.0);
@@ -1698,7 +1905,7 @@ mod tests {
     /// the VST3's defaults are checked against the core's rather than just against themselves.
     #[test]
     fn the_defaults_match_the_shared_core() {
-        let params = ComISAssistParams::default();
+        let params = ComISAssistParams::for_format::<Surround514>();
         let core = AutomixEngineConfig::default();
 
         assert_eq!(params.target_ratio.default_plain_value() as f64, core.target_ratio_lu);
@@ -1712,5 +1919,92 @@ mod tests {
         assert_eq!(depth.center, core.duck_depth.center);
         assert_eq!(depth.lfe, core.duck_depth.lfe);
         assert_eq!(depth.surround, core.duck_depth.surround);
+        assert_eq!(depth.top_front, core.duck_depth.top_front);
+        assert_eq!(depth.top_rear, core.duck_depth.top_rear);
+        assert_eq!(depth.side, core.duck_depth.side);
+        assert_eq!(depth.top_side, core.duck_depth.top_side);
+    }
+
+    fn hidden(param: &FloatParam) -> bool {
+        param.flags().contains(ParamFlags::HIDDEN)
+    }
+
+    /// Each format offers the host exactly the duck-depth groups it has channels for - a hidden
+    /// parameter is also non-automatable, so this is what keeps a stereo session's automation
+    /// list free of controls that would do nothing.
+    #[test]
+    fn each_format_exposes_only_its_own_channel_groups() {
+        fn visible_groups<F: BedFormat>() -> Vec<&'static str> {
+            let params = ComISAssistParams::for_format::<F>();
+            let visible: Vec<_> = params
+                .duck_depth_params()
+                .iter()
+                .zip(BED_GROUP_LABELS)
+                .filter(|(p, _)| !hidden(p))
+                .map(|(_, label)| label)
+                .collect();
+            // The GUI draws `DUCK_GROUPS`; the host sees the unhidden params. They must agree.
+            let drawn: Vec<_> = F::DUCK_GROUPS.iter().map(|&g| BED_GROUP_LABELS[g]).collect();
+            let mut sorted_drawn = drawn.clone();
+            sorted_drawn.sort_by_key(|label| BED_GROUP_LABELS.iter().position(|l| l == label));
+            assert_eq!(visible, sorted_drawn, "{}", F::LABEL);
+            drawn
+        }
+        assert!(visible_groups::<Stereo>().is_empty(), "2.0 has no duck depth at all");
+        assert_eq!(visible_groups::<Surround51>(), ["Front L/R", "Center", "LFE", "Surround L/R"]);
+        assert_eq!(
+            visible_groups::<Surround514>(),
+            ["Front L/R", "Center", "LFE", "Surround L/R", "Top Front L/R", "Top Rear L/R"]
+        );
+        assert_eq!(
+            visible_groups::<Surround712>(),
+            ["Front L/R", "Center", "LFE", "Surround L/R", "Side L/R", "Top Side L/R"]
+        );
+
+        assert!(hidden(&ComISAssistParams::for_format::<Stereo>().divergence), "no Center on 2.0");
+        assert!(!hidden(&ComISAssistParams::for_format::<Surround51>().divergence));
+        assert!(!hidden(&ComISAssistParams::for_format::<Surround514>().divergence));
+        assert!(!hidden(&ComISAssistParams::for_format::<Surround712>().divergence));
+    }
+
+    /// The bus contract: Bed in and out on the main bus at the format's width and exact speaker
+    /// arrangement, COM on one mono sidechain, nothing else.
+    #[test]
+    fn each_format_has_a_bed_main_bus_and_a_mono_sidechain() {
+        fn check<F: BedFormat>(expected_arrangement: u64, expected_channels: u32) {
+            let layouts = <ComISAssist<F> as Plugin>::AUDIO_IO_LAYOUTS;
+            assert_eq!(layouts.len(), 1, "{}: one fixed layout", F::LABEL);
+            let layout = layouts[0];
+            assert_eq!(layout.main_input_channels.map(NonZeroU32::get), Some(expected_channels));
+            assert_eq!(layout.main_output_channels.map(NonZeroU32::get), Some(expected_channels));
+            assert_eq!(layout.aux_input_ports, &[new_nonzero_u32(1)]);
+            assert!(layout.aux_output_ports.is_empty());
+            assert_eq!(
+                <ComISAssist<F> as Vst3Plugin>::VST3_MAIN_BUS_ARRANGEMENT,
+                Some(expected_arrangement),
+                "{}",
+                F::LABEL
+            );
+            // The core's layout must be the same width as the bus, or it would read the wrong
+            // channels.
+            assert_eq!(F::LAYOUT.channel_count(), expected_channels, "{}", F::LABEL);
+        }
+        check::<Stereo>(kStereo, 2);
+        check::<Surround51>(k51, 6);
+        check::<Surround514>(k51_4, 10);
+        check::<Surround712>(k71_2, 10);
+    }
+
+    /// A host tells plugins apart by class ID alone - two formats sharing one would load as each
+    /// other. The 5.1 one is also pinned, since it is what existing sessions were saved with.
+    #[test]
+    fn every_format_has_its_own_class_id() {
+        let ids = [Stereo::CLASS_ID, Surround51::CLASS_ID, Surround514::CLASS_ID, Surround712::CLASS_ID];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(&Surround51::CLASS_ID, b"ComISAssistDuck1");
     }
 }
