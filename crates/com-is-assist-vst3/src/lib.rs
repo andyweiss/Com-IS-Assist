@@ -317,13 +317,24 @@ struct ComISAssistParams {
     /// cannot duck the bed against itself. See `AutomixEngineConfig::com_gate_lufs`.
     #[id = "com-gate-lufs"]
     pub com_gate_lufs: FloatParam,
-    /// "Speed" - the single timing control. Scales every loop stage's ballistics together.
-    /// Replaces the five separate time parameters the old single-loop design needed: with the
-    /// multi-loop cascade the effective attack and release are emergent, so there is nothing
-    /// meaningful left for individual times to set. Raise it if the mixer feels sluggish, lower it
-    /// if it breathes.
-    #[id = "speed"]
-    pub speed: FloatParam,
+    /// "Attack", in milliseconds - the mid stage's attack, with the other stages scaled along.
+    /// See `AutomixEngineConfig::attack_seconds`. Together with `release` this replaced the single
+    /// "Speed" macro, which could only move the way down and the way back together.
+    #[id = "attack-ms"]
+    pub attack_ms: FloatParam,
+    /// "Release", in seconds - the slow stage's release, with the other stages scaled along. See
+    /// `AutomixEngineConfig::release_seconds`.
+    #[id = "release-s"]
+    pub release_s: FloatParam,
+    /// "Tolerance", in LU - how far the programme may stray from the balance before the quick
+    /// stages react. Also the ratio meter's "on target" band. See
+    /// `AutomixEngineConfig::tolerance_lu`.
+    #[id = "tolerance-lu"]
+    pub tolerance_lu: FloatParam,
+    /// "Fast stage" - `false` takes the millisecond stage out of the cascade, for comparing the
+    /// result with and without it. See `AutomixEngineConfig::fast_stage`.
+    #[id = "fast-stage"]
+    pub fast_stage: BoolParam,
     /// "Duck depth" per Bed channel *group*: how much of the computed gain reduction those
     /// channels actually take. `1:1` is the reduction in full (6 dB of ducking reduces them by
     /// 6 dB), `1:0` is no ducking at all. See `com_is_assist_core::automix::DuckDepth`.
@@ -524,35 +535,38 @@ impl ComISAssistParams {
             .with_step_size(1.0)
             .with_value_to_string(formatters::v2s_f32_rounded(0))
             .with_unit(" LUFS"),
-            speed: FloatParam::new(
-                "Speed",
-                automix.speed as f32,
-                // A multiplier, so the useful range is logarithmic: 0.25x to 8x, with unity at the
-                // exact centre of the slider and equal travel either side of it. `Skewed`
-                // unnormalizes as `t^(1/factor)·(max-min) + min`, so the factor that puts 1.0 at
-                // t = 0.5 is `ln(0.5) / ln((1-min)/(max-min))` - derived rather than dialled in, so
-                // unity stays centred if the limits are ever retuned. (The original range passed
-                // `skew_factor(0.0)`, which is 2^0 = 1.0 - i.e. plain linear, despite the comment
-                // claiming otherwise, leaving unity at 20% of the travel.)
-                FloatRange::Skewed {
-                    min: SPEED_MIN,
-                    max: SPEED_MAX,
-                    factor: 0.5_f32.ln() / ((1.0 - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)).ln(),
-                },
+            attack_ms: FloatParam::new(
+                "Attack",
+                (automix.attack_seconds * 1000.0) as f32,
+                centred_skew(ATTACK_MS_MIN, ATTACK_MS_MAX, (automix.attack_seconds * 1000.0) as f32),
             )
-            // Continuous rather than stepped: a fixed step that reads sensibly at 0.06x is far too
-            // fine at 16x. The formatter carries the precision instead, loosening as the value
-            // grows, since a hundredth matters at the bottom of the range and nothing at the top.
-            .with_unit("x")
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(0)),
+            release_s: FloatParam::new(
+                "Release",
+                automix.release_seconds as f32,
+                centred_skew(RELEASE_S_MIN, RELEASE_S_MAX, automix.release_seconds as f32),
+            )
+            .with_unit(" s")
+            // A tenth of a second matters at the short end and nothing at the long one.
             .with_value_to_string(Arc::new(|value| {
-                if value < 1.0 {
-                    format!("{value:.2}")
-                } else if value < 10.0 {
+                if value < 10.0 {
                     format!("{value:.1}")
                 } else {
                     format!("{value:.0}")
                 }
             })),
+            tolerance_lu: FloatParam::new(
+                "Tolerance",
+                automix.tolerance_lu as f32,
+                FloatRange::Linear { min: 0.0, max: 6.0 },
+            )
+            // Half-LU steps rather than the whole units the other level controls use: the useful
+            // settings sit between 1 and 3, where a whole LU is too coarse a step.
+            .with_step_size(0.5)
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" LU"),
+            fast_stage: BoolParam::new("Fast Stage", automix.fast_stage),
             duck_depth_front: duck_depth_param("Front L/R"),
             duck_depth_center: duck_depth_param("Center"),
             duck_depth_lfe: duck_depth_param("LFE"),
@@ -582,7 +596,10 @@ impl ComISAssistParams {
             overvoice_ratio_lu: self.overvoice_ratio.value() as f64,
             max_gain_reduction_db: self.max_gain_reduction_db.value() as f64,
             com_gate_lufs: self.com_gate_lufs.value() as f64,
-            speed: self.speed.value() as f64,
+            attack_seconds: self.attack_ms.value() as f64 / 1000.0,
+            release_seconds: self.release_s.value() as f64,
+            fast_stage: self.fast_stage.value(),
+            tolerance_lu: self.tolerance_lu.value() as f64,
             duck_depth: self.duck_depth(),
         }
     }
@@ -715,16 +732,22 @@ const GAP_BEFORE_RATIO: f32 = BAR_TO_BAR_GAP - SCALE_SPAN - RATIO_SIDE_SLACK;
 /// After the Ratio column (Ratio -> COM).
 const GAP_AFTER_RATIO: f32 = BAR_TO_BAR_GAP - RATIO_SIDE_SLACK;
 
-/// Range of the `speed` macro. The slow end stays at the original 0.25x - below that the mixer is
-/// simply too sluggish to be useful, and a wider sweep only made the usable part of the control
-/// harder to hit. Only the fast end was opened up, 4x to 8x.
-///
-/// Note the practical ceiling is lower than 8x for the *slow* stage - its 3s R128 short-term
-/// measurement only changes so fast, so past a point its ballistics stop being what limits it and
-/// raising `speed` further only sharpens the mid and fast stages. That is not a defect; it is the
-/// cascade behaving as designed.
-const SPEED_MIN: f32 = 0.25;
-const SPEED_MAX: f32 = 8.0;
+/// Range of the Attack control, in ms. The ends correspond to the old Speed macro's 8x and
+/// 0.25x - the range that had been settled on by ear - so nothing reachable before is lost.
+const ATTACK_MS_MIN: f32 = 20.0;
+const ATTACK_MS_MAX: f32 = 600.0;
+/// Range of the Release control, in seconds; likewise the old Speed range (8x to 0.25x of 3s).
+const RELEASE_S_MIN: f32 = 0.4;
+const RELEASE_S_MAX: f32 = 12.0;
+
+/// A skewed range that puts `centre` at the exact middle of the slider's travel. Times want
+/// logarithmic-feeling travel, and the default sitting in the middle gives equal room either side.
+/// `Skewed` unnormalizes as `t^(1/factor)·(max-min) + min`, so the factor that puts `centre` at
+/// t = 0.5 is `ln(0.5) / ln((centre-min)/(max-min))` - derived rather than dialled in, so the
+/// default stays centred if a limit is ever retuned.
+fn centred_skew(min: f32, max: f32, centre: f32) -> FloatRange {
+    FloatRange::Skewed { min, max, factor: 0.5_f32.ln() / ((centre - min) / (max - min)).ln() }
+}
 
 /// Padding either side of the rule dividing the meter bank from the controls column.
 const CONTROLS_GUTTER_PAD: f32 = 20.0;
@@ -764,9 +787,11 @@ const CAPTION_BLOCK_HEIGHT: f32 = CAPTION_NAME_HEIGHT + 11.0;
 const CAPTION_GAP: f32 = 7.0;
 
 
-/// Half-width of the ratio meter's "on target" green band, in LU - a GUI-only readability
-/// threshold - a readability band for the eye, governing nothing in the DSP.
-const RATIO_METER_GREEN_BAND_LU: f32 = 2.0;
+/// The narrowest the ratio meter's "on target" green band is drawn, in LU. The band otherwise
+/// follows the Tolerance control, so the meter and the mixer agree on what "on target" means; at
+/// Tolerance 0 a zero-width band would show every reading as off target, which is no reading at
+/// all.
+const RATIO_METER_MIN_GREEN_BAND_LU: f32 = 1.0;
 
 /// Exact width of the meter bank row, derived from the columns and gaps that make it up rather
 /// than hardcoded - the state badge sits beneath it and must stay flush with it if any column
@@ -1221,7 +1246,10 @@ const PARAMETER_HELP: &[(&str, &str)] = &[
     ("IS voice ratio", "How far the commentary should sit above the bed while the commentator alone is talking. Higher means the bed ducks further."),
     ("Over-voice ratio", "The same, for when there is voice on the bed too - an interview under the commentary needs more headroom to stay intelligible. An absolute target, not an offset."),
     ("Max gain reduction", "A hard floor on how far the bed may ever be pushed down, whatever the ratios ask for."),
-    ("Speed", "How quickly the mixer reacts, as one control. Raise it if it feels sluggish, lower it if it breathes. Ducking is always quicker than recovery; this moves both without losing that."),
+    ("Attack", "How quickly the bed is ducked when it needs to come down. Shorter follows the programme more closely, longer is calmer."),
+    ("Release", "How quickly the bed recovers once it may come back up. Longer keeps the bed down through pauses in the commentary; shorter brings it back sooner."),
+    ("Tolerance", "How far the balance may drift before the mixer reacts quickly. Small fluctuations inside it are left alone, so a mix that only needs a little ducking stays calm. Also the green band on the ratio meter. 0 reacts to everything."),
+    ("Fast stage", "The part of the mixer that reacts within milliseconds to a sudden surge in the bed. Switch it off to compare: without it the mixer is calmer, but a sudden crowd roar takes longer to be caught."),
     ("Voice detect gate", "A level below which voice on the commentary channel is ignored, so bed spill in the commentary mic cannot duck the bed against its own bleed. Set it 20-30 dB under the commentator's normal level - the shaded area on the COM meter shows where it is off."),
     ("Duck depth", "How much of the ducking each part of the bed takes. 1:1 is the full amount, 1:0 none at all. Holding the surrounds, heights and LFE back keeps the commentary clear without flattening the scene. Only the groups this format has are shown."),
     ("Mix dialogue to bed", "Folds the commentary into the bed output, for running the plugin as a bus insert rather than alongside a separate commentary path."),
@@ -1430,7 +1458,9 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                         //            distinct situation from "not loud enough yet", worth its own
                         //            neutral color rather than alarming red)
                         //   red    - positive but under target by more than the green band
-                        //   green  - within +/-RATIO_METER_GREEN_BAND_LU of target (on target)
+                        //   green  - within +/-Tolerance of target (on target) - the same band
+                        //            the mixer itself leaves alone, floored for readability
+                        //            (see `RATIO_METER_MIN_GREEN_BAND_LU`)
                         //   orange - above the green band: COM louder than needed (not wrong, just
                         //            excess headroom)
                         // Deliberately keyed off `ratio_lu` (the signed, real control-loop value),
@@ -1454,11 +1484,12 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                         let com_gate_lufs = params.com_gate_lufs.value();
                         let com_gated_out = com_lufs < com_gate_lufs;
 
+                        let green_band_lu = params.tolerance_lu.value().max(RATIO_METER_MIN_GREEN_BAND_LU);
                         const RATIO_GREEN: egui::Color32 = egui::Color32::from_rgb(0x39, 0xC8, 0x39);
                         const RATIO_ORANGE: egui::Color32 = egui::Color32::from_rgb(224, 140, 32);
                         let ratio_color = if ratio_lu < 0.0 {
                             egui::Color32::from_gray(120)
-                        } else if ratio_lu < target_ratio_lu - RATIO_METER_GREEN_BAND_LU {
+                        } else if ratio_lu < target_ratio_lu - green_band_lu {
                             egui::Color32::from_rgb(224, 32, 32)
                         } else {
                             RATIO_GREEN
@@ -1467,7 +1498,7 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                         // above this is drawn orange - the level up to here is exactly what was
                         // asked for and should still read as on-target.
                         let ratio_excess_from = (ratio_lu >= 0.0)
-                            .then_some(target_ratio_lu + RATIO_METER_GREEN_BAND_LU)
+                            .then_some(target_ratio_lu + green_band_lu)
                             .filter(|threshold| display_ratio_lu > *threshold);
 
                         ui.horizontal(|ui| {
@@ -1583,8 +1614,20 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                                         ui.add(ParamSlider::for_param(&params.max_gain_reduction_db, setter).with_width(CONTROL_SLIDER_WIDTH));
                                         ui.end_row();
 
-                                        control_label(ui, "Speed");
-                                        ui.add(ParamSlider::for_param(&params.speed, setter).with_width(CONTROL_SLIDER_WIDTH));
+                                        for (label, param) in [
+                                            ("Attack", &params.attack_ms),
+                                            ("Release", &params.release_s),
+                                            ("Tolerance", &params.tolerance_lu),
+                                        ] {
+                                            control_label(ui, label);
+                                            ui.add(ParamSlider::for_param(param, setter).with_width(CONTROL_SLIDER_WIDTH));
+                                            ui.end_row();
+                                        }
+
+                                        // In the grid, so the checkbox lines up with the sliders
+                                        // above it rather than with the labels.
+                                        control_label(ui, "Fast stage");
+                                        bool_param_checkbox(ui, setter, &params.fast_stage, "");
                                         ui.end_row();
                                     }));
 
@@ -1876,6 +1919,17 @@ mod tests {
         }
     }
 
+    /// The time controls' defaults must sit at the exact centre of their sliders - that is what
+    /// `centred_skew` is for, and an off-centre default is easy to miss by eye.
+    #[test]
+    fn the_time_defaults_sit_at_the_centre_of_their_sliders() {
+        let params = ComISAssistParams::for_format::<Surround51>();
+        for param in [&params.attack_ms, &params.release_s] {
+            let normalized = param.preview_normalized(param.default_plain_value());
+            assert!((normalized - 0.5).abs() < 1e-4, "{} default sits at {normalized}", param.name());
+        }
+    }
+
     /// Every shipped default in one assertion, pinned where a reader can see them together.
     ///
     /// Worth having because these have now moved more than once, and the GUI gives no clue whether
@@ -1889,7 +1943,10 @@ mod tests {
         assert_eq!(params.overvoice_ratio.default_plain_value(), 13.0);
         assert_eq!(params.max_gain_reduction_db.default_plain_value(), 24.0);
         assert_eq!(params.com_gate_lufs.default_plain_value(), -32.0);
-        assert_eq!(params.speed.default_plain_value(), 1.0);
+        assert_eq!(params.attack_ms.default_plain_value(), 150.0);
+        assert_eq!(params.release_s.default_plain_value(), 3.0);
+        assert_eq!(params.tolerance_lu.default_plain_value(), 2.0);
+        assert!(params.fast_stage.default_plain_value());
         // Centre-only: Dialogue is not spread into L/R unless asked for.
         assert_eq!(params.divergence.default_plain_value(), 0.0);
         assert!(!params.bypass.default_plain_value());
@@ -1912,7 +1969,10 @@ mod tests {
         assert_eq!(params.overvoice_ratio.default_plain_value() as f64, core.overvoice_ratio_lu);
         assert_eq!(params.max_gain_reduction_db.default_plain_value() as f64, core.max_gain_reduction_db);
         assert_eq!(params.com_gate_lufs.default_plain_value() as f64, core.com_gate_lufs);
-        assert_eq!(params.speed.default_plain_value() as f64, core.speed);
+        assert!((params.attack_ms.default_plain_value() as f64 / 1000.0 - core.attack_seconds).abs() < 1e-9);
+        assert_eq!(params.release_s.default_plain_value() as f64, core.release_seconds);
+        assert_eq!(params.tolerance_lu.default_plain_value() as f64, core.tolerance_lu);
+        assert_eq!(params.fast_stage.default_plain_value(), core.fast_stage);
 
         let depth = params.duck_depth();
         assert_eq!(depth.front_lr, core.duck_depth.front_lr);

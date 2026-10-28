@@ -139,7 +139,8 @@ fn main() -> ExitCode {
         eprintln!();
         eprintln!("Config overrides (environment variables, all optional):");
         eprintln!("  COMIS_TARGET_RATIO_LU, COMIS_OVERVOICE_RATIO_LU, COMIS_MAX_GAIN_REDUCTION_DB,");
-        eprintln!("  COMIS_SPEED, COMIS_COM_GATE_LUFS,");
+        eprintln!("  COMIS_ATTACK_SECONDS, COMIS_RELEASE_SECONDS, COMIS_TOLERANCE_LU, COMIS_COM_GATE_LUFS,");
+        eprintln!("  COMIS_FAST_STAGE (0 to switch the fast stage off),");
         eprintln!("  COMIS_DUCK_DEPTH (front,center,lfe,surround,side,top_front,top_rear,top_side as 0-1 factors,");
         eprintln!("    e.g. 1,1,0,0.5),");
         eprintln!("  COMIS_BED_LAYOUT (7.1.2 to read a 10-channel bed as 7.1.2 rather than 5.1.4),");
@@ -186,7 +187,10 @@ fn main() -> ExitCode {
         overvoice_ratio_lu: env_f64("COMIS_OVERVOICE_RATIO_LU", defaults.overvoice_ratio_lu),
         max_gain_reduction_db: env_f64("COMIS_MAX_GAIN_REDUCTION_DB", defaults.max_gain_reduction_db),
         com_gate_lufs: env_f64("COMIS_COM_GATE_LUFS", defaults.com_gate_lufs),
-        speed: env_f64("COMIS_SPEED", defaults.speed),
+        attack_seconds: env_f64("COMIS_ATTACK_SECONDS", defaults.attack_seconds),
+        release_seconds: env_f64("COMIS_RELEASE_SECONDS", defaults.release_seconds),
+        fast_stage: env_f64("COMIS_FAST_STAGE", if defaults.fast_stage { 1.0 } else { 0.0 }) != 0.0,
+        tolerance_lu: env_f64("COMIS_TOLERANCE_LU", defaults.tolerance_lu),
         duck_depth: env_duck_depth(defaults.duck_depth),
     };
 

@@ -3,7 +3,7 @@
 ## What is implemented
 
 Parameters (see `Specs/vstDefinitions.md` for exact names):
-- **Implemented**: IS voice ratio (`target-ratio`, formerly labelled "Com/IS distance"), Voice detect gate (`com-gate-lufs`), Over-voice ratio (`overvoice-ratio`), Speed (`speed`), Voice divergence (`divergence` — restricted to Left/Right/Center, see `mix_dialogue_into_bed`).
+- **Implemented**: IS voice ratio (`target-ratio`, formerly labelled "Com/IS distance"), Voice detect gate (`com-gate-lufs`), Over-voice ratio (`overvoice-ratio`), Attack (`attack-ms`), Release (`release-s`), Tolerance (`tolerance-lu`), Fast stage (`fast-stage`), Voice divergence (`divergence` — restricted to Left/Right/Center, see `mix_dialogue_into_bed`).
 - **"voice detector comm" - implemented, but not as an on/off toggle.** Real voice-activity detection (Silero VAD, via `com_is_assist_core::voice_activity::SileroVad`) gates the ratio/automix control loop directly, replacing the old flat -70dB LUFS-floor "is COM currently silent?" stand-in - see `Specs/TechnicalConcept.md` section 6. Always on, not exposed as a disable-able parameter: turning it off would just reintroduce the exact problem it fixes (Bed getting reduced in response to COM having *some* sound - room tone, static, another open mic - that isn't actually speech).
 - **"voice detector IS" - implemented.** A second, independent `SileroVad` instance runs on a mono downmix of the dry Bed. Like the COM detector it is always on rather than switchable. When it finds voice on the original while Comm is silent, the bed recovers to unity faster than normal; when both carry voice, the higher Over-voice ratio applies. Together the two detectors select the automix state (section 5.1 of `TechnicalConcept.md`).
 
@@ -22,7 +22,7 @@ The mixer does exactly one of four things at any moment, chosen by the two voice
 | no | yes | Bed recovers to unity *faster* (voice on the original is worth hearing) |
 | yes | yes | Bed is ducked until the higher **Over-voice ratio** is met |
 
-How *fast* each of those happens is set by **Speed**, not by per-state times.
+How *fast* each of those happens is set by **Attack** and **Release**, not by per-state times.
 
 ## PARAMETERS
 
@@ -34,8 +34,22 @@ The **? Help** button next to Bypass opens an about/help overlay: the running ve
 
 The version is the GitHub release tag for a released build; a build made locally says "dev build" instead, so it is always clear which one is running.
 
-# Speed
-How quickly the mixer responds, as a single control. There are no separate attack/release times: the leveling is built from three control loops at different speeds (a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges), and the resulting attack and release behaviour emerges from how they interact. Long and gentle when the programme is steady, very quick when something jumps. Speed scales all three together: raise it if the mix feels sluggish, lower it if it breathes. Ducking is always far quicker than recovery - the fast loop bites immediately while the recovery is carried by the slow loop - so this one control moves the whole envelope without losing that fast-down/slow-up character. The pause tolerance that keeps the bed down through sentence gaps is fixed in real time, so recovery stays cushioned even at high Speed. The range runs from 0.25x to 8x with 1x at the centre of the control. Towards the top end the slow loop stops being the limit - its 3-second loudness measurement only changes so fast - so the highest settings mainly sharpen the two faster loops.
+# Attack and Release
+How quickly the mixer ducks (Attack) and how quickly it recovers (Release), set separately.
+
+The leveling is built from three control loops at different speeds: a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges. **Attack** is the time of the loop you hear ducking, the one that follows the bed: 150 ms by default, 20-600 ms. **Release** is the time of the loop you hear recovering, the slow one that holds most of the reduction: 3 s by default, 0.4-12 s. The other loops scale along, so the mixer keeps its character, biting immediately on a surge and settling in behind it, at every setting. The defaults sit in the middle of each control.
+
+The pause tolerance that keeps the bed down through sentence gaps is fixed in real time, so recovery stays cushioned even at a short Release.
+
+# Tolerance
+How far the balance may drift before the mixer reacts quickly. 2 LU by default, 0-6 LU.
+
+The two quicker loops are built to grab fast and let go slowly. On a programme whose level moves around, that makes them ride the peaks, so a mix that needs only a little ducking used to get considerably more, and the gain kept moving. Small fluctuations inside the tolerance are now left alone, and only larger ones are acted on (less the tolerance). A genuine surge is still caught. The overall balance is never affected: the slow loop still holds the ratio exactly.
+
+The ratio meter's green "on target" band follows this control (at least 1 LU wide, so it stays readable), so the meter and the mixer agree on what "on target" means. 0 reacts to every fluctuation, which was the behaviour before this control existed.
+
+# Fast stage
+Switches the very fast loop on or off. On by default. It reacts within milliseconds to a sudden surge in the bed, such as a crowd roar, before the slower loops have noticed it. That is also what makes the mixer busy: switched off, the gain moves roughly half as much, but a sudden surge takes up to a few hundred milliseconds longer to be caught. It is a switch so the two can be compared on the actual programme.
 
 # Duck depth (per bed channel group)
 How much of the ducking each group of bed channels gets, as a ratio. At 1:1 the group takes the full reduction - if the mixer decides on 6 dB, those channels come down 6 dB. At 1:0 they are left alone entirely, however hard the rest of the bed is being held down. Anything between scales it proportionally, so 1:0.5 of a 6 dB reduction is 3 dB.

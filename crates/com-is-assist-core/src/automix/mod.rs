@@ -11,7 +11,9 @@ pub use automix_engine::{
     AutomixEngine, AutomixEngineConfig, AutomixResult, DuckDepth, LoudnessSnapshot, MAX_BED_CHANNELS,
 };
 pub use k_weighted_loudness::KWeightedLoudnessMeter;
-pub use loop_bank::{LoopBank, LoopBankConfig, LoopContributions};
+pub use loop_bank::{
+    LoopBank, LoopBankConfig, LoopContributions, REFERENCE_ATTACK_SECONDS, REFERENCE_RELEASE_SECONDS,
+};
 pub use mix_state::MixState;
 pub use dialogue_mix::mix_dialogue_into_bed;
 pub use envelope_detector::EnvelopeDetector;

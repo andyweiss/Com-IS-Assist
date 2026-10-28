@@ -1,6 +1,6 @@
 use super::envelope_detector::EnvelopeDetector;
 
-/// Time constants for one stage of the cascade, in seconds at Speed = 1.0.
+/// Time constants for one stage of the cascade, in seconds at the default Attack and Release.
 #[derive(Debug, Clone, Copy)]
 struct Ballistics {
     attack_seconds: f64,
@@ -29,6 +29,19 @@ const MID: Ballistics = Ballistics { attack_seconds: 0.15, release_seconds: 0.6 
 /// tick or two, modulating the Bed at syllable rate. A transient catcher wants to grab quickly and
 /// let go slowly, so that what it responds to is *onsets* rather than the shape of every vowel.
 const FAST: Ballistics = Ballistics { attack_seconds: 0.005, release_seconds: 0.4 };
+
+/// The stage each user-facing time control is expressed against: **Attack** is the mid stage's
+/// attack and **Release** the slow stage's release, and every other stage's constant scales by the
+/// same ratio.
+///
+/// Those two because they are what is heard. On the way down the fast stage only catches onsets
+/// (it is a bounded, positive-only trim) and the slow stage arrives seconds later underneath; the
+/// ducking that follows the programme is the mid stage's. On the way back recovery is governed by
+/// the slow stage, which holds most of the reduction. Scaling the other stages along keeps their
+/// ratios - and so the cascade's shape - intact, while the number on the control stays a real time
+/// rather than a multiplier.
+pub const REFERENCE_ATTACK_SECONDS: f64 = MID.attack_seconds;
+pub const REFERENCE_RELEASE_SECONDS: f64 = SLOW.release_seconds;
 
 /// Over how long the release eases in after ducking stops.
 ///
@@ -64,26 +77,33 @@ const INTERVIEW_RELEASE_SPEEDUP: f64 = 4.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LoopBankConfig {
-    /// The "Speed" macro: scales every stage's time constants together. >1 is faster, <1 calmer.
-    /// One control replaces the five separate time parameters the single-loop design needed.
-    pub speed: f64,
+    /// Multiplier on every stage's **attack** time constant: 2.0 is twice as slow, 0.5 twice as
+    /// quick. See [`REFERENCE_ATTACK_SECONDS`].
+    pub attack_scale: f64,
+    /// Multiplier on every stage's **release** time constant. See [`REFERENCE_RELEASE_SECONDS`].
+    pub release_scale: f64,
     pub max_gain_reduction_db: f64,
     /// How far the mid stage may trim the slow stage's estimate, in dB either way.
     pub mid_authority_db: f64,
     /// How far the fast stage may trim slow+mid. Set to 0.0 to disable the fast stage entirely.
     pub fast_authority_db: f64,
+    /// Tolerance of the two trim stages, in dB: a deviation from the slower stages' answer within
+    /// this band is ignored, and only what lies beyond it is acted on.
+    pub trim_dead_band_db: f64,
 }
 
 impl Default for LoopBankConfig {
     fn default() -> Self {
         Self {
-            speed: 1.0,
+            attack_scale: 1.0,
+            release_scale: 1.0,
             max_gain_reduction_db: 24.0,
             mid_authority_db: 6.0,
             // Smaller than the mid stage's: this one moves in milliseconds, so the audible cost of
             // it being wrong is higher. 4dB is enough to catch an onset before the 400ms window has
             // noticed it, without being enough to dominate.
             fast_authority_db: 4.0,
+            trim_dead_band_db: 0.0,
         }
     }
 }
@@ -155,24 +175,17 @@ impl LoopBank {
 
     /// Attack and release times for one stage.
     ///
-    /// **`speed` scales both sides**, and that is safe precisely because the fast-attack /
-    /// slow-release asymmetry is *structural* rather than something the control has to impose:
-    ///
-    /// - On the way down, the fast stage engages in milliseconds, mid in ~150ms and slow in ~800ms,
-    ///   so the cascade bites immediately and then firms up.
-    /// - On the way back, recovery is governed by the **slow** stage's constant alone - the whole
-    ///   cascade decays by one factor derived from `SLOW` (see `update_release`), and most of the
-    ///   reduction lives in that stage anyway - so it is ~4x longer than even the slowest attack.
-    ///
-    /// Scaling both therefore moves the whole envelope without flattening it: the release/attack
-    /// ratio is identical at every setting. Scaling only the attack was tried, and while it does
-    /// stop a high `speed` producing a quick recovery, it distorts the shape the cascade was built
-    /// to have and costs the user the single honest control.
+    /// The two sides scale **independently**: `attack_scale` moves every stage's attack together and
+    /// `release_scale` every stage's release. Within one side the stages keep their ratios, so the
+    /// cascade still bites in milliseconds and firms up behind; what the user changes is how the
+    /// way down compares with the way back. (This replaced a single "Speed" macro that scaled both
+    /// sides by one factor - it preserved the shape but could not, say, make recovery slower
+    /// without also making the duck slower, which is the adjustment most often asked for.)
     fn scaled(&self, ballistics: Ballistics) -> (f64, f64) {
-        let speed = self.config.speed.max(0.01);
         (
-            ballistics.attack_seconds / speed,
-            ballistics.release_seconds * self.release_stretch() / (speed * self.release_speedup),
+            ballistics.attack_seconds * self.config.attack_scale.max(0.01),
+            ballistics.release_seconds * self.config.release_scale.max(0.01) * self.release_stretch()
+                / self.release_speedup,
         )
     }
 
@@ -190,6 +203,12 @@ impl LoopBank {
 
     fn clamp_authority(value: f64, authority_db: f64) -> f64 {
         value.clamp(-authority_db, authority_db)
+    }
+
+    /// Soft threshold: zero within `±dead_band`, and shifted toward zero by it outside, so the
+    /// response is continuous at the band's edges rather than jumping by the band's width.
+    fn outside_dead_band(value: f64, dead_band: f64) -> f64 {
+        value.signum() * (value.abs() - dead_band).max(0.0)
     }
 
     /// Steps the slow and mid stages. Call once per control tick with the reductions required by
@@ -216,7 +235,8 @@ impl LoopBank {
         }
 
         if let Some(required) = required_mid_db {
-            let target = Self::clamp_authority(required - self.slow.value(), self.config.mid_authority_db);
+            let error = Self::outside_dead_band(required - self.slow.value(), self.config.trim_dead_band_db);
+            let target = Self::clamp_authority(error, self.config.mid_authority_db);
             let (attack, release) = self.scaled(MID);
             self.mid.process(target, attack, release, dt_seconds);
         }
@@ -264,7 +284,8 @@ impl LoopBank {
                 // Clamping at zero instead of going negative is what turns this from an envelope
                 // follower into a transient catcher.
                 let coarse = self.slow.value() + self.mid.value();
-                (required - coarse).clamp(0.0, self.config.fast_authority_db)
+                Self::outside_dead_band(required - coarse, self.config.trim_dead_band_db)
+                    .clamp(0.0, self.config.fast_authority_db)
             }
         };
         let (attack, release) = self.scaled(FAST);

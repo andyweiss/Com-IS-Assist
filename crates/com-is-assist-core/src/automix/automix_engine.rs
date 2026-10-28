@@ -1,4 +1,6 @@
-use super::loop_bank::{LoopBank, LoopBankConfig, LoopContributions};
+use super::loop_bank::{
+    LoopBank, LoopBankConfig, LoopContributions, REFERENCE_ATTACK_SECONDS, REFERENCE_RELEASE_SECONDS,
+};
 use super::mix_state::MixState;
 use crate::loudness::{BedLayout, Ebur128Meter};
 
@@ -42,12 +44,32 @@ pub struct AutomixEngineConfig {
     /// protect nothing. Useful settings are typically 20-30 dB below the commentator's own
     /// momentary level.
     pub com_gate_lufs: f64,
-    /// The "Speed" macro — scales every stage's ballistics together. This is the *only* timing
-    /// control, replacing the five separate time parameters (`adaptation`/`attack`/`hold`/
-    /// `release`/`interview-release`) the single-loop design needed: with the multi-loop cascade
-    /// the effective attack and release are emergent, so the individual times had nothing
-    /// meaningful left to set.
-    pub speed: f64,
+    /// **Attack**, in seconds: the mid stage's attack time constant, with the slow and fast stages'
+    /// attacks scaled by the same ratio (see [`REFERENCE_ATTACK_SECONDS`] for why the mid stage is
+    /// the one named). Default 0.15s.
+    pub attack_seconds: f64,
+    /// **Release**, in seconds: the slow stage's release time constant, with the mid and fast
+    /// stages' releases scaled by the same ratio (see [`REFERENCE_RELEASE_SECONDS`]). Default 3s.
+    ///
+    /// The release ease-in after ducking stops (`RELEASE_HOLD_SECONDS`) and the faster interview
+    /// recovery are fixed proportions on top of this, not separate settings.
+    pub release_seconds: f64,
+    /// `false` takes the fast stage out of the cascade altogether, leaving slow + mid. For A/B
+    /// comparison: the fast stage is the one that reacts within milliseconds to a Bed surge, and
+    /// whether that is worth its audible activity depends on the material.
+    pub fast_stage: bool,
+    /// **Tolerance**, in LU: how far the programme may stray from the slow stage's answer before
+    /// the mid and fast stages react. Only what lies beyond it is acted on (a soft threshold), so
+    /// a real surge still gets through, minus this amount.
+    ///
+    /// It exists because both trim stages are, by design, quick to grab and slow to let go - and a
+    /// follower like that sits *above* a fluctuating input, acting as a peak detector. Its excess
+    /// therefore scales with how much the Bed's level fluctuates, not with how much ducking is
+    /// needed: measured on real programme, a balance needing ~2 dB was getting 4.8 dB on average
+    /// and travelling 8 dB/s. Inside the tolerance there is nothing to follow, so that excess goes
+    /// away while large corrections are left alone. 0 is the pre-feature behaviour. The slow stage
+    /// is never subject to it - it is the answer the tolerance is measured against.
+    pub tolerance_lu: f64,
     /// How much of the computed gain reduction each group of Bed channels receives - see
     /// [`DuckDepth`].
     pub duck_depth: DuckDepth,
@@ -165,7 +187,14 @@ impl Default for AutomixEngineConfig {
             // point on real commentary: comfortably under a commentator's own momentary level,
             // comfortably over the bed's bleed into the mic.
             com_gate_lufs: -32.0,
-            speed: 1.0,
+            attack_seconds: REFERENCE_ATTACK_SECONDS,
+            release_seconds: REFERENCE_RELEASE_SECONDS,
+            fast_stage: true,
+            // The same 2 LU the ratio meter has always drawn as "on target" - now the mixer agrees
+            // with it. Measured on real programme needing ~2 dB: mean reduction 4.8 -> 3.6 dB,
+            // gain travel 8.3 -> 4.7 dB/s (3 LU: 3.1 dB, 3.5 dB/s, at the cost of letting more of
+            // a genuine surge through).
+            tolerance_lu: 2.0,
             duck_depth: DuckDepth::default(),
         }
     }
@@ -234,10 +263,14 @@ impl AutomixEngine {
     }
 
     fn loop_config(config: &AutomixEngineConfig) -> LoopBankConfig {
+        let defaults = LoopBankConfig::default();
         LoopBankConfig {
-            speed: config.speed,
+            attack_scale: config.attack_seconds / REFERENCE_ATTACK_SECONDS,
+            release_scale: config.release_seconds / REFERENCE_RELEASE_SECONDS,
             max_gain_reduction_db: config.max_gain_reduction_db,
-            ..LoopBankConfig::default()
+            fast_authority_db: if config.fast_stage { defaults.fast_authority_db } else { 0.0 },
+            trim_dead_band_db: config.tolerance_lu.max(0.0),
+            ..defaults
         }
     }
 

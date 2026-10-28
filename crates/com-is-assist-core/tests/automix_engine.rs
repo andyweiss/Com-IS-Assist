@@ -155,67 +155,150 @@ fn the_mid_stage_authority_bounds_how_far_momentary_can_pull_the_total() {
     );
 }
 
-/// The Speed macro is the only timing control left, so it has to do something measurable.
+fn with_times(attack_seconds: f64, release_seconds: f64) -> AutomixEngineConfig {
+    AutomixEngineConfig { attack_seconds, release_seconds, ..Default::default() }
+}
+
+/// Ducks to a steady answer, then releases for `release_ticks` and returns where it got to.
+fn duck_then_release(config: AutomixEngineConfig, release_ticks: usize) -> (f64, f64) {
+    let snap = snapshot(-20.0, -26.0);
+    let mut engine = engine_with(config);
+    let ducked = run(&mut engine, 600, snap, true, false);
+    let released = run(&mut engine, release_ticks, snap, false, false);
+    (ducked, released)
+}
+
+/// Attack has to do something measurable.
 ///
 /// Measured early (200ms) deliberately: by ~800ms both settings have essentially arrived, because
 /// the mid stage rushes in to cover whatever the slow stage has not yet done. That masking is the
 /// cascade working as intended - it is also why "how fast is it?" has to be asked of the first few
 /// hundred milliseconds rather than of the settled value.
 #[test]
-fn a_higher_speed_setting_reacts_faster() {
+fn a_shorter_attack_reacts_faster() {
     let snap = snapshot(-20.0, -26.0);
-    let mut slow = engine_with(AutomixEngineConfig { speed: 0.5, ..Default::default() });
-    let mut fast = engine_with(AutomixEngineConfig { speed: 4.0, ..Default::default() });
+    let mut calm = engine_with(with_times(0.3, 3.0));
+    let mut quick = engine_with(with_times(0.0375, 3.0));
 
-    let slow_db = run(&mut slow, 2, snap, true, false);
-    let fast_db = run(&mut fast, 2, snap, true, false);
+    let calm_db = run(&mut calm, 2, snap, true, false);
+    let quick_db = run(&mut quick, 2, snap, true, false);
 
     assert!(
-        fast_db > slow_db * 1.5,
-        "after 200ms speed 4.0 reached {fast_db}dB where speed 0.5 reached {slow_db}dB"
+        quick_db > calm_db * 1.5,
+        "after 200ms a 37.5ms attack reached {quick_db}dB where a 300ms attack reached {calm_db}dB"
     );
 }
 
-/// Both settings must still converge on the same place - Speed changes how quickly the mixer gets
-/// there, never where "there" is. (Feed-forward is what makes that separation clean.)
+/// Attack changes how quickly the mixer gets there, never where "there" is. (Feed-forward is what
+/// makes that separation clean.)
 #[test]
-fn speed_changes_the_journey_not_the_destination() {
+fn attack_changes_the_journey_not_the_destination() {
     let snap = snapshot(-20.0, -26.0);
-    let mut slow = engine_with(AutomixEngineConfig { speed: 0.5, ..Default::default() });
-    let mut fast = engine_with(AutomixEngineConfig { speed: 4.0, ..Default::default() });
+    let mut calm = engine_with(with_times(0.3, 3.0));
+    let mut quick = engine_with(with_times(0.0375, 3.0));
 
-    let slow_db = run(&mut slow, 600, snap, true, false);
-    let fast_db = run(&mut fast, 600, snap, true, false);
+    let calm_db = run(&mut calm, 600, snap, true, false);
+    let quick_db = run(&mut quick, 600, snap, true, false);
 
     let expected = required(&AutomixEngineConfig::default(), -20.0, -26.0);
-    assert!((slow_db - fast_db).abs() < 0.1, "settled at {slow_db}dB vs {fast_db}dB");
-    assert!((slow_db - expected).abs() < 0.1, "both should land on the dry-level answer {expected}dB, got {slow_db}dB");
+    assert!((calm_db - quick_db).abs() < 0.1, "settled at {calm_db}dB vs {quick_db}dB");
+    assert!((calm_db - expected).abs() < 0.1, "both should land on the dry-level answer {expected}dB, got {calm_db}dB");
 }
 
-/// Guards the ends of the Speed range (0.25x-8x in both wrappers). The extremes are the settings
-/// most likely to expose a numerical problem - 8x drives the fast stage's time constant to well
-/// under a millisecond, below the sub-chunk step that advances it, and 0.25x stretches the slow
-/// stage's release to 12s - so both ends are checked for a finite, in-range result rather than
-/// trusted to behave because the middle of the range does.
+/// The point of splitting the old Speed macro: Release must move recovery on its own. A longer
+/// release holds more of the reduction after the same time...
 #[test]
-fn the_speed_extremes_stay_well_behaved() {
-    let snap = snapshot(-20.0, -26.0);
-    for speed in [0.25, 8.0] {
-        let mut engine = engine_with(AutomixEngineConfig { speed, ..Default::default() });
-        let db = run(&mut engine, 600, snap, true, false);
-        assert!(db.is_finite(), "speed {speed}x produced a non-finite reduction: {db}");
-        assert!(
-            (0.0..=AutomixEngineConfig::default().max_gain_reduction_db).contains(&db),
-            "speed {speed}x left the reduction outside its bounds: {db}dB"
-        );
-    }
+fn a_longer_release_recovers_more_slowly() {
+    // 3s into the release - well past the ease-in, well before either has fully recovered.
+    let (ducked, quick) = duck_then_release(with_times(0.15, 1.5), 30);
+    let (_, slow) = duck_then_release(with_times(0.15, 6.0), 30);
 
-    // 8x must still land on the same feed-forward answer as 1x - Speed is a journey control, and
-    // opening up the top of the range must not have made it change the destination.
-    let mut quick = engine_with(AutomixEngineConfig { speed: 8.0, ..Default::default() });
-    let settled = run(&mut quick, 600, snap, true, false);
+    assert!(ducked > 2.0, "need a real reduction to release from, got {ducked}dB");
+    assert!(slow > quick + 1.0, "after 3s a 6s release held {slow}dB, a 1.5s release {quick}dB");
+}
+
+/// ...and must not be affected by Attack, nor Attack by it. Under the old single macro these could
+/// only move together.
+#[test]
+fn attack_and_release_are_independent() {
+    let (_, release_after_quick_attack) = duck_then_release(with_times(0.0375, 3.0), 30);
+    let (_, release_after_calm_attack) = duck_then_release(with_times(0.3, 3.0), 30);
+    assert!(
+        (release_after_quick_attack - release_after_calm_attack).abs() < 0.05,
+        "attack changed the release: {release_after_quick_attack}dB vs {release_after_calm_attack}dB"
+    );
+
+    let snap = snapshot(-20.0, -26.0);
+    let mut short_release = engine_with(with_times(0.15, 0.4));
+    let mut long_release = engine_with(with_times(0.15, 12.0));
+    let a = run(&mut short_release, 2, snap, true, false);
+    let b = run(&mut long_release, 2, snap, true, false);
+    assert!((a - b).abs() < 1e-9, "release changed the attack: {a}dB vs {b}dB");
+}
+
+/// Guards the ends of both ranges (Attack 20-600ms, Release 0.4-12s, as the wrappers expose
+/// them). The extremes are the settings most likely to expose a numerical problem - the quickest
+/// attack drives the fast stage's time constant below the sub-chunk step that advances it - so
+/// they are checked for a finite, in-range result rather than trusted to behave because the
+/// middle of the range does.
+#[test]
+fn the_time_extremes_stay_well_behaved() {
+    let snap = snapshot(-20.0, -26.0);
     let expected = required(&AutomixEngineConfig::default(), -20.0, -26.0);
-    assert!((settled - expected).abs() < 0.1, "speed 8x settled at {settled}dB, expected the {expected}dB dry answer");
+    for (attack, release) in [(0.02, 0.4), (0.02, 12.0), (0.6, 0.4), (0.6, 12.0)] {
+        let mut engine = engine_with(with_times(attack, release));
+        let db = run(&mut engine, 600, snap, true, false);
+        assert!(db.is_finite(), "attack {attack}s / release {release}s produced {db}");
+        assert!(
+            (db - expected).abs() < 0.1,
+            "attack {attack}s / release {release}s settled at {db}dB, expected the {expected}dB dry answer"
+        );
+        let released = run(&mut engine, 600, snap, false, false);
+        assert!((0.0..=db).contains(&released), "release went out of bounds: {released}dB");
+    }
+}
+
+/// Switching the fast stage off must take it out entirely - for an A/B comparison, anything left
+/// over would be the thing being compared.
+#[test]
+fn the_fast_stage_can_be_switched_off() {
+    let fast_contribution = |fast_stage: bool| {
+        let mut engine = engine_with(AutomixEngineConfig { fast_stage, ..Default::default() });
+        run(&mut engine, 50, snapshot(-20.0, -26.0), true, false);
+        engine.set_state_from_vad(true, false);
+        // A 6 dB Bed surge seen only by the fast detector, for 100ms of sub-chunks.
+        for _ in 0..75 {
+            engine.process_fast(-14.0, -26.0, 64.0 / 48_000.0);
+        }
+        engine.contributions().fast_db
+    };
+    assert!(fast_contribution(true) > 1.0, "the fast stage should catch a surge when on");
+    assert_eq!(fast_contribution(false), 0.0, "the fast stage must contribute nothing when off");
+}
+
+/// Tolerance: a deviation inside the band moves neither trim stage, and one beyond it is acted on
+/// minus the band - a soft threshold, so there is no jump at the band's edge.
+#[test]
+fn the_trim_stages_ignore_deviations_within_the_tolerance() {
+    let fast_after_surge = |tolerance_lu: f64, surge_db: f64| {
+        let mut engine = engine_with(AutomixEngineConfig { tolerance_lu, ..Default::default() });
+        // Settled first, so the surge is the only deviation the fast stage sees.
+        run(&mut engine, 600, snapshot(-20.0, -26.0), true, false);
+        engine.set_state_from_vad(true, false);
+        for _ in 0..750 {
+            engine.process_fast(-20.0 + surge_db, -26.0, 64.0 / 48_000.0);
+        }
+        engine.contributions().fast_db
+    };
+    assert!(fast_after_surge(2.0, 1.5) < 1e-9, "a 1.5 dB surge is inside a 2 LU tolerance");
+    assert!((fast_after_surge(2.0, 3.0) - 1.0).abs() < 0.05, "3 dB beyond a 2 LU band is 1 dB");
+    assert!((fast_after_surge(0.0, 3.0) - 3.0).abs() < 0.05, "no tolerance takes all of it");
+
+    // The mid stage likewise: a 400ms-window excursion inside the band leaves it at zero.
+    let mut engine = engine_with(AutomixEngineConfig { tolerance_lu: 2.0, ..Default::default() });
+    let snap = LoudnessSnapshot { bed_momentary_lufs: -18.5, ..snapshot(-20.0, -26.0) };
+    run(&mut engine, 600, snap, true, false);
+    assert!(engine.contributions().mid_db.abs() < 1e-6, "{:?}", engine.contributions());
 }
 
 /// Adaptive ballistics: the fast stage must move long before the slow stage has, which is the
