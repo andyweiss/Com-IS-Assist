@@ -1,5 +1,5 @@
 //! Measures how busy the gain is when the mix only needs a *small* reduction - the complaint being
-//! that the plugin does "quite a lot" even then - and how much of that comes from each stage.
+//! that the plugin does "quite a lot" even then - and how that depends on Attack and Release.
 //!
 //! `cargo run --release --example subtle_reduction -- <com.wav> <bed.wav>... [--seconds N]
 //!     [--start S] [--com-gain dB,dB,...]`
@@ -10,9 +10,9 @@
 //! COM shifted by each amount, which moves the *needed* reduction without changing the material:
 //! raising COM by 6 dB lowers the reduction the ratio asks for by 6 dB.
 //!
-//! The needed reduction is taken to be the slow stage's value - its 3s answer is the programme
-//! balance; everything the mid and fast stages add on top is movement around it. Results are
-//! bucketed by that value, so "subtle" can be read off directly.
+//! The needed reduction is the feed-forward answer on the 3s window, `target - (COM - BED)` -
+//! the programme balance, independent of how the mixer is configured, so every variant is judged
+//! against the same thing. Results are bucketed by it, so "subtle" can be read off directly.
 //!
 //! COM voice comes from the real detector, through the same guard band the plugin uses; IS voice is
 //! held off, so only the ordinary duck/release states are exercised.
@@ -67,12 +67,10 @@ fn profile(paths: &[String]) {
 struct Bucket {
     blocks: u64,
     gr: f64,
-    slow: f64,
-    mid: f64,
-    fast: f64,
+    needed: f64,
     /// Sum of |GR change| between blocks, in dB: how much the gain moves.
     travel: f64,
-    /// Sum of (GR - slow)^2, for the RMS movement around the needed reduction.
+    /// Sum of (GR - needed)^2, for the RMS movement around the needed reduction.
     deviation_sq: f64,
 }
 
@@ -84,7 +82,7 @@ struct Run {
 
 fn run(com: &[f32], bed: &[f32], channels: usize, rate: u32, config: AutomixEngineConfig, vad_flags: &[bool]) -> Run {
     let mut processor =
-        AutomixProcessor::new(channels as u32, rate, config, 0.1).expect("bed channel count supported");
+        AutomixProcessor::new(channels as u32, rate, config).expect("bed channel count supported");
     let mut buckets = [Bucket::default(); BUCKETS.len()];
     let (mut ducking_blocks, mut total_blocks) = (0, 0);
     let mut previous_gr = 0.0;
@@ -95,22 +93,21 @@ fn run(com: &[f32], bed: &[f32], channels: usize, rate: u32, config: AutomixEngi
         processor.set_voice_activity(active, false);
         bed_block.copy_from_slice(&bed[start * channels..(start + BLOCK) * channels]);
         processor.process_bed(&mut bed_block).expect("bed");
-        processor.maybe_run_control_step(active, false);
 
         let gr = processor.applied_gain_reduction_db();
-        let c = processor.contributions();
         total_blocks += 1;
         if processor.mix_state() == MixState::DuckToTarget {
             ducking_blocks += 1;
-            let index = BUCKETS.iter().position(|edge| c.slow_db < *edge).unwrap();
+            // `applied_ratio_lu` is the dry 3s ratio plus the applied reduction.
+            let dry_ratio = processor.applied_ratio_lu() - gr;
+            let needed = (processor.active_target_ratio_lu() - dry_ratio).max(0.0);
+            let index = BUCKETS.iter().position(|edge| needed < *edge).unwrap();
             let b = &mut buckets[index];
             b.blocks += 1;
             b.gr += gr;
-            b.slow += c.slow_db;
-            b.mid += c.mid_db;
-            b.fast += c.fast_db;
+            b.needed += needed;
             b.travel += (gr - previous_gr).abs();
-            b.deviation_sq += (gr - c.slow_db).powi(2);
+            b.deviation_sq += (gr - needed).powi(2);
         }
         previous_gr = gr;
     }
@@ -123,7 +120,7 @@ fn report(label: &str, run: &Run, rate: u32) {
         "  {label}  (ducking {:.0}% of the time)",
         100.0 * run.ducking_blocks as f64 / run.total_blocks.max(1) as f64
     );
-    println!("    needed     time   mean GR   slow    mid   fast   movement  travel");
+    println!("    needed     time  needed  mean GR   movement  travel");
     let mut lower = 0.0;
     for (edge, b) in BUCKETS.iter().zip(run.buckets) {
         let range = if edge.is_finite() { format!("{lower:.0}-{edge:.0} dB") } else { format!(">{lower:.0} dB") };
@@ -134,12 +131,10 @@ fn report(label: &str, run: &Run, rate: u32) {
         }
         let n = b.blocks as f64;
         println!(
-            "    {range:8} {:5.0}s  {:6.2}  {:6.2} {:+6.2} {:6.2}   {:5.2} dB  {:5.1} dB/s",
+            "    {range:8} {:5.0}s  {:6.2}  {:6.2}   {:5.2} dB  {:5.1} dB/s",
             n * seconds_per_block,
+            b.needed / n,
             b.gr / n,
-            b.slow / n,
-            b.mid / n,
-            b.fast / n,
             (b.deviation_sq / n).sqrt(),
             b.travel / (n * seconds_per_block),
         );
@@ -205,12 +200,16 @@ fn main() {
         })
         .collect();
 
-    let tolerance = |tolerance_lu| AutomixEngineConfig { tolerance_lu, ..Default::default() };
+    let times = |attack_seconds, release_seconds| AutomixEngineConfig {
+        attack_seconds,
+        release_seconds,
+        ..Default::default()
+    };
     let variants = [
-        ("tolerance 0 LU (v2.0.0 behaviour)", tolerance(0.0)),
-        ("default (tolerance 2 LU)", AutomixEngineConfig::default()),
-        ("default, fast stage off", AutomixEngineConfig { fast_stage: false, ..Default::default() }),
-        ("tolerance 3 LU", tolerance(3.0)),
+        ("attack 0.15s / release 3s", times(0.15, 3.0)),
+        ("attack 1s / release 3s", times(1.0, 3.0)),
+        ("attack 2.5s / release 3s (default)", AutomixEngineConfig::default()),
+        ("attack 5s / release 3s", times(5.0, 3.0)),
     ];
     for gain_db in com_gains {
         let gain = 10f32.powf(gain_db as f32 / 20.0);
@@ -221,7 +220,7 @@ fn main() {
         }
         println!();
     }
-    println!("needed   = the slow stage's value (the 3s programme balance), by bucket");
-    println!("movement = RMS of (GR - slow): how far the gain strays from the needed reduction");
+    println!("needed   = target - (COM - BED) on the 3s window: the programme balance, by bucket");
+    println!("movement = RMS of (GR - needed): how far the gain strays from the needed reduction");
     println!("travel   = total gain change per second while ducking");
 }

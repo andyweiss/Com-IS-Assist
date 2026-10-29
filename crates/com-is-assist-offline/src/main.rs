@@ -1,6 +1,6 @@
 // Offline validation CLI (see Specs/TechnicalConcept.md): feeds a Bed + Dialogue WAV pair through
-// the shared `AutomixProcessor` - the same multi-loop, feed-forward DSP both plugin wrappers use -
-// and prints per-tick measurements as CSV, including what each loop stage is contributing.
+// the shared `AutomixProcessor` - the same feed-forward DSP the plugin uses - and prints
+// measurements as CSV, one row per 100ms.
 // Optionally renders leveled-Bed/Mix WAVs so the result can actually be listened to.
 //
 // Every tunable is overridable from the environment (see `env_f64`) so a settings sweep can be
@@ -14,9 +14,8 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-/// 100ms control tick, matching BS.1770's own gating-block granularity - the R128 readings do not
-/// update faster than this, so there is nothing to gain from a shorter one. (The fast loop runs far
-/// more often than this, inside `AutomixProcessor`.)
+/// How much audio is read, processed and reported per CSV row. Only the reporting cadence: inside
+/// `AutomixProcessor` the gain loop steps every ~1.3ms sub-chunk regardless.
 const TICK_SECONDS: f64 = 0.1;
 
 /// Reads one interleaved tick's worth of frames as normalized f32, whatever the file's format.
@@ -139,8 +138,8 @@ fn main() -> ExitCode {
         eprintln!();
         eprintln!("Config overrides (environment variables, all optional):");
         eprintln!("  COMIS_TARGET_RATIO_LU, COMIS_OVERVOICE_RATIO_LU, COMIS_MAX_GAIN_REDUCTION_DB,");
-        eprintln!("  COMIS_ATTACK_SECONDS, COMIS_RELEASE_SECONDS, COMIS_TOLERANCE_LU, COMIS_COM_GATE_LUFS,");
-        eprintln!("  COMIS_FAST_STAGE (0 to switch the fast stage off),");
+        eprintln!("  COMIS_ATTACK_SECONDS, COMIS_RELEASE_SECONDS, COMIS_COM_GATE_LUFS,");
+        eprintln!("  COMIS_IS_VOICE_DETECT (0 to switch the IS-side voice detector off),");
         eprintln!("  COMIS_DUCK_DEPTH (front,center,lfe,surround,side,top_front,top_rear,top_side as 0-1 factors,");
         eprintln!("    e.g. 1,1,0,0.5),");
         eprintln!("  COMIS_BED_LAYOUT (7.1.2 to read a 10-channel bed as 7.1.2 rather than 5.1.4),");
@@ -189,8 +188,6 @@ fn main() -> ExitCode {
         com_gate_lufs: env_f64("COMIS_COM_GATE_LUFS", defaults.com_gate_lufs),
         attack_seconds: env_f64("COMIS_ATTACK_SECONDS", defaults.attack_seconds),
         release_seconds: env_f64("COMIS_RELEASE_SECONDS", defaults.release_seconds),
-        fast_stage: env_f64("COMIS_FAST_STAGE", if defaults.fast_stage { 1.0 } else { 0.0 }) != 0.0,
-        tolerance_lu: env_f64("COMIS_TOLERANCE_LU", defaults.tolerance_lu),
         duck_depth: env_duck_depth(defaults.duck_depth),
     };
 
@@ -205,7 +202,7 @@ fn main() -> ExitCode {
         _ => BedLayout::from_channel_count(bed_channels),
     };
     let mut processor = match bed_layout {
-        Ok(layout) => AutomixProcessor::with_layout(layout, sample_rate, config, TICK_SECONDS),
+        Ok(layout) => AutomixProcessor::with_layout(layout, sample_rate, config),
         Err(e) => {
             eprintln!("unsupported bed channel count {bed_channels}: {e:?}");
             return ExitCode::FAILURE;
@@ -225,7 +222,10 @@ fn main() -> ExitCode {
             None
         }
     };
-    let mut is_vad = SileroVad::new(sample_rate, vad_config).ok();
+    // Off is the same as never finding voice on the Bed, as in the plugin: only the ordinary
+    // duck/release states remain.
+    let is_voice_detect = env_f64("COMIS_IS_VOICE_DETECT", 1.0) != 0.0;
+    let mut is_vad = if is_voice_detect { SileroVad::new(sample_rate, vad_config).ok() } else { None };
 
     let tick_frames = (sample_rate as f64 * TICK_SECONDS) as usize;
 
@@ -246,7 +246,7 @@ fn main() -> ExitCode {
 
     println!(
         "tick,time_s,bed_lufs_m,com_lufs_m,com_voice_active,is_voice_active,mix_state,\
-ratio_lu,target_lu,r_slow,r_mid,r_fast,gain_reduction_db"
+ratio_lu,target_lu,gain_reduction_db"
     );
 
     let mut tick: u64 = 0;
@@ -299,11 +299,8 @@ ratio_lu,target_lu,r_slow,r_mid,r_fast,gain_reduction_db"
         processor.set_voice_activity(com_voice_active, is_voice_active);
         processor.process_bed(&mut leveled_bed).expect("process bed");
 
-        processor.maybe_run_control_step(com_voice_active, is_voice_active);
-
-        let c = processor.contributions();
         println!(
-            "{},{:.2},{:.2},{:.2},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            "{},{:.2},{:.2},{:.2},{},{},{},{:.2},{:.2},{:.2}",
             tick,
             tick as f64 * TICK_SECONDS,
             processor.bed_momentary_lufs(),
@@ -313,10 +310,7 @@ ratio_lu,target_lu,r_slow,r_mid,r_fast,gain_reduction_db"
             mix_state_label(processor.mix_state()),
             processor.applied_ratio_lu(),
             processor.active_target_ratio_lu(),
-            c.slow_db,
-            c.mid_db,
-            c.fast_db,
-            c.total_db,
+            processor.applied_gain_reduction_db(),
         );
 
         if let Some((leveled_bed_writer, mix_writer)) = render.as_mut() {

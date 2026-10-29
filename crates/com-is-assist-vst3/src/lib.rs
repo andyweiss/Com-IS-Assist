@@ -52,7 +52,6 @@ const DISPLAY_VERSION: &str = env!("COMIS_DISPLAY_VERSION");
 const LEFT_CHANNEL: usize = 0;
 const RIGHT_CHANNEL: usize = 1;
 const CENTER_CHANNEL: usize = 2;
-const TICK_SECONDS: f64 = 0.1;
 
 /// The one thing that differs between the exported plugins: the Bed's layout. See the module doc
 /// comment for why this is one plugin per layout rather than one with several.
@@ -317,24 +316,23 @@ struct ComISAssistParams {
     /// cannot duck the bed against itself. See `AutomixEngineConfig::com_gate_lufs`.
     #[id = "com-gate-lufs"]
     pub com_gate_lufs: FloatParam,
-    /// "Attack", in milliseconds - the mid stage's attack, with the other stages scaled along.
-    /// See `AutomixEngineConfig::attack_seconds`. Together with `release` this replaced the single
-    /// "Speed" macro, which could only move the way down and the way back together.
+    /// "Attack", in milliseconds - how quickly the reduction moves toward a larger answer. See
+    /// `AutomixEngineConfig::attack_seconds`. Together with `release` this replaced a single
+    /// "Speed" macro, which could only move the way down and the way back together. Stored in ms
+    /// so the parameter ID and unit survive from when its range ended at 600ms.
     #[id = "attack-ms"]
     pub attack_ms: FloatParam,
-    /// "Release", in seconds - the slow stage's release, with the other stages scaled along. See
+    /// "Release", in seconds - how quickly the reduction lets go. See
     /// `AutomixEngineConfig::release_seconds`.
     #[id = "release-s"]
     pub release_s: FloatParam,
-    /// "Tolerance", in LU - how far the programme may stray from the balance before the quick
-    /// stages react. Also the ratio meter's "on target" band. See
-    /// `AutomixEngineConfig::tolerance_lu`.
-    #[id = "tolerance-lu"]
-    pub tolerance_lu: FloatParam,
-    /// "Fast stage" - `false` takes the millisecond stage out of the cascade, for comparing the
-    /// result with and without it. See `AutomixEngineConfig::fast_stage`.
-    #[id = "fast-stage"]
-    pub fast_stage: BoolParam,
+    /// "IS voice detect" - `false` switches the Bed-side voice detector off, so the mixer treats
+    /// the Bed as never carrying voice: only the ordinary duck and release states remain, and the
+    /// over-voice ratio has nothing to do. For programme where the detector finds "voice" that is
+    /// not worth protecting - crowd chants, sung music - and the faster interview recovery or the
+    /// higher over-voice ducking would be wrong.
+    #[id = "is-voice-detect"]
+    pub is_voice_detect: BoolParam,
     /// "Duck depth" per Bed channel *group*: how much of the computed gain reduction those
     /// channels actually take. `1:1` is the reduction in full (6 dB of ducking reduces them by
     /// 6 dB), `1:0` is no ducking at all. See `com_is_assist_core::automix::DuckDepth`.
@@ -540,8 +538,26 @@ impl ComISAssistParams {
                 (automix.attack_seconds * 1000.0) as f32,
                 centred_skew(ATTACK_MS_MIN, ATTACK_MS_MAX, (automix.attack_seconds * 1000.0) as f32),
             )
-            .with_unit(" ms")
-            .with_value_to_string(formatters::v2s_f32_rounded(0)),
+            // Milliseconds where they matter and seconds beyond - "2.5 s" reads at a glance where
+            // "2500 ms" has to be counted. The parser takes either, so typing works whichever way
+            // round the value is displayed.
+            .with_value_to_string(Arc::new(|ms| {
+                if ms < 1000.0 {
+                    format!("{ms:.0} ms")
+                } else if ms < 10_000.0 {
+                    format!("{:.1} s", ms / 1000.0)
+                } else {
+                    format!("{:.0} s", ms / 1000.0)
+                }
+            }))
+            .with_string_to_value(Arc::new(|text| {
+                let text = text.trim();
+                if let Some(seconds) = text.strip_suffix('s').filter(|t| !t.ends_with('m')) {
+                    seconds.trim().parse::<f32>().ok().map(|s| s * 1000.0)
+                } else {
+                    text.trim_end_matches("ms").trim().parse().ok()
+                }
+            })),
             release_s: FloatParam::new(
                 "Release",
                 automix.release_seconds as f32,
@@ -556,17 +572,7 @@ impl ComISAssistParams {
                     format!("{value:.0}")
                 }
             })),
-            tolerance_lu: FloatParam::new(
-                "Tolerance",
-                automix.tolerance_lu as f32,
-                FloatRange::Linear { min: 0.0, max: 6.0 },
-            )
-            // Half-LU steps rather than the whole units the other level controls use: the useful
-            // settings sit between 1 and 3, where a whole LU is too coarse a step.
-            .with_step_size(0.5)
-            .with_value_to_string(formatters::v2s_f32_rounded(1))
-            .with_unit(" LU"),
-            fast_stage: BoolParam::new("Fast Stage", automix.fast_stage),
+            is_voice_detect: BoolParam::new("IS Voice Detect", true),
             duck_depth_front: duck_depth_param("Front L/R"),
             duck_depth_center: duck_depth_param("Center"),
             duck_depth_lfe: duck_depth_param("LFE"),
@@ -598,8 +604,6 @@ impl ComISAssistParams {
             com_gate_lufs: self.com_gate_lufs.value() as f64,
             attack_seconds: self.attack_ms.value() as f64 / 1000.0,
             release_seconds: self.release_s.value() as f64,
-            fast_stage: self.fast_stage.value(),
-            tolerance_lu: self.tolerance_lu.value() as f64,
             duck_depth: self.duck_depth(),
         }
     }
@@ -639,16 +643,27 @@ fn control_label(ui: &mut egui::Ui, text: &str) -> egui::Rect {
 /// The tint is painted *behind* the widgets by reserving a shape index first and filling it in once
 /// the row's rect is known, which is the only way to get a background under widgets whose extent
 /// egui decides as it lays them out.
+///
+/// `enabled: false` greys the row out - label and slider, each in its own grid cell - for a target
+/// the state machine currently cannot reach (over-voice, with IS voice detection off).
 fn ratio_control_row(
     ui: &mut egui::Ui,
     label: &str,
     param: &FloatParam,
     setter: &ParamSetter,
     active_color: Option<egui::Color32>,
+    enabled: bool,
 ) {
     let background = ui.painter().add(egui::Shape::Noop);
-    let label_rect = control_label(ui, label);
-    ui.add(ParamSlider::for_param(param, setter).with_width(CONTROL_SLIDER_WIDTH));
+    let label_rect = ui
+        .scope(|ui| {
+            if !enabled {
+                ui.disable();
+            }
+            control_label(ui, label)
+        })
+        .inner;
+    ui.add_enabled(enabled, ParamSlider::for_param(param, setter).with_width(CONTROL_SLIDER_WIDTH));
 
     if let Some(color) = active_color {
         // Behind the *name* only, not the slider: the tint marks which target is live, and
@@ -732,11 +747,13 @@ const GAP_BEFORE_RATIO: f32 = BAR_TO_BAR_GAP - SCALE_SPAN - RATIO_SIDE_SLACK;
 /// After the Ratio column (Ratio -> COM).
 const GAP_AFTER_RATIO: f32 = BAR_TO_BAR_GAP - RATIO_SIDE_SLACK;
 
-/// Range of the Attack control, in ms. The ends correspond to the old Speed macro's 8x and
-/// 0.25x - the range that had been settled on by ear - so nothing reachable before is lost.
-const ATTACK_MS_MIN: f32 = 20.0;
-const ATTACK_MS_MAX: f32 = 600.0;
-/// Range of the Release control, in seconds; likewise the old Speed range (8x to 0.25x of 3s).
+/// Range of the Attack control, in ms. Long at the top because the loop reads the 3s short-term
+/// window and a short attack on it rides the peaks of a fluctuating Bed (see
+/// `com_is_assist_core::automix::DEFAULT_ATTACK_SECONDS`); the useful settings are seconds, and
+/// 100ms is kept at the bottom only as the "as quick as it goes" end.
+const ATTACK_MS_MIN: f32 = 100.0;
+const ATTACK_MS_MAX: f32 = 10_000.0;
+/// Range of the Release control, in seconds.
 const RELEASE_S_MIN: f32 = 0.4;
 const RELEASE_S_MAX: f32 = 12.0;
 
@@ -787,11 +804,9 @@ const CAPTION_BLOCK_HEIGHT: f32 = CAPTION_NAME_HEIGHT + 11.0;
 const CAPTION_GAP: f32 = 7.0;
 
 
-/// The narrowest the ratio meter's "on target" green band is drawn, in LU. The band otherwise
-/// follows the Tolerance control, so the meter and the mixer agree on what "on target" means; at
-/// Tolerance 0 a zero-width band would show every reading as off target, which is no reading at
-/// all.
-const RATIO_METER_MIN_GREEN_BAND_LU: f32 = 1.0;
+/// Half-width of the ratio meter's "on target" green band, in LU - a GUI-only readability
+/// threshold, governing nothing in the DSP.
+const RATIO_METER_GREEN_BAND_LU: f32 = 2.0;
 
 /// Exact width of the meter bank row, derived from the columns and gaps that make it up rather
 /// than hardcoded - the state badge sits beneath it and must stay flush with it if any column
@@ -1246,11 +1261,10 @@ const PARAMETER_HELP: &[(&str, &str)] = &[
     ("IS voice ratio", "How far the commentary should sit above the bed while the commentator alone is talking. Higher means the bed ducks further."),
     ("Over-voice ratio", "The same, for when there is voice on the bed too - an interview under the commentary needs more headroom to stay intelligible. An absolute target, not an offset."),
     ("Max gain reduction", "A hard floor on how far the bed may ever be pushed down, whatever the ratios ask for."),
-    ("Attack", "How quickly the bed is ducked when it needs to come down. Shorter follows the programme more closely, longer is calmer."),
+    ("Attack", "How quickly the bed is ducked when it needs to come down. A few seconds keeps the ducking to what the balance actually needs; much shorter follows every swell of the bed and ducks more than needed."),
     ("Release", "How quickly the bed recovers once it may come back up. Longer keeps the bed down through pauses in the commentary; shorter brings it back sooner."),
-    ("Tolerance", "How far the balance may drift before the mixer reacts quickly. Small fluctuations inside it are left alone, so a mix that only needs a little ducking stays calm. Also the green band on the ratio meter. 0 reacts to everything."),
-    ("Fast stage", "The part of the mixer that reacts within milliseconds to a sudden surge in the bed. Switch it off to compare: without it the mixer is calmer, but a sudden crowd roar takes longer to be caught."),
     ("Voice detect gate", "A level below which voice on the commentary channel is ignored, so bed spill in the commentary mic cannot duck the bed against its own bleed. Set it 20-30 dB under the commentator's normal level - the shaded area on the COM meter shows where it is off."),
+    ("IS voice detect", "Voice detection on the bed. On, voice on the bed makes the bed recover faster, and commentary over it uses the over-voice ratio. Switch it off for crowd chants or sung music the detector mistakes for voice - the bed lamp then shows a cross and the over-voice ratio greys out."),
     ("Duck depth", "How much of the ducking each part of the bed takes. 1:1 is the full amount, 1:0 none at all. Holding the surrounds, heights and LFE back keeps the commentary clear without flattening the scene. Only the groups this format has are shown."),
     ("Mix dialogue to bed", "Folds the commentary into the bed output, for running the plugin as a bus insert rather than alongside a separate commentary path."),
     ("Voice divergence", "Where the mixed-in commentary sits: centre only at 0%, spread across left and right at 100%. Only does anything with the mix above switched on."),
@@ -1451,16 +1465,12 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
 
                         // Ratio bar color is an at-a-glance read of where the current COM/IS ratio
                         // sits relative to the user's target, for tuning by ear - a GUI-only
-                        // signal, not the DSP's own dead-band (`AutomixEngine::process_tick` still
-                        // uses `AutomixEngineConfig`'s tolerances for its actual gain decisions,
-                        // unchanged by this):
+                        // signal, governing nothing in the DSP:
                         //   grey   - ratio is negative: COM is currently *quieter* than IS (a
                         //            distinct situation from "not loud enough yet", worth its own
                         //            neutral color rather than alarming red)
                         //   red    - positive but under target by more than the green band
-                        //   green  - within +/-Tolerance of target (on target) - the same band
-                        //            the mixer itself leaves alone, floored for readability
-                        //            (see `RATIO_METER_MIN_GREEN_BAND_LU`)
+                        //   green  - within +/-RATIO_METER_GREEN_BAND_LU of target (on target)
                         //   orange - above the green band: COM louder than needed (not wrong, just
                         //            excess headroom)
                         // Deliberately keyed off `ratio_lu` (the signed, real control-loop value),
@@ -1472,6 +1482,7 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                         // ratio, and colouring that against the normal target would show orange
                         // ("excess headroom") for exactly as long as it does the right thing.
                         let mix_state_index = meters.mix_state.load(Ordering::Relaxed);
+                        let is_voice_detect = params.is_voice_detect.value();
                         let target_ratio_lu = if mix_state_index == 3 {
                             params.overvoice_ratio.value()
                         } else {
@@ -1484,12 +1495,11 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                         let com_gate_lufs = params.com_gate_lufs.value();
                         let com_gated_out = com_lufs < com_gate_lufs;
 
-                        let green_band_lu = params.tolerance_lu.value().max(RATIO_METER_MIN_GREEN_BAND_LU);
                         const RATIO_GREEN: egui::Color32 = egui::Color32::from_rgb(0x39, 0xC8, 0x39);
                         const RATIO_ORANGE: egui::Color32 = egui::Color32::from_rgb(224, 140, 32);
                         let ratio_color = if ratio_lu < 0.0 {
                             egui::Color32::from_gray(120)
-                        } else if ratio_lu < target_ratio_lu - green_band_lu {
+                        } else if ratio_lu < target_ratio_lu - RATIO_METER_GREEN_BAND_LU {
                             egui::Color32::from_rgb(224, 32, 32)
                         } else {
                             RATIO_GREEN
@@ -1498,7 +1508,7 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                         // above this is drawn orange - the level up to here is exactly what was
                         // asked for and should still read as on-target.
                         let ratio_excess_from = (ratio_lu >= 0.0)
-                            .then_some(target_ratio_lu + green_band_lu)
+                            .then_some(target_ratio_lu + RATIO_METER_GREEN_BAND_LU)
                             .filter(|threshold| display_ratio_lu > *threshold);
 
                         ui.horizontal(|ui| {
@@ -1531,9 +1541,12 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                                             color: accent,
                                             gain_reduction_db: Some(gain_reduction_db),
                                             voice: Some(VoiceIndicator {
-                                                active: meters.is_voice_active.load(Ordering::Relaxed),
-                                                // No guard band on the Bed side.
-                                                gated_out: false,
+                                                active: is_voice_detect
+                                                    && meters.is_voice_active.load(Ordering::Relaxed),
+                                                // The same cross as COM's guard band: "not
+                                                // detecting" has to look different from "detecting
+                                                // nothing", since they call for different actions.
+                                                gated_out: !is_voice_detect,
                                             }),
                                             gate_lufs: None,
                                         },
@@ -1601,38 +1614,33 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                                             &params.target_ratio,
                                             setter,
                                             (mix_state_index == 1).then(|| mix_state_color(1)),
+                                            true,
                                         );
+                                        // Over-voice needs voice on the Bed, which nothing can
+                                        // report with the IS detector off - greyed out rather
+                                        // than hidden, so it is clear why it does nothing.
                                         ratio_control_row(
                                             ui,
                                             "Over-voice ratio",
                                             &params.overvoice_ratio,
                                             setter,
                                             (mix_state_index == 3).then(|| mix_state_color(3)),
+                                            is_voice_detect,
                                         );
 
                                         control_label(ui, "Max gain reduction");
                                         ui.add(ParamSlider::for_param(&params.max_gain_reduction_db, setter).with_width(CONTROL_SLIDER_WIDTH));
                                         ui.end_row();
 
-                                        for (label, param) in [
-                                            ("Attack", &params.attack_ms),
-                                            ("Release", &params.release_s),
-                                            ("Tolerance", &params.tolerance_lu),
-                                        ] {
+                                        for (label, param) in [("Attack", &params.attack_ms), ("Release", &params.release_s)] {
                                             control_label(ui, label);
                                             ui.add(ParamSlider::for_param(param, setter).with_width(CONTROL_SLIDER_WIDTH));
                                             ui.end_row();
                                         }
-
-                                        // In the grid, so the checkbox lines up with the sliders
-                                        // above it rather than with the labels.
-                                        control_label(ui, "Fast stage");
-                                        bool_param_checkbox(ui, setter, &params.fast_stage, "");
-                                        ui.end_row();
                                     }));
 
-                                // Set off on its own: this gates *detection* rather than shaping
-                                // the mix, so it belongs with neither the tuning parameters above
+                                // Set off on its own: these govern *detection* rather than shaping
+                                // the mix, so they belong with neither the tuning parameters above
                                 // nor the routing group below.
                                 ui.add_space(14.0);
                                 ui.separator();
@@ -1643,6 +1651,11 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                                         ParamSlider::for_param(&params.com_gate_lufs, setter)
                                             .with_width(CONTROL_SLIDER_WIDTH),
                                     );
+                                    ui.end_row();
+
+                                    // In the grid, so the checkbox lines up with the slider above.
+                                    control_label(ui, "IS voice detect");
+                                    bool_param_checkbox(ui, setter, &params.is_voice_detect, "");
                                     ui.end_row();
                                 }));
 
@@ -1677,9 +1690,9 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
                                 // defined entirely by which of four states it's in, showing that
                                 // state directly is the fastest answer to "why is it doing that?"
                                 // - far more legible than inferring it from the meters.
-                                // Per-channel duck depth. Replaces the three loop-contribution
-                                // bars that used to sit here, which were a debugging view of the
-                                // cascade's internals rather than anything to mix with.
+                                // Per-channel duck depth. Replaces the loop-contribution bars that
+                                // used to sit here, a debugging view of the old three-stage
+                                // cascade rather than anything to mix with.
                                 // The whole section, rule included, is left out on formats with
                                 // no groups (2.0).
                                 if !F::DUCK_GROUPS.is_empty() {
@@ -1732,7 +1745,6 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
             F::LAYOUT,
             buffer_config.sample_rate as u32,
             self.params.automix_config(),
-            TICK_SECONDS,
         ));
         // `.ok()`, not `.expect(...)`: if this fails (e.g. the ONNX Runtime binary couldn't be
         // obtained), `process()` fails open rather than the whole plugin refusing to initialize
@@ -1763,7 +1775,7 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
         // `initialize()` only reads these parameters once, at plugin load - without refreshing
         // them here on every block, a live parameter change would silently have no effect. Cheap -
         // a couple of struct copies - and preserves all accumulated state (loudness detectors, the
-        // loop stages' in-flight values), unlike rebuilding the processor would.
+        // loop's in-flight reduction), unlike rebuilding the processor would.
         processor.set_config(self.params.automix_config());
         processor.set_automix_enabled(!self.params.bypass.value());
 
@@ -1829,22 +1841,23 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
         // Fails *closed* on the IS side (no detector => "no voice on IS"), unlike COM's fail-open:
         // IS voice only ever selects the interview/over-voice states, so assuming it absent just
         // falls back to the ordinary duck/release behavior rather than inventing a state.
+        // Switched off, the detector is not fed at all - it would only be spending the worker's
+        // time on an answer nothing reads - and the Bed counts as never carrying voice.
         let is_voice_active = match self.is_voice_activity.as_mut() {
-            Some(vad) => {
+            Some(vad) if self.params.is_voice_detect.value() => {
                 vad.feed(mono_bed);
                 vad.voice_active()
             }
-            None => false,
+            _ => false,
         };
-        // Published before `process_bed` so the fast stage sees a state change on this block
-        // rather than at the next ~100ms control tick - see `set_voice_activity`.
+        // Published before `process_bed` so a state change takes effect from this block's first
+        // sub-chunk - see `set_voice_activity`.
         processor.set_voice_activity(voice_active, is_voice_active);
 
-        // Measures the dry Bed, then steps the fast stage and applies the resulting gain in
+        // Measures the dry Bed, then steps the gain loop and applies the resulting gain in
         // sub-chunks - all inside the shared core, so every wrapper gets identical DSP. In place
         // and unbuffered, so the plugin adds no latency and reports none.
         let _ = processor.process_bed(interleaved_bed);
-        processor.maybe_run_control_step(voice_active, is_voice_active);
 
         // Only bother publishing to the meters while the GUI is actually open - matches
         // nih-plug's own guidance for keeping this off the hot path otherwise.
@@ -1930,6 +1943,19 @@ mod tests {
         }
     }
 
+    /// Attack is displayed in ms below a second and in seconds above, and typing either back in
+    /// must land on the same value.
+    #[test]
+    fn attack_reads_back_what_it_displays() {
+        let params = ComISAssistParams::for_format::<Surround51>();
+        for (text, ms) in [("2.5 s", 2500.0), ("250 ms", 250.0), ("2.5s", 2500.0), ("400", 400.0)] {
+            let parsed = params.attack_ms.string_to_normalized_value(text).map(|n| params.attack_ms.preview_plain(n));
+            assert!(parsed.is_some_and(|p| (p - ms).abs() < 0.01), "{text} parsed as {parsed:?}, expected {ms}");
+        }
+        assert_eq!(params.attack_ms.normalized_value_to_string(params.attack_ms.preview_normalized(2500.0), true), "2.5 s");
+        assert_eq!(params.attack_ms.normalized_value_to_string(params.attack_ms.preview_normalized(250.0), true), "250 ms");
+    }
+
     /// Every shipped default in one assertion, pinned where a reader can see them together.
     ///
     /// Worth having because these have now moved more than once, and the GUI gives no clue whether
@@ -1943,10 +1969,9 @@ mod tests {
         assert_eq!(params.overvoice_ratio.default_plain_value(), 13.0);
         assert_eq!(params.max_gain_reduction_db.default_plain_value(), 24.0);
         assert_eq!(params.com_gate_lufs.default_plain_value(), -32.0);
-        assert_eq!(params.attack_ms.default_plain_value(), 150.0);
+        assert_eq!(params.attack_ms.default_plain_value(), 2500.0);
         assert_eq!(params.release_s.default_plain_value(), 3.0);
-        assert_eq!(params.tolerance_lu.default_plain_value(), 2.0);
-        assert!(params.fast_stage.default_plain_value());
+        assert!(params.is_voice_detect.default_plain_value());
         // Centre-only: Dialogue is not spread into L/R unless asked for.
         assert_eq!(params.divergence.default_plain_value(), 0.0);
         assert!(!params.bypass.default_plain_value());
@@ -1971,8 +1996,6 @@ mod tests {
         assert_eq!(params.com_gate_lufs.default_plain_value() as f64, core.com_gate_lufs);
         assert!((params.attack_ms.default_plain_value() as f64 / 1000.0 - core.attack_seconds).abs() < 1e-9);
         assert_eq!(params.release_s.default_plain_value() as f64, core.release_seconds);
-        assert_eq!(params.tolerance_lu.default_plain_value() as f64, core.tolerance_lu);
-        assert_eq!(params.fast_stage.default_plain_value(), core.fast_stage);
 
         let depth = params.duck_depth();
         assert_eq!(depth.front_lr, core.duck_depth.front_lr);

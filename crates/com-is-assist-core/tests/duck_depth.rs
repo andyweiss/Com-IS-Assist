@@ -7,7 +7,6 @@
 use com_is_assist_core::automix::{AutomixEngineConfig, AutomixProcessor, DuckDepth, MAX_BED_CHANNELS};
 use com_is_assist_core::loudness::BedLayout;
 
-const TICK: f64 = 0.1;
 const RATE: u32 = 48_000;
 
 fn sine(freq: f64, amp: f32, frames: usize) -> Vec<f32> {
@@ -32,7 +31,6 @@ fn processor(layout: BedLayout, duck_depth: DuckDepth) -> AutomixProcessor {
             duck_depth,
             ..AutomixEngineConfig::default()
         },
-        TICK,
     )
 }
 
@@ -51,9 +49,9 @@ fn settled_reduction_db_for(layout: BedLayout, duck_depth: DuckDepth) -> Vec<f64
     let mut bed = Vec::new();
     for _ in 0..60 {
         p.feed_dialogue(&com).expect("dialogue");
+        p.set_voice_activity(true, false);
         bed = interleave(&dry_mono, bed_channels);
         p.process_bed(&mut bed).expect("bed");
-        p.maybe_run_control_step(true, false);
     }
 
     // Peak over the back half of the final block, well clear of the ramp into it.

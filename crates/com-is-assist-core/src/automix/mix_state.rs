@@ -1,6 +1,6 @@
-/// The automix control state for one ~100ms tick, decided *entirely* by the two voice-activity
-/// detectors (COM/Dialogue and IS/Bed) - nothing else. This
-/// replaces the earlier implicit branching inside `AutomixEngine::process_tick` (voice-onset
+/// The automix control state, decided *entirely* by the two voice-activity detectors (COM/Dialogue
+/// and IS/Bed) - nothing else. This replaces the earlier implicit branching inside the engine
+/// (voice-onset
 /// fast-trigger → `!voice_active` release → `valid` gate → tolerance dead-band, all interleaved),
 /// which produced behavior that was hard to predict; see `Specs/TechnicalConcept.md` section 5.
 ///

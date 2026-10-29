@@ -3,9 +3,9 @@
 ## What is implemented
 
 Parameters (see `Specs/vstDefinitions.md` for exact names):
-- **Implemented**: IS voice ratio (`target-ratio`, formerly labelled "Com/IS distance"), Voice detect gate (`com-gate-lufs`), Over-voice ratio (`overvoice-ratio`), Attack (`attack-ms`), Release (`release-s`), Tolerance (`tolerance-lu`), Fast stage (`fast-stage`), Voice divergence (`divergence` — restricted to Left/Right/Center, see `mix_dialogue_into_bed`).
+- **Implemented**: IS voice ratio (`target-ratio`, formerly labelled "Com/IS distance"), Voice detect gate (`com-gate-lufs`), Over-voice ratio (`overvoice-ratio`), Attack (`attack-ms`), Release (`release-s`), IS voice detect (`is-voice-detect`), Voice divergence (`divergence` — restricted to Left/Right/Center, see `mix_dialogue_into_bed`).
 - **"voice detector comm" - implemented, but not as an on/off toggle.** Real voice-activity detection (Silero VAD, via `com_is_assist_core::voice_activity::SileroVad`) gates the ratio/automix control loop directly, replacing the old flat -70dB LUFS-floor "is COM currently silent?" stand-in - see `Specs/TechnicalConcept.md` section 6. Always on, not exposed as a disable-able parameter: turning it off would just reintroduce the exact problem it fixes (Bed getting reduced in response to COM having *some* sound - room tone, static, another open mic - that isn't actually speech).
-- **"voice detector IS" - implemented.** A second, independent `SileroVad` instance runs on a mono downmix of the dry Bed. Like the COM detector it is always on rather than switchable. When it finds voice on the original while Comm is silent, the bed recovers to unity faster than normal; when both carry voice, the higher Over-voice ratio applies. Together the two detectors select the automix state (section 5.1 of `TechnicalConcept.md`).
+- **"voice detector IS" - implemented.** A second, independent `SileroVad` instance runs on a mono downmix of the dry Bed. Unlike the COM detector it can be switched off (**IS voice detect**, below). When it finds voice on the original while Comm is silent, the bed recovers to unity faster than normal; when both carry voice, the higher Over-voice ratio applies. Together the two detectors select the automix state (section 5.1 of `TechnicalConcept.md`).
 
 Display:
 - **Implemented (VST3 only, custom GUI — see `Specs/vstDefinitions.md`'s "GUI (custom, meters + controls)" section)**: a tall, professional-bargraph-style meter bank (left side of the window, parameters on the right) with current Gain reduction in dB as its own standalone vertical bar (top-down fill, own 0-36dB scale) next to IS LUFS momentary (pre-gain) and Comm LUFS momentary, each shown as a vertical bar filling bottom-up, both in the same accent colour the parameter sliders use; Ratio in LU, computed against Bed's effective (post-reduction) level so it reflects what's actually audible; Voice activity Comm **and** Voice activity IS (green LEDs, under their respective bars); a live **state readout** naming which of the four automix states is currently active, and a **duck depth** control per bed channel group (this replaced a per-loop debugging readout, which showed what each of the three control loops was contributing in dB).
@@ -37,19 +37,16 @@ The version is the GitHub release tag for a released build; a build made locally
 # Attack and Release
 How quickly the mixer ducks (Attack) and how quickly it recovers (Release), set separately.
 
-The leveling is built from three control loops at different speeds: a slow one that sets the overall balance, a faster one that follows the bed, and a very fast one that catches sudden bed surges. **Attack** is the time of the loop you hear ducking, the one that follows the bed: 150 ms by default, 20-600 ms. **Release** is the time of the loop you hear recovering, the slow one that holds most of the reduction: 3 s by default, 0.4-12 s. The other loops scale along, so the mixer keeps its character, biting immediately on a surge and settling in behind it, at every setting. The defaults sit in the middle of each control.
+The leveling is one control loop. It follows the balance between commentary and bed as measured over 3 seconds, and holds the bed where the IS voice ratio asks. **Attack** is how quickly it moves when more ducking is needed: 2.5 s by default, 0.1-10 s. **Release** is how quickly it lets go: 3 s by default, 0.4-12 s. The defaults sit in the middle of each control.
+
+The long default attack is deliberate. With a short attack the loop grabs every swell in the bed and is slow to let go, so a mix that only needs a little ducking gets considerably more, and the gain keeps moving. At a few seconds it averages instead: on real broadcast programme needing about 2 dB, a 2.5 s attack applied about 2 dB, where 150 ms applied about 4 dB. The price is that a big, sudden change, such as the commentator starting after a pause, takes a few seconds to be fully ducked. Around 1 s is the setting to try if that is too slow.
 
 The pause tolerance that keeps the bed down through sentence gaps is fixed in real time, so recovery stays cushioned even at a short Release.
 
-# Tolerance
-How far the balance may drift before the mixer reacts quickly. 2 LU by default, 0-6 LU.
+# IS voice detect
+Switches voice detection on the bed on or off. On by default.
 
-The two quicker loops are built to grab fast and let go slowly. On a programme whose level moves around, that makes them ride the peaks, so a mix that needs only a little ducking used to get considerably more, and the gain kept moving. Small fluctuations inside the tolerance are now left alone, and only larger ones are acted on (less the tolerance). A genuine surge is still caught. The overall balance is never affected: the slow loop still holds the ratio exactly.
-
-The ratio meter's green "on target" band follows this control (at least 1 LU wide, so it stays readable), so the meter and the mixer agree on what "on target" means. 0 reacts to every fluctuation, which was the behaviour before this control existed.
-
-# Fast stage
-Switches the very fast loop on or off. On by default. It reacts within milliseconds to a sudden surge in the bed, such as a crowd roar, before the slower loops have noticed it. That is also what makes the mixer busy: switched off, the gain moves roughly half as much, but a sudden surge takes up to a few hundred milliseconds longer to be caught. It is a switch so the two can be compared on the actual programme.
+On, voice on the bed changes what the mixer does: with the commentator silent the bed recovers faster, and with both talking the higher **Over-voice ratio** applies. Switch it off for programme where the detector hears "voice" that should not get that treatment, such as crowd chants or sung music. The bed is then treated as never carrying voice. The IS lamp shows a cross, as the commentary lamp does when its gate is closed, and the Over-voice ratio greys out, because nothing can reach it.
 
 # Duck depth (per bed channel group)
 How much of the ducking each group of bed channels gets, as a ratio. At 1:1 the group takes the full reduction - if the mixer decides on 6 dB, those channels come down 6 dB. At 1:0 they are left alone entirely, however hard the rest of the bed is being held down. Anything between scales it proportionally, so 1:0.5 of a 6 dB reduction is 3 dB.

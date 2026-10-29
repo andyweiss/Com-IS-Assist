@@ -19,7 +19,7 @@ Two voice-activity detectors — one on the Dialogue (COM), one on the Bed (IS) 
 
 How much to duck is computed **feed-forward** from the dry signals. Because reducing the Bed by 1 dB raises the COM/IS ratio by exactly 1 LU, the required reduction is simply `target − (COM − BED)` — no feedback loop, so no windup and no pumping.
 
-That reduction is applied by three cascaded gain stages whose detectors see the Bed at different speeds (3 s short-term, 400 ms momentary, and a ~50 ms K-weighted detector run at audio-block rate), their reductions adding in dB. Attack and release are not configured but **emerge** from how the stages interact: long and gentle when the programme is steady, very fast when the Bed surges. **Attack** and **Release** set the two directions separately, each scaling all three stages together. **Tolerance** keeps the two quicker stages from chasing small fluctuations, so a mix that needs only a little ducking stays calm. The fast stage can be switched off to compare the result without it.
+That reduction is applied by one loop on the 3 s short-term loudness of both signals, with **Attack** (default 2.5 s) and **Release** (default 3 s) as its time constants, stepped every ~1.3 ms so the gain moves smoothly. The long attack is deliberate: a short one rides the peaks of a fluctuating Bed and ducks more than the balance needs. The price is a slower response to a large, sudden change. **IS voice detect** switches the Bed-side detector off for programme where its "voice" should not change the mix, such as crowd chants or sung music.
 
 How much of that reduction each part of the Bed receives is set per channel group (**duck depth**, a ratio from 1:1 down to 1:0 for Front L/R, Center, LFE and Surround L/R, plus Top Front L/R and Top Rear L/R on 5.1.4, and Side L/R and Top Side L/R on 7.1.2), so the surrounds and LFE can be held back while the front channels duck fully. Everything at 1:1 - the default - ducks the whole Bed uniformly.
 
@@ -55,7 +55,7 @@ Sessions saved with releases up to v1.0.2 (the single 8-channel plugin) reopen o
 ```
 crates/
   com-is-assist-core/        # shared DSP: loudness metering (ebur128), voice activity (Silero),
-                             #   the 4-state machine and the multi-loop gain cascade
+                             #   the 4-state machine and the feed-forward gain loop
   com-is-assist-vst3/        # VST3 plugin (nih-plug)
   com-is-assist-offline/     # CLI tool: WAV(bed) + WAV(dialogue) -> CSV metrics + rendered WAVs
 vendor/nih_plug/             # nih-plug with exact VST3 speaker arrangements (see PATCHED.md there)

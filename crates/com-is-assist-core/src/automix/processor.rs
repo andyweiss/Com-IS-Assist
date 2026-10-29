@@ -2,22 +2,20 @@ use ebur128::Error as Ebur128Error;
 
 use crate::automix::{
     apply_ramped_gain_per_channel, AutomixEngine, AutomixEngineConfig, KWeightedLoudnessMeter,
-    LoopContributions, LoudnessSnapshot, MixState, MAX_BED_CHANNELS,
+    LoudnessSnapshot, MixState, MAX_BED_CHANNELS,
 };
 use crate::loudness::{BedLayout, ConfigError, Ebur128Meter};
 
-/// The fast stage is stepped once per this many frames rather than once per audio block. At 48kHz
-/// that is ~1.3ms, so a 5ms attack is actually realisable; stepping once per block would quantise
-/// it to the host's buffer size (often 10-20ms) and the stage would lose the transient response
-/// that justifies its existence.
-const FAST_SUBCHUNK_FRAMES: usize = 64;
+/// The gain computer is stepped, and a new gain applied, once per this many frames rather than once
+/// per audio block. At 48kHz that is ~1.3ms, so the gain follows a smooth curve whatever buffer
+/// size the host uses (often 10-20ms), and a voice-detector state change takes effect at once.
+///
+/// This replaced a ~100ms control tick. The tick existed because querying the `ebur128` crate's
+/// windows was expensive; `KWeightedLoudnessMeter` made the queries O(1), and stepping only on the
+/// tick left the gain to change in one jump every 100ms, ramped over a single sub-chunk.
+const SUBCHUNK_FRAMES: usize = 64;
 
-/// Integration time of the fast detectors. Well below R128 momentary (400ms), which is the point,
-/// but not so short that it reads individual syllables as level changes - 30ms was tried first and
-/// made the stage track the speech envelope rather than its onsets.
-const FAST_WINDOW_SECONDS: f64 = 0.05;
-
-/// Bundles the loudness detectors, the multi-loop gain computer and the output delay that every
+/// Bundles the loudness detectors and the gain computer that every
 /// wrapper (the VST3 plugin and `com-is-assist-offline`) needs byte-for-byte
 /// identically. This is what actually enforces "no DSP divergence between wrappers"
 /// (`Specs/TechnicalConcept.md` section 8): there is exactly one implementation of how audio gets
@@ -37,9 +35,8 @@ pub struct AutomixProcessor {
     bed_channels: u32,
     sample_rate: u32,
 
-    /// Dry Bed and Dialogue. One instance per signal serves every stage: the slow (3s short-term)
-    /// and mid (400ms momentary) R128 windows, and on the Bed side the fast detector too - all
-    /// from a single K-weighting pass.
+    /// Dry Bed and Dialogue. The gain loop reads their 3s short-term windows; the 400ms momentary
+    /// windows feed the meters and the COM guard band.
     ///
     /// These were `Ebur128Meter`s until the real-time cost was measured. That crate recomputes a
     /// window's sum of squares on every query, which cost ~700us for short-term on a 6-channel bed
@@ -49,30 +46,18 @@ pub struct AutomixProcessor {
     /// the two are tested against.
     bed_meter: KWeightedLoudnessMeter,
     dialogue_meter: KWeightedLoudnessMeter,
-    /// COM short-term, the stable reference the fast stage measures the Bed against (see
-    /// [`LoudnessSnapshot`] for why only the Bed is read fast).
-    ///
-    /// Refreshed every block by [`Self::set_voice_activity`], not once per control tick. It was
-    /// cached at tick rate purely because querying `ebur128` cost ~700us; with the windows now
-    /// O(1) that saving is gone, and the staleness was costing up to 100ms of ducking latency -
-    /// at a speech onset the fast stage had no current COM level to compute a target from, so it
-    /// could not act until the next tick however early the detector fired.
-    dialogue_reference_lufs: f64,
-
     automix_engine: AutomixEngine,
 
-    /// The gain actually applied to the most recent sample **of each channel**, so the next chunk
-    /// can ramp from it rather than stepping. Replaces the old tick-length ramp: with the fast
-    /// stage updating every sub-chunk there is no fixed ramp window any more. Per-channel since
+    /// The gain actually applied to the most recent sample **of each channel**, so the next
+    /// sub-chunk can ramp from it rather than stepping. Per-channel since
     /// `AutomixEngineConfig::duck_depth` lets the channels sit at different gains.
     current_gain: [f32; MAX_BED_CHANNELS],
     automix_enabled: bool,
 
-    /// Frames fed into each side since the last control step. A new slow/mid step only runs once
-    /// both have accumulated a full tick - this is the one place the ~100ms control cadence lives.
-    bed_frames_since_control: u64,
-    dialogue_frames_since_control: u64,
-    tick_frames: u64,
+    /// The voice flags in force, as last published by [`Self::set_voice_activity`] - COM's after
+    /// the guard band.
+    com_voice_active: bool,
+    is_voice_active: bool,
 
     applied_gain_reduction_db: f64,
     control_ratio_lu: f64,
@@ -85,9 +70,6 @@ pub struct AutomixProcessor {
     /// touches the channel map. Held here rather than in the engine because it shapes how one
     /// computed reduction is *applied*, not how it is decided.
     duck_depth: [f64; MAX_BED_CHANNELS],
-    /// The COM voice flag *after* gating - what actually drove the most recent control step, and
-    /// therefore what a GUI indicator should show.
-    com_voice_gated: bool,
 }
 
 impl AutomixProcessor {
@@ -97,47 +79,29 @@ impl AutomixProcessor {
         bed_channels: u32,
         sample_rate: u32,
         automix_config: AutomixEngineConfig,
-        tick_seconds: f64,
     ) -> Result<Self, ConfigError> {
-        Ok(Self::with_layout(
-            BedLayout::from_channel_count(bed_channels)?,
-            sample_rate,
-            automix_config,
-            tick_seconds,
-        ))
+        Ok(Self::with_layout(BedLayout::from_channel_count(bed_channels)?, sample_rate, automix_config))
     }
 
-    pub fn with_layout(
-        bed_layout: BedLayout,
-        sample_rate: u32,
-        automix_config: AutomixEngineConfig,
-        tick_seconds: f64,
-    ) -> Self {
+    pub fn with_layout(bed_layout: BedLayout, sample_rate: u32, automix_config: AutomixEngineConfig) -> Self {
         let bed_map = bed_layout.channel_map();
         let bed_channels = bed_map.len() as u32;
         Self {
             bed_layout,
             bed_channels,
             sample_rate,
-            bed_meter: KWeightedLoudnessMeter::new(&bed_map, sample_rate, FAST_WINDOW_SECONDS),
-            dialogue_meter: KWeightedLoudnessMeter::new(
-                &Ebur128Meter::dialogue_channel_map(),
-                sample_rate,
-                FAST_WINDOW_SECONDS,
-            ),
-            dialogue_reference_lufs: Ebur128Meter::NEGATIVE_INFINITY_DB,
+            bed_meter: KWeightedLoudnessMeter::new(&bed_map, sample_rate),
+            dialogue_meter: KWeightedLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate),
             automix_engine: AutomixEngine::new(automix_config),
             current_gain: [1.0; MAX_BED_CHANNELS],
             automix_enabled: true,
-            bed_frames_since_control: 0,
-            dialogue_frames_since_control: 0,
-            tick_frames: (sample_rate as f64 * tick_seconds) as u64,
+            com_voice_active: false,
+            is_voice_active: false,
             applied_gain_reduction_db: 0.0,
             control_ratio_lu: 0.0,
             mix_state: MixState::ReleaseToUnity,
             com_gate_lufs: automix_config.com_gate_lufs,
             duck_depth: automix_config.duck_depth.per_channel_for(bed_layout),
-            com_voice_gated: false,
         }
     }
 
@@ -158,16 +122,16 @@ impl AutomixProcessor {
         self.automix_enabled = enabled;
     }
 
-    /// Feeds one chunk of *dry* Dialogue into the Dialogue meter and advances the control cadence.
+    /// Feeds one chunk of *dry* Dialogue into the Dialogue meter. Call it before
+    /// [`Self::process_bed`] for the same block, so the Bed is gained against current COM levels.
     /// Dialogue is never gained and never delayed, so there is no equivalent of `process_bed` on
     /// this side - the caller forwards its own buffer untouched.
     pub fn feed_dialogue(&mut self, dry_dialogue: &[f32]) -> Result<(), Ebur128Error> {
         self.dialogue_meter.push_frames(dry_dialogue);
-        self.dialogue_frames_since_control += dry_dialogue.len() as u64;
         Ok(())
     }
 
-    /// The Bed signal path, in place: measures the dry signal, then steps the fast stage and
+    /// The Bed signal path, in place: measures the dry signal, then steps the gain computer and
     /// applies the resulting gain in sub-chunks.
     ///
     /// Order matters and is the whole feed-forward idea: audio is *measured* before any gain is
@@ -181,21 +145,22 @@ impl AutomixProcessor {
             return Ok(());
         }
 
-        // Dry measurement, before anything is applied.
-
-        self.bed_frames_since_control += bed.len() as u64 / channels as u64;
-
-        let subchunk_samples = FAST_SUBCHUNK_FRAMES * channels;
-
-        for subchunk in bed.chunks_mut(subchunk_samples) {
+        for subchunk in bed.chunks_mut(SUBCHUNK_FRAMES * channels) {
+            // Dry measurement, before anything is applied.
             self.bed_meter.push_frames(subchunk);
 
+            let loudness = LoudnessSnapshot {
+                bed_short_term_lufs: self.bed_meter.short_term_loudness_db(),
+                dialogue_short_term_lufs: self.dialogue_meter.short_term_loudness_db(),
+            };
+            self.control_ratio_lu = loudness.dialogue_short_term_lufs - loudness.bed_short_term_lufs;
+
             // The final sub-chunk of a block is usually short, so derive dt from its real length
-            // rather than assuming a full one - the fast stage's ballistics are in seconds.
+            // rather than assuming a full one - the loop's ballistics are in seconds.
             let dt = (subchunk.len() / channels) as f64 / self.sample_rate as f64;
-            let reduction_db =
-                self.automix_engine
-                    .process_fast(self.bed_meter.fast_loudness_db(), self.dialogue_reference_lufs, dt);
+            let result = self.automix_engine.step(loudness, self.com_voice_active, self.is_voice_active, dt);
+            self.mix_state = result.state;
+            let reduction_db = result.gain_reduction_db;
             self.applied_gain_reduction_db = reduction_db;
 
             // One reduction, distributed across the channels by `duck_depth`. Scaling in **dB**
@@ -216,59 +181,18 @@ impl AutomixProcessor {
         Ok(())
     }
 
-    /// Publishes the detectors' current answer, so a state change takes effect on the next audio
-    /// sub-chunk instead of waiting for the control tick.
-    ///
-    /// Call this every block, before [`Self::process_bed`]. Doing so is what keeps the mixer's
-    /// reaction tied to the detector's latency rather than to the ~100ms tick - see
-    /// [`AutomixEngine::set_state_from_vad`]. Applies the COM guard band, which is cheap now that
-    /// the loudness windows are O(1) to query.
-    pub fn set_voice_activity(&mut self, com_voice_active: bool, is_voice_active: bool) {
-        let com_voice_active = self.gate_com(com_voice_active);
-        self.mix_state = self.automix_engine.set_state_from_vad(com_voice_active, is_voice_active);
-        self.dialogue_reference_lufs = self.dialogue_meter.short_term_loudness_db();
-    }
-
-    /// Guard band: ignore reported speech on COM while COM itself is too quiet to be the
-    /// commentator - see `AutomixEngineConfig::com_gate_lufs`. Momentary (400ms) rather than
-    /// short-term, so the gate tracks the talker rather than lagging seconds behind them.
-    fn gate_com(&mut self, com_voice_active: bool) -> bool {
-        let gated = com_voice_active && self.dialogue_meter.momentary_loudness_db() >= self.com_gate_lufs;
-        self.com_voice_gated = gated;
-        gated
-    }
-
-    /// Recomputes the slow and mid stages once enough new audio has been fed into both sides since
-    /// the last control step. A no-op otherwise, so it is safe to call after every chunk from
-    /// either side.
+    /// Publishes the voice detectors' current answer. Call this every block, before
+    /// [`Self::process_bed`], so a state change takes effect from that block's first sub-chunk.
     ///
     /// `com_voice_active`/`is_voice_active` come from the caller's two `SileroVad` instances (see
-    /// `crate::voice_activity`); together they select the [`MixState`] that drives this tick.
-    pub fn maybe_run_control_step(&mut self, com_voice_active: bool, is_voice_active: bool) {
-        if self.bed_frames_since_control < self.tick_frames
-            || self.dialogue_frames_since_control < self.tick_frames
-        {
-            return;
-        }
-        let dt = self.bed_frames_since_control as f64 / self.sample_rate as f64;
-        self.bed_frames_since_control = 0;
-        self.dialogue_frames_since_control = 0;
-
-        let com_voice_active = self.gate_com(com_voice_active);
-
-        let loudness = LoudnessSnapshot {
-            bed_short_term_lufs: self.bed_meter.short_term_loudness_db(),
-            bed_momentary_lufs: self.bed_meter.momentary_loudness_db(),
-            dialogue_short_term_lufs: self.dialogue_meter.short_term_loudness_db(),
-        };
-        self.dialogue_reference_lufs = loudness.dialogue_short_term_lufs;
-        self.control_ratio_lu = loudness.dialogue_short_term_lufs - loudness.bed_short_term_lufs;
-
-        let result = self
-            .automix_engine
-            .process_tick(loudness, com_voice_active, is_voice_active, dt);
-        self.applied_gain_reduction_db = result.gain_reduction_db;
-        self.mix_state = result.state;
+    /// `crate::voice_activity`); together they select the [`MixState`]. COM passes through the guard
+    /// band here - see [`AutomixEngineConfig::com_gate_lufs`]. Momentary (400ms) rather than
+    /// short-term, so the gate tracks the talker rather than lagging seconds behind them.
+    pub fn set_voice_activity(&mut self, com_voice_active: bool, is_voice_active: bool) {
+        self.com_voice_active =
+            com_voice_active && self.dialogue_meter.momentary_loudness_db() >= self.com_gate_lufs;
+        self.is_voice_active = is_voice_active;
+        self.mix_state = MixState::from_vad(self.com_voice_active, self.is_voice_active);
     }
 
     // ---- metering ----------------------------------------------------------------------------
@@ -277,24 +201,18 @@ impl AutomixProcessor {
         self.applied_gain_reduction_db
     }
 
-    /// What each stage of the cascade is contributing right now - the fastest answer to "why is it
-    /// doing that?", since the three stages have visibly different characters.
-    pub fn contributions(&self) -> LoopContributions {
-        self.automix_engine.contributions()
-    }
-
     pub fn mix_state(&self) -> MixState {
         self.mix_state
     }
 
-    /// Whether COM voice was considered present at the most recent control step, *after* the
-    /// guard band. This is what actually drives the state machine, so it is what a GUI indicator
-    /// should show - a raw detector flag would light while the gate was suppressing it.
+    /// Whether COM voice is currently considered present, *after* the guard band. This is what
+    /// actually drives the state machine, so it is what a GUI indicator should show - a raw
+    /// detector flag would light while the gate was suppressing it.
     pub fn com_voice_gated(&self) -> bool {
-        self.com_voice_gated
+        self.com_voice_active
     }
 
-    /// The COM/IS ratio the control loop is actually achieving: the dry ratio plus whatever
+    /// The COM/IS ratio the gain loop is actually achieving: the dry ratio plus whatever
     /// reduction is currently applied. This is the number to compare against the target, and it is
     /// meaningful in a way the old feedback design's equivalent was not - there, the measured ratio
     /// already contained the reduction, so "ratio vs target" and "how much more to do" were the

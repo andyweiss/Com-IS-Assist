@@ -37,7 +37,7 @@ fn main() {
 
     let mut vad = SileroVad::new(rate, VoiceActivityConfig::default()).expect("vad");
     let mut processor =
-        AutomixProcessor::new(1, rate, AutomixEngineConfig::default(), 0.1).expect("processor");
+        AutomixProcessor::new(1, rate, AutomixEngineConfig::default()).expect("processor");
 
     // Measured from where the *speech energy* stops, not where the detector drops. Those are 800ms
     // apart - the hangover deliberately holds the ducking state through inter-sentence pauses - and
@@ -62,7 +62,6 @@ fn main() {
         processor.set_voice_activity(active, false);
         let mut b = bed[start..start + BLOCK].to_vec();
         processor.process_bed(&mut b).expect("bed");
-        processor.maybe_run_control_step(active, false);
         let gr = processor.applied_gain_reduction_db();
         max_gr = max_gr.max(gr);
         if was_active && !active {
@@ -101,11 +100,10 @@ fn main() {
             let from = std::env::var("TRACE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(61.0);
             let t = start as f64 / rate as f64;
             if t >= from && t <= from + 4.0 && (start / BLOCK).is_multiple_of(40) {
-                    let c = processor.contributions();
                     let com_rms = 20.0 * (rms.max(1e-9) as f64).log10();
                     println!(
-                        "  t={:7.2}s com={com_rms:6.1}dB vad={active:5} {:?}  slow {:6.2} mid {:6.2} fast {:6.2} -> gr {:6.2}",
-                        t, processor.mix_state(), c.slow_db, c.mid_db, c.fast_db, gr
+                        "  t={:7.2}s com={com_rms:6.1}dB vad={active:5} {:?}  gr {:6.2}",
+                        t, processor.mix_state(), gr
                     );
             }
         }

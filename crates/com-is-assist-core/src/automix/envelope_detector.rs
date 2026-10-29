@@ -1,13 +1,12 @@
 /// A one-pole smoother with independent attack and release time constants — the single smoothing
-/// primitive the multi-loop gain stages are built from (`Specs/TechnicalConcept.md` section 5.2).
+/// primitive the gain loop is built from (`Specs/TechnicalConcept.md` section 5.2).
 /// Whichever direction `target` moves relative to the current value picks the attack or the release
 /// constant, matching standard compressor/expander ballistics.
 ///
-/// Time constants and the time step are passed **per call** rather than stored. That is what lets
-/// the three loops share one primitive while running at genuinely different rates: the slow and mid
-/// stages step once per ~100ms control tick, the fast stage steps once per audio sub-chunk (a
-/// fraction of a millisecond), and the "Speed" macro rescales every constant live without having to
-/// rebuild anything or lose the in-flight value.
+/// Time constants and the time step are passed **per call** rather than stored, so Attack and
+/// Release can change live - and the release be eased in - without rebuilding anything or losing
+/// the in-flight value. The step is exact for any `dt_seconds`, which is what lets the loop run at
+/// audio sub-chunk rate.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EnvelopeDetector {
     current: f64,

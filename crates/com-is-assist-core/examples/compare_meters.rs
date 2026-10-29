@@ -18,7 +18,7 @@ fn main() {
     println!("{path}: {channels}ch {}Hz, {} frames", spec.sample_rate, samples.len() / channels);
 
     let map = Ebur128Meter::bed_channel_map(channels as u32).expect("channel map");
-    let mut ours = KWeightedLoudnessMeter::new(&map, spec.sample_rate, 0.05);
+    let mut ours = KWeightedLoudnessMeter::new(&map, spec.sample_rate);
     let mut r128 = Ebur128Meter::new(&map, spec.sample_rate).unwrap();
 
     let tick = spec.sample_rate as usize / 10 * channels;

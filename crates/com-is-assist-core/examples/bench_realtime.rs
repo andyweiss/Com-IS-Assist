@@ -56,13 +56,13 @@ fn main() {
     println!("block {block} frames @ {RATE}Hz -> {budget_us:.1}us of real time per block, {blocks} blocks\n");
 
     let mut processor =
-        AutomixProcessor::new(BED_CHANNELS as u32, RATE, AutomixEngineConfig::default(), 0.1).expect("processor");
+        AutomixProcessor::new(BED_CHANNELS as u32, RATE, AutomixEngineConfig::default()).expect("processor");
     let mut com_vad = BackgroundVad::new(RATE, VoiceActivityConfig::default(), true).expect("com vad");
     let mut is_vad = BackgroundVad::new(RATE, VoiceActivityConfig::default(), false).expect("is vad");
 
     let mut s_feed = Stats::new("  feed_dialogue");
     let mut s_bed = Stats::new("  process_bed");
-    let mut s_ctl = Stats::new("  control step (tick)");
+    let mut s_ctl = Stats::new("  set_voice_activity");
     let mut s_com = Stats::new("COM VAD feed");
     let mut s_is = Stats::new("IS VAD feed");
     let mut s_wrap = Stats::new("wrapper buffer shuffling");
@@ -103,12 +103,12 @@ fn main() {
         s_feed.samples.push(t.elapsed().as_secs_f64() * 1e6);
 
         let t = Instant::now();
-        let _ = processor.process_bed(&mut interleaved_bed);
-        s_bed.samples.push(t.elapsed().as_secs_f64() * 1e6);
+        processor.set_voice_activity(com_vad.voice_active(), is_vad.voice_active());
+        s_ctl.samples.push(t.elapsed().as_secs_f64() * 1e6);
 
         let t = Instant::now();
-        processor.maybe_run_control_step(com_vad.voice_active(), is_vad.voice_active());
-        s_ctl.samples.push(t.elapsed().as_secs_f64() * 1e6);
+        let _ = processor.process_bed(&mut interleaved_bed);
+        s_bed.samples.push(t.elapsed().as_secs_f64() * 1e6);
 
         s_all.samples.push(t_all.elapsed().as_secs_f64() * 1e6);
         std::hint::black_box(&interleaved_bed);

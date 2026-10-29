@@ -9,7 +9,7 @@
 //!
 //! What it measures is the whole chain: the resampler's input chunk, Silero's own 32ms inference
 //! hop, and the hangover logic. It does *not* include `BackgroundVad`'s poll interval (add up to
-//! that) or the automix control tick (see `AutomixProcessor`).
+//! that).
 
 use com_is_assist_core::automix::{AutomixEngineConfig, AutomixProcessor};
 use com_is_assist_core::voice_activity::{SileroVad, VoiceActivityConfig};
@@ -90,7 +90,7 @@ fn main() {
     report("VAD flag", &mut latencies);
 
     // End to end: the figure an operator actually hears - speech onset to the bed starting to
-    // move. Adds the control path on top of the detector: state adoption, the fast stage's own
+    // move. Adds the control path on top of the detector: state adoption, the gain loop's
     // attack, and the gain ramp.
     let mut duck = Vec::new();
     for &region in &regions {
@@ -109,7 +109,6 @@ fn main() {
             1,
             rate,
             AutomixEngineConfig { com_gate_lufs: -70.0, ..AutomixEngineConfig::default() },
-            0.1,
         )
         .expect("processor");
 
@@ -121,7 +120,6 @@ fn main() {
             processor.set_voice_activity(active, false);
             let mut bed = bed_tone[start..start + BLOCK].to_vec();
             processor.process_bed(&mut bed).expect("bed");
-            processor.maybe_run_control_step(active, false);
             if processor.applied_gain_reduction_db() > 0.5 && start >= silence {
                 duck.push((start - silence) as f64 / rate as f64 * 1000.0);
                 break;

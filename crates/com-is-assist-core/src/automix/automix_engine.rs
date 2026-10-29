@@ -1,6 +1,4 @@
-use super::loop_bank::{
-    LoopBank, LoopBankConfig, LoopContributions, REFERENCE_ATTACK_SECONDS, REFERENCE_RELEASE_SECONDS,
-};
+use super::gain_loop::{GainLoop, GainLoopConfig, DEFAULT_ATTACK_SECONDS, DEFAULT_RELEASE_SECONDS};
 use super::mix_state::MixState;
 use crate::loudness::{BedLayout, Ebur128Meter};
 
@@ -18,7 +16,7 @@ fn required_reduction(target_ratio_lu: f64, bed_lufs: f64, dialogue_lufs: f64) -
 }
 
 /// Target policy for [`AutomixEngine`]. See `Specs/TechnicalConcept.md` section 5 for the state
-/// machine (5.1) and the multi-loop control law (5.2) these values feed.
+/// machine (5.1) and the control law (5.2) these values feed.
 #[derive(Debug, Clone, Copy)]
 pub struct AutomixEngineConfig {
     /// `UI.md`'s "Com/IS distance": how many LU COM should sit *above* IS while the commentator is
@@ -44,32 +42,14 @@ pub struct AutomixEngineConfig {
     /// protect nothing. Useful settings are typically 20-30 dB below the commentator's own
     /// momentary level.
     pub com_gate_lufs: f64,
-    /// **Attack**, in seconds: the mid stage's attack time constant, with the slow and fast stages'
-    /// attacks scaled by the same ratio (see [`REFERENCE_ATTACK_SECONDS`] for why the mid stage is
-    /// the one named). Default 0.15s.
+    /// **Attack**, in seconds: the time constant with which the reduction moves toward a larger
+    /// answer. Default 2.5s - see [`DEFAULT_ATTACK_SECONDS`] for why it is long.
     pub attack_seconds: f64,
-    /// **Release**, in seconds: the slow stage's release time constant, with the mid and fast
-    /// stages' releases scaled by the same ratio (see [`REFERENCE_RELEASE_SECONDS`]). Default 3s.
+    /// **Release**, in seconds: the time constant with which the reduction lets go. Default 3s.
     ///
     /// The release ease-in after ducking stops (`RELEASE_HOLD_SECONDS`) and the faster interview
     /// recovery are fixed proportions on top of this, not separate settings.
     pub release_seconds: f64,
-    /// `false` takes the fast stage out of the cascade altogether, leaving slow + mid. For A/B
-    /// comparison: the fast stage is the one that reacts within milliseconds to a Bed surge, and
-    /// whether that is worth its audible activity depends on the material.
-    pub fast_stage: bool,
-    /// **Tolerance**, in LU: how far the programme may stray from the slow stage's answer before
-    /// the mid and fast stages react. Only what lies beyond it is acted on (a soft threshold), so
-    /// a real surge still gets through, minus this amount.
-    ///
-    /// It exists because both trim stages are, by design, quick to grab and slow to let go - and a
-    /// follower like that sits *above* a fluctuating input, acting as a peak detector. Its excess
-    /// therefore scales with how much the Bed's level fluctuates, not with how much ducking is
-    /// needed: measured on real programme, a balance needing ~2 dB was getting 4.8 dB on average
-    /// and travelling 8 dB/s. Inside the tolerance there is nothing to follow, so that excess goes
-    /// away while large corrections are left alone. 0 is the pre-feature behaviour. The slow stage
-    /// is never subject to it - it is the answer the tolerance is measured against.
-    pub tolerance_lu: f64,
     /// How much of the computed gain reduction each group of Bed channels receives - see
     /// [`DuckDepth`].
     pub duck_depth: DuckDepth,
@@ -84,7 +64,7 @@ pub const MAX_BED_CHANNELS: usize = 10;
 /// ducking is 3 dB.
 ///
 /// This is a *distribution* control, not a second gain stage: the reduction itself is still
-/// computed once, from the whole Bed's loudness, by the state machine and the cascade. All it
+/// computed once, from the whole Bed's loudness, by the state machine and the gain loop. All it
 /// changes is how that one answer is spread - which is why leaving every group at 1.0 reproduces
 /// the pre-feature behaviour exactly.
 ///
@@ -187,46 +167,23 @@ impl Default for AutomixEngineConfig {
             // point on real commentary: comfortably under a commentator's own momentary level,
             // comfortably over the bed's bleed into the mic.
             com_gate_lufs: -32.0,
-            attack_seconds: REFERENCE_ATTACK_SECONDS,
-            release_seconds: REFERENCE_RELEASE_SECONDS,
-            fast_stage: true,
-            // The same 2 LU the ratio meter has always drawn as "on target" - now the mixer agrees
-            // with it. Measured on real programme needing ~2 dB: mean reduction 4.8 -> 3.6 dB,
-            // gain travel 8.3 -> 4.7 dB/s (3 LU: 3.1 dB, 3.5 dB/s, at the cost of letting more of
-            // a genuine surge through).
-            tolerance_lu: 2.0,
+            attack_seconds: DEFAULT_ATTACK_SECONDS,
+            release_seconds: DEFAULT_RELEASE_SECONDS,
             duck_depth: DuckDepth::default(),
         }
     }
 }
 
-/// The loudness readings one control tick works from, all measured **feed-forward on the dry
-/// signals** — see [`AutomixEngine::process_tick`].
+/// The loudness readings one step works from, both measured **feed-forward on the dry signals** on
+/// R128's 3s short-term window - see [`AutomixEngine::step`].
 ///
-/// Note the asymmetry: the Bed is read at several speeds, the Dialogue at only one. That is
-/// deliberate and is what the stages actually differ in.
-///
-/// **Why only the Bed gets fast detectors.** `ratio = COM − BED`, so `required = target − ratio`:
-/// if COM gets *louder* the ratio rises and *less* ducking is needed, not more. The event that
-/// genuinely demands a fast response is therefore a **Bed** surge — a crowd roar burying the
-/// commentator — not a COM one. Driving the fast stages from COM as well was tried and was wrong
-/// twice over: at 50ms a speech signal's "level" is its syllable envelope, so the stage tracked
-/// vowels and modulated the Bed at syllable rate; and because a 3s window over speech-with-gaps
-/// measures a systematically quieter COM than a 400ms window during speech, the stages disagreed
-/// by a constant offset and sat fighting each other (measured: the mid stage parked at −2 to −5 dB
-/// while the fast stage repeatedly saturated its +4 dB clamp).
-///
-/// Reading COM at one stable speed for every stage removes both problems: the stages now measure
-/// the *same* quantity and differ only in how quickly they see the Bed move, so they agree in
-/// steady state and separate only during a Bed transient — which is exactly the intended division
-/// of labour.
+/// Short-term on *both* sides, deliberately. Reading either side faster was tried, in the
+/// three-stage cascade this replaced: COM read quickly tracks the syllable envelope of speech, and a quickly-read Bed
+/// on a fluctuating programme gets peak-followed, so the mixer reduces more than the balance needs
+/// and keeps moving. One window on both sides measures one quantity - the programme balance.
 #[derive(Debug, Clone, Copy)]
 pub struct LoudnessSnapshot {
-    /// Bed at the 3s short-term window — the slow stage's detector.
     pub bed_short_term_lufs: f64,
-    /// Bed at the 400ms momentary window — the mid stage's detector.
-    pub bed_momentary_lufs: f64,
-    /// COM at the 3s short-term window. The single Dialogue reference every stage works against.
     pub dialogue_short_term_lufs: f64,
 }
 
@@ -234,55 +191,51 @@ pub struct LoudnessSnapshot {
 pub struct AutomixResult {
     pub gain_reduction_db: f64,
     pub gain_linear: f64,
-    /// Which state produced this tick's result — surfaced so wrappers can display it and tests can
+    /// Which state produced this step's result — surfaced so wrappers can display it and tests can
     /// assert on the state machine directly rather than inferring it from gain values.
     pub state: MixState,
-    pub contributions: LoopContributions,
 }
 
 /// Decides *what* the mixer should be doing (the four-state machine) and hands the question of
-/// *how* to get there to the multi-loop [`LoopBank`].
+/// *how* to get there to the [`GainLoop`].
 ///
 /// The split matters: the state machine is the part that was already right, and it stays exactly as
-/// it was. Everything underneath it — a single feedback loop with five time constants — was
-/// replaced by the feed-forward cascade, because no amount of tuning fixes a topology whose
-/// measurement lags its actuation by three seconds.
+/// it was. Underneath it, an original feedback loop with five time constants was replaced by a
+/// feed-forward one, because no amount of tuning fixes a topology whose measurement lags its
+/// actuation by three seconds.
 pub struct AutomixEngine {
     config: AutomixEngineConfig,
-    loops: LoopBank,
+    gain_loop: GainLoop,
     previous_state: MixState,
 }
 
 impl AutomixEngine {
     pub fn new(config: AutomixEngineConfig) -> Self {
         Self {
-            loops: LoopBank::new(Self::loop_config(&config)),
+            gain_loop: GainLoop::new(Self::loop_config(&config)),
             config,
             previous_state: MixState::ReleaseToUnity,
         }
     }
 
-    fn loop_config(config: &AutomixEngineConfig) -> LoopBankConfig {
-        let defaults = LoopBankConfig::default();
-        LoopBankConfig {
-            attack_scale: config.attack_seconds / REFERENCE_ATTACK_SECONDS,
-            release_scale: config.release_seconds / REFERENCE_RELEASE_SECONDS,
+    fn loop_config(config: &AutomixEngineConfig) -> GainLoopConfig {
+        GainLoopConfig {
+            attack_seconds: config.attack_seconds,
+            release_seconds: config.release_seconds,
             max_gain_reduction_db: config.max_gain_reduction_db,
-            fast_authority_db: if config.fast_stage { defaults.fast_authority_db } else { 0.0 },
-            trim_dead_band_db: config.tolerance_lu.max(0.0),
-            ..defaults
         }
     }
 
-    /// Call once per ~100ms control tick with dry-signal loudness at both R128 windows, the two
-    /// voice-activity flags, and the elapsed time since the previous call.
+    /// Advances the mixer by `dt_seconds`, given dry-signal short-term loudness on both sides and
+    /// the two voice-activity flags. Wrappers call it once per audio sub-chunk (~1.3ms), so a state
+    /// change takes effect at once and the gain follows a smooth curve; any step size works,
+    /// because the loop's ballistics are exact for any `dt`.
     ///
-    /// The required reduction at each time scale is computed directly:
-    /// `required = target_ratio − (COM − BED)`. That identity holds because reducing the Bed by
+    /// The required reduction is computed directly: `required = target_ratio − (COM − BED)`. That identity holds because reducing the Bed by
     /// 1 dB raises the ratio by exactly 1 LU, and it is exact only because both readings come from
     /// the **dry** signals. Measuring the already-ducked Bed (as this engine used to) turns the
     /// same expression into a feedback loop that cannot see its own effect for three seconds.
-    pub fn process_tick(
+    pub fn step(
         &mut self,
         loudness: LoudnessSnapshot,
         com_voice_active: bool,
@@ -296,69 +249,26 @@ impl AutomixEngine {
             // needed one: after a gap its measurement was stale, so it had to be told where to
             // resume from, and that seeding produced an instantaneous ~19dB jump in the applied
             // gain. Feed-forward has nothing stale to compensate for - the dry levels are correct
-            // on the very first tick back - and the cascade covers the onset on its own: the mid
-            // stage engages within ~150ms and the fast stage within milliseconds, while the slow
-            // stage takes over the steady state behind them. Measured on real commentary, removing
-            // the trigger cut the largest single-tick gain movement from 19.4dB to 8.0dB with no
-            // loss of onset response.
+            // on the very first step back, so the loop's own attack is all the onset needs.
+            // Measured on real commentary, removing the trigger cut the largest single-tick gain
+            // movement from 19.4dB to 8.0dB with no loss of onset response.
             let target = match state {
                 MixState::DuckToOvervoice => self.config.overvoice_ratio_lu,
                 _ => self.config.target_ratio_lu,
             };
-            let required_slow = required_reduction(
+            let required = required_reduction(
                 target,
                 loudness.bed_short_term_lufs,
                 loudness.dialogue_short_term_lufs,
             );
-            let required_mid = required_reduction(
-                target,
-                loudness.bed_momentary_lufs,
-                loudness.dialogue_short_term_lufs,
-            );
-            self.loops.update_slow_mid(required_slow, required_mid, dt_seconds);
+            self.gain_loop.update(required, dt_seconds);
         } else {
-            self.loops
+            self.gain_loop
                 .update_release(state == MixState::InterviewPassthrough, dt_seconds);
         }
 
         self.previous_state = state;
         self.result(state)
-    }
-
-    /// Adopts the state the two detectors currently imply, without waiting for the next control
-    /// tick.
-    ///
-    /// The tick runs at ~100ms because that is the rate at which R128 loudness carries new
-    /// information. The *state*, though, comes from the VADs, which say something new as soon as
-    /// they are asked - and letting a state change wait for the tick added up to 100ms on top of
-    /// the detector's own latency, which was audible as the bed ducking a syllable late. Called
-    /// per audio block, the fast stage starts ducking within a sub-chunk of the detector firing
-    /// while the slow and mid stages still update on the tick, which is the cascade behaving as
-    /// designed - fast first, slow taking over.
-    ///
-    /// Returns the state now in force.
-    pub fn set_state_from_vad(&mut self, com_voice_active: bool, is_voice_active: bool) -> MixState {
-        self.previous_state = MixState::from_vad(com_voice_active, is_voice_active);
-        self.loops.set_releasing(!self.previous_state.is_ducking());
-        self.previous_state
-    }
-
-    /// Steps the fast stage between control ticks, at audio sub-chunk rate, from the fast
-    /// K-weighted **Bed** detector against the stable COM reference (see [`LoudnessSnapshot`] for
-    /// why COM is not read fast). Uses the state the last control tick resolved to — the state
-    /// machine runs on VAD, which does not change meaningfully within one audio block.
-    pub fn process_fast(&mut self, bed_fast_lufs: f64, dialogue_reference_lufs: f64, dt_seconds: f64) -> f64 {
-        let required = if self.previous_state.is_ducking() {
-            let target = match self.previous_state {
-                MixState::DuckToOvervoice => self.config.overvoice_ratio_lu,
-                _ => self.config.target_ratio_lu,
-            };
-            required_reduction(target, bed_fast_lufs, dialogue_reference_lufs)
-        } else {
-            None
-        };
-        self.loops.update_fast(required, dt_seconds);
-        self.loops.total_reduction_db()
     }
 
     /// The ratio target the engine is currently aiming at, for metering.
@@ -370,37 +280,28 @@ impl AutomixEngine {
     }
 
     fn result(&self, state: MixState) -> AutomixResult {
-        let contributions = self.loops.contributions();
-        AutomixResult {
-            gain_reduction_db: contributions.total_db,
-            gain_linear: 10f64.powf(-contributions.total_db / 20.0),
-            state,
-            contributions,
-        }
+        let gain_reduction_db = self.gain_loop.reduction_db();
+        AutomixResult { gain_reduction_db, gain_linear: 10f64.powf(-gain_reduction_db / 20.0), state }
     }
 
-    /// Replaces the config in place without disturbing any in-flight stage value, so host
+    /// Replaces the config in place without disturbing the in-flight reduction, so host
     /// automation (or a dragged slider) takes effect on the next step.
     pub fn set_config(&mut self, config: AutomixEngineConfig) {
         self.config = config;
-        self.loops.set_config(Self::loop_config(&config));
+        self.gain_loop.set_config(Self::loop_config(&config));
     }
 
     pub fn current_gain_reduction_db(&self) -> f64 {
-        self.loops.total_reduction_db()
+        self.gain_loop.reduction_db()
     }
 
-    pub fn contributions(&self) -> LoopContributions {
-        self.loops.contributions()
-    }
-
-    /// The state the most recent `process_tick` resolved to (`ReleaseToUnity` before the first).
+    /// The state the most recent `step` resolved to (`ReleaseToUnity` before the first).
     pub fn current_state(&self) -> MixState {
         self.previous_state
     }
 
     pub fn reset(&mut self) {
-        self.loops.reset();
+        self.gain_loop.reset();
         self.previous_state = MixState::ReleaseToUnity;
     }
 }

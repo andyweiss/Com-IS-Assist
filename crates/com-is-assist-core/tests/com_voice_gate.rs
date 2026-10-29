@@ -1,7 +1,5 @@
 use com_is_assist_core::automix::{AutomixEngineConfig, AutomixProcessor};
 
-const TICK: f64 = 0.1;
-
 fn sine(freq: f64, amp: f32, rate: u32, frames: usize) -> Vec<f32> {
     (0..frames)
         .map(|i| amp * (2.0 * std::f64::consts::PI * freq * i as f64 / rate as f64).sin() as f32)
@@ -13,7 +11,6 @@ fn processor(gate_lufs: f64) -> AutomixProcessor {
         1,
         48_000,
         AutomixEngineConfig { com_gate_lufs: gate_lufs, ..AutomixEngineConfig::default() },
-        TICK,
     )
     .expect("valid config")
 }
@@ -28,9 +25,9 @@ fn quiet_com_is_gated_out_even_when_voice_is_reported() {
 
     for _ in 0..40 {
         p.feed_dialogue(&quiet).unwrap();
+        p.set_voice_activity(true, false); // detector insists there IS voice
         let mut bed = sine(400.0, 0.3, rate, 4_800);
         p.process_bed(&mut bed).unwrap();
-        p.maybe_run_control_step(true, false); // detector insists there IS voice
     }
 
     assert!(
@@ -50,9 +47,9 @@ fn loud_com_passes_the_guard_band() {
 
     for _ in 0..40 {
         p.feed_dialogue(&loud).unwrap();
+        p.set_voice_activity(true, false);
         let mut bed = sine(400.0, 0.3, rate, 4_800);
         p.process_bed(&mut bed).unwrap();
-        p.maybe_run_control_step(true, false);
     }
 
     assert!(
@@ -75,9 +72,9 @@ fn the_default_guard_band_does_not_gate_normal_programme() {
 
     for _ in 0..40 {
         p.feed_dialogue(&normal).unwrap();
+        p.set_voice_activity(true, false);
         let mut bed = sine(400.0, 0.3, rate, 4_800);
         p.process_bed(&mut bed).unwrap();
-        p.maybe_run_control_step(true, false);
     }
     assert!(
         p.com_voice_gated(),
