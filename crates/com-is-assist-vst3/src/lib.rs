@@ -1367,7 +1367,12 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
 
     const MIDI_INPUT: MidiConfig = MidiConfig::None;
     const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
+    // Off, deliberately. With it on, nih-plug splits the audio block at every parameter change, so
+    // dragging a control - which the host reports as a stream of changes - turned one block into
+    // many small `process()` calls, each paying the whole per-call cost. Nothing here can use
+    // sample accuracy anyway: parameters are read once per block, and the gain loop's time
+    // constants are seconds long.
+    const SAMPLE_ACCURATE_AUTOMATION: bool = false;
 
     type SysExMessage = ();
     type BackgroundTask = ();
@@ -1746,6 +1751,13 @@ impl<F: BedFormat> Plugin for ComISAssist<F> {
             buffer_config.sample_rate as u32,
             self.params.automix_config(),
         ));
+        // Sized here, off the audio thread, so `process()` never has to grow them - see the
+        // fields' doc comment.
+        let max_frames = buffer_config.max_buffer_size as usize;
+        let bed_channels = F::LAYOUT.channel_count() as usize;
+        self.interleaved_bed = vec![0.0; max_frames * bed_channels];
+        self.dialogue_scratch = vec![0.0; max_frames];
+        self.mono_bed_scratch = vec![0.0; max_frames];
         // `.ok()`, not `.expect(...)`: if this fails (e.g. the ONNX Runtime binary couldn't be
         // obtained), `process()` fails open rather than the whole plugin refusing to initialize
         // over what's ultimately just a display/gating refinement, not the core automix path.

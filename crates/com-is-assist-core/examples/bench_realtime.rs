@@ -63,6 +63,7 @@ fn main() {
     let mut s_feed = Stats::new("  feed_dialogue");
     let mut s_bed = Stats::new("  process_bed");
     let mut s_ctl = Stats::new("  set_voice_activity");
+    let mut s_cfg = Stats::new("  set_config (changing)");
     let mut s_com = Stats::new("COM VAD feed");
     let mut s_is = Stats::new("IS VAD feed");
     let mut s_wrap = Stats::new("wrapper buffer shuffling");
@@ -98,6 +99,17 @@ fn main() {
         is_vad.feed(&mono_bed);
         s_is.samples.push(t.elapsed().as_secs_f64() * 1e6);
 
+        // A different config every block, as while a control is being dragged: the wrapper
+        // refreshes the config every block, so this must cost nothing however often it changes.
+        let t = Instant::now();
+        let x = (b % 100) as f64 / 100.0;
+        processor.set_config(AutomixEngineConfig {
+            attack_seconds: 0.5 + 4.0 * x,
+            target_ratio_lu: 3.0 + 6.0 * x,
+            ..AutomixEngineConfig::default()
+        });
+        s_cfg.samples.push(t.elapsed().as_secs_f64() * 1e6);
+
         let t = Instant::now();
         let _ = processor.feed_dialogue(&dialogue);
         s_feed.samples.push(t.elapsed().as_secs_f64() * 1e6);
@@ -114,7 +126,7 @@ fn main() {
         std::hint::black_box(&interleaved_bed);
     }
 
-    for s in [&mut s_wrap, &mut s_com, &mut s_is, &mut s_feed, &mut s_bed, &mut s_ctl, &mut s_all] {
+    for s in [&mut s_wrap, &mut s_com, &mut s_is, &mut s_cfg, &mut s_feed, &mut s_bed, &mut s_ctl, &mut s_all] {
         s.report(budget_us);
     }
     // Expected to be large: this loop pushes ten seconds of audio in a fraction of a second, so

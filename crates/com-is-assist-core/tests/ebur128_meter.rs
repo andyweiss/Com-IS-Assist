@@ -72,7 +72,7 @@ fn seven_one_two_weights_the_side_pair_not_ls_rs() {
     let map = BedLayout::Surround712.channel_map();
     assert_eq!(map.len(), 10);
     let loudness_with_signal_on = |channels: [usize; 2]| {
-        let mut meter = Ebur128Meter::new(&map, 48_000).unwrap();
+        let mut meter = Ebur128Meter::new(map, 48_000).unwrap();
         let mut frames = vec![0.0_f32; 48_000 * 10];
         for (i, frame) in frames.chunks_mut(10).enumerate() {
             let s = 0.1 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48_000.0).sin();

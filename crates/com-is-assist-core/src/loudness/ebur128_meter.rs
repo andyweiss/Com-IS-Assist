@@ -62,6 +62,10 @@ impl BedLayout {
 
     /// BS.1770 channel map, one entry per interleaved channel.
     ///
+    /// A `'static` slice rather than a `Vec`: it is read on the audio thread whenever settings
+    /// change (to resolve duck depth), and an allocation there turned into dropouts while a control
+    /// was being dragged. See `tests/realtime_alloc.rs`.
+    ///
     /// The LFE is `Unused`: BS.1770 excludes it from the loudness sum. Elevated channels sit at the
     /// ITU-R BS.2051 positions for their layout (5.1.4 is System D: U±030 front, U±110 rear; the
     /// 7.1.2 top pair is U±090) and are weighted 1.0, like the front pair.
@@ -70,19 +74,19 @@ impl BedLayout {
     /// (M±135). That matters for loudness, not just labelling: BS.1770 gives the +1.5 dB surround
     /// weight only to channels between 60° and 120°, so the side pair takes it and the rear pair,
     /// unlike Ls/Rs on 5.1 (M±110), does not.
-    pub fn channel_map(self) -> Vec<Channel> {
+    pub fn channel_map(self) -> &'static [Channel] {
         use Channel::{
             Center, Left, LeftSurround, Mm090, Mm135, Mp090, Mp135, Right, RightSurround, Um030, Um090,
             Um110, Unused, Up030, Up090, Up110,
         };
         match self {
-            Self::Mono => vec![Center],
-            Self::Stereo => vec![Left, Right],
-            Self::Lrc => vec![Left, Right, Center],
-            Self::Quad => vec![Left, Right, LeftSurround, RightSurround],
-            Self::Surround50 => vec![Left, Right, Center, LeftSurround, RightSurround],
-            Self::Surround51 => vec![Left, Right, Center, Unused, LeftSurround, RightSurround],
-            Self::Surround514 => vec![
+            Self::Mono => &[Center],
+            Self::Stereo => &[Left, Right],
+            Self::Lrc => &[Left, Right, Center],
+            Self::Quad => &[Left, Right, LeftSurround, RightSurround],
+            Self::Surround50 => &[Left, Right, Center, LeftSurround, RightSurround],
+            Self::Surround51 => &[Left, Right, Center, Unused, LeftSurround, RightSurround],
+            Self::Surround514 => &[
                 Left,
                 Right,
                 Center,
@@ -94,7 +98,7 @@ impl BedLayout {
                 Up110, // Top Rear Left
                 Um110, // Top Rear Right
             ],
-            Self::Surround712 => vec![
+            Self::Surround712 => &[
                 Left,
                 Right,
                 Center,
@@ -198,7 +202,7 @@ impl Ebur128Meter {
     /// knows the actual layout (the VST3 does) should use [`BedLayout::channel_map`] instead, since
     /// a channel count alone cannot tell 5.1.4 from 7.1.2.
     pub fn bed_channel_map(channel_count: u32) -> Result<Vec<Channel>, ConfigError> {
-        Ok(BedLayout::from_channel_count(channel_count)?.channel_map())
+        Ok(BedLayout::from_channel_count(channel_count)?.channel_map().to_vec())
     }
 
     /// Default BS.1770 channel map for this project's mono Dialogue (COM) signal.

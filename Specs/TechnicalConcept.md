@@ -277,6 +277,13 @@ Three periodic spikes, all now removed:
 
 `Ebur128Meter` is no longer in the audio path at all. It remains as the conformance reference the incremental meter is tested against.
 
+**Dropouts while adjusting settings.** These were reported later, and they did not show in the benchmark, because they needed two things the benchmark did not have:
+
+- **An allocation on every block.** `set_config` runs every block so that live parameter changes take effect. It rebuilt the duck-depth table from `BedLayout::channel_map()`, which returned a freshly allocated `Vec`. On an idle allocator that is fast enough to go unnoticed. While a control is being dragged, the GUI thread is allocating heavily to repaint, the two threads contend for the allocator, and the audio thread can stall. `channel_map` now returns a `'static` slice. The plugin's scratch buffers, which their own doc comment said were preallocated but were in fact grown on the first blocks, are now sized at `initialize()` from the host's maximum block size.
+- **Sample-accurate automation.** With it on, nih-plug splits each audio block at every parameter change. A dragged control arrives as a stream of changes, so one block became many small `process()` calls, each paying the whole per-call cost. Nothing in this plugin can use sample accuracy, since parameters are read once per block and the gain loop's time constants are seconds long, so it is off.
+
+`tests/realtime_alloc.rs` guards the first: it installs a counting global allocator and holds 2000 blocks of the full per-block call sequence, with the config changing on every block, on all four bed layouts, to **zero** allocations. Before the fix it counted exactly one per block. `bench_realtime` now also times `set_config` with a changing config: at most 0.5 µs.
+
 ## 9b. Detection latency
 
 Reported as the bed ducking audibly late. Measured on real commentary by splicing speech at a known sample after silence (`cargo run --release --example detect_latency -- <mono.wav>`), the delay from speech onset to the bed starting to move was **~150-300ms**. Four causes, three of them ours:

@@ -90,7 +90,7 @@ impl AutomixProcessor {
             bed_layout,
             bed_channels,
             sample_rate,
-            bed_meter: KWeightedLoudnessMeter::new(&bed_map, sample_rate),
+            bed_meter: KWeightedLoudnessMeter::new(bed_map, sample_rate),
             dialogue_meter: KWeightedLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate),
             automix_engine: AutomixEngine::new(automix_config),
             current_gain: [1.0; MAX_BED_CHANNELS],
