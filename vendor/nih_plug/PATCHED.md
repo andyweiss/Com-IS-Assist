@@ -41,6 +41,10 @@ For this plugin, the result is: main bus `kStereo` / `k51` / `k51_4` / `k71_2`, 
 The `Cargo.toml` also differs from upstream: its `[workspace]` and `[profile.*]` sections were
 removed, since the crate is no longer a workspace root.
 
+Two more `COM-IS PATCH` changes only quiet the build log: a `[lints.rust]` entry in `Cargo.toml`
+that declares `objc`'s `cargo-clippy` cfg, and an `#[allow(unused_imports)]` on the
+`unsafe_clap_call` re-export in `src/wrapper/clap/util.rs`.
+
 ## Updating
 
 Copy `src/`, `nih_plug_derive/` and `Cargo.toml` from the new upstream commit, remove `[workspace]`

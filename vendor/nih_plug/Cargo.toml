@@ -100,3 +100,8 @@ features = [
   "Win32_System_LibraryLoader",
   "Win32_System_Performance",
 ]
+
+# COM-IS PATCH: build-log noise only. `objc`'s `msg_send!`/`class!` test `feature = "cargo-clippy"`,
+# which current rustc no longer knows.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
