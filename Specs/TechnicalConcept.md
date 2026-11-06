@@ -44,14 +44,16 @@ crates/
                               # feed-forward redesign - the ratio is now read straight off the dry
                               # short-term meters, and the VADs replaced the valid latch.
       automix/               # mix_state (the 4-state machine, §5.1), gain_loop (the one
-                              # feed-forward loop, §5.2), k_weighted_loudness (every loudness window the
+                              # feed-forward loop, §5.2), speech_loudness (COM's level while
+                              # speaking, §5.2), k_weighted_loudness (every loudness window the
                               # control path reads - see §9a),
                               # envelope_detector (shared smoother),
                               # automix_engine, gain_ramp, dialogue_mix, processor (shared facade)
       voice_activity/        # SileroVad via `ort` + `rubato` - one instance per side (COM and
                               # IS) - and BackgroundVad, which runs them off the audio thread (§9a)
     tests/                    # automix_engine.rs, com_voice_gate.rs, duck_depth.rs,
-                              # ebur128_meter.rs, envelope_detector.rs
+                              # ebur128_meter.rs, envelope_detector.rs, realtime_alloc.rs,
+                              # speech_reference.rs
   com-is-assist-vst3/                 # nih-plug-based wrapper around com-is-assist-core
   com-is-assist-offline/              # CLI: WAV(bed)+WAV(dialogue) -> CSV metrics + rendered WAVs
     Cargo.toml                # deps: com-is-assist-core (path), hound
@@ -122,39 +124,58 @@ Applied in `AutomixProcessor::process_bed` at the existing single gain choke poi
 
 ### 5.2 Control law: one feed-forward loop
 
-One gain loop, reading the 3 s short-term window on both sides:
+One gain loop. The Bed is read on the 3 s short-term window, and COM is read as the commentator's level **while speaking**:
 
 ```
-Bed(dry) ─┬──────────────────────────► ×g ──► Bed out
-          │                             ▲
-          └──► short-term ──┐           │
-                            ├─► required = target − (COM − BED) ─► Attack/Release ─┘
-COM(dry) ───► short-term ───┘
+Bed(dry) ─┬───────────────────────────────────────► ×g ──► Bed out
+          │                                          ▲
+          └──► short-term (3 s) ──────┐              │
+                                      ├─► required = target − (COM − BED) ─► Attack/Release ─┘
+COM(dry) ───► speech level ───────────┘
+              (integrated while voice is detected)
 ```
 
 `GainLoop` (`automix/gain_loop.rs`) is a one-pole follower with separate **Attack** and **Release** time constants (`EnvelopeDetector`), stepped every 64-sample sub-chunk (~1.3 ms at 48 kHz) by `AutomixProcessor::process_bed`. Its readings are O(1) to query (§9a), and the follower is exact for any step size, so the gain follows a smooth curve whatever buffer size the host uses, and a voice-detector state change takes effect at once.
 
 | | default | range (VST3) |
 |---|---|---|
-| Attack | 2.5 s | 0.1–10 s |
+| Attack | 1 s | 0.1–10 s |
 | Release | 3 s | 0.4–12 s |
 
-**Attack is long on purpose**, and this is the single most important tuning fact. A follower that is quicker to grab than to let go sits *above* a fluctuating input: it rides the peaks. So the reduction it applies exceeds what the programme balance needs, by an amount set by how much the bed's level fluctuates, not by how much ducking is called for. With attack close to release the follower averages instead. Measured with `examples/subtle_reduction.rs` on real broadcast programme: 35 min of commentary against a stereo bed, two separate 10-minute sections, COM raised 6 dB so that ~1.9 dB is needed. Rows are ducking time where 1–3 dB was needed:
+**COM is measured only while it speaks** (`SpeechLoudness`, `automix/speech_loudness.rs`). The 3 s short-term window over speech also averages in the pauses between words and sentences. So it read the commentator systematically too low, which asked for too much reduction. It also swung within every sentence: climbing from near silence as a sentence began and dipping at every pause, so the reduction moved within the sentence. Users reported both, as "too much gain reduction" and "heavy movements within a sentence". The speech level follows BS.1770 integrated loudness:
 
-| Attack (Release 3 s) | mean reduction | RMS around needed | gain travel |
+- It takes one 400 ms momentary reading per 100 ms hop, with the gated COM voice flag (after the guard band, so rejected crosstalk is never measured as the commentator).
+- While voice is active, each block's energy is integrated, except blocks below −70 LUFS or more than 10 LU below the current estimate. Those are the gaps between words, which the detector's hangover holds the flag through.
+- While voice is inactive, nothing changes: the level **holds through pauses**.
+- When an utterance ends, its result becomes the **prior** for the next, with a fixed weight of 3 s of speech. Each sentence starts from where the last one left off and is pulled toward its own level as it goes on. History never piles up: an older sentence's influence shrinks geometrically with every new one, so a commentator who gets louder is followed within a sentence or two.
+
+Until the first utterance has been measured, COM short-term stands in. The Bed stays on the 3 s window so that a bed surge is still followed. Measuring the Bed only during speech too was simulated (`examples/speech_gated.rs`, variant C). It is calmer still within a sentence, but follows a mid-sentence surge slowly.
+
+Measured with `examples/speech_gated.rs` on real broadcast programme (35 min of commentary against a stereo bed, two separate 10-minute sections), scored per utterance. COM at its real level, and raised 6 dB so the needed reduction is subtle:
+
+| | mean reduction | movement within a sentence (median range) | gain travel | ratio vs target (mean) |
+|---|---|---|---|---|
+| COM 3 s window, Attack 2.5 s (v2.2) | 1.2–6.0 dB | 0.9–1.3 dB | 0.45–0.98 dB/s | +0.2 to +3.3 LU |
+| **COM speech level, Attack 1 s (now)** | **0.6–5.5 dB** | **0.0–1.0 dB** | **0.17–0.88 dB/s** | **−0.2 to +2.7 LU** |
+
+Less reduction and less movement in every case, and closer to the target in every case. (Positive errors at +6 dB are where COM was already above target with no ducking at all, which no reduction can fix.) `tests/speech_reference.rs` pins the mechanism: speech at the Bed's level with 50% gaps is ducked by the 5 dB target, where the 3 s reading asked for 7.8 dB, and the reduction moves 0.14 dB within the utterance against 0.40 dB before.
+
+**Attack is not short.** A follower that is quicker to grab than to let go sits *above* a fluctuating input: it rides the peaks, so the reduction exceeds what the balance needs. How much depends on how much the *reference* fluctuates. Against the 3 s COM reading it took 2.5 s to stop over-ducking. Measured with `examples/subtle_reduction.rs` with that reading, in ducking time where 1–3 dB was needed:
+
+| Attack (Release 3 s), COM 3 s window | mean reduction | RMS around needed | gain travel |
 |---|---|---|---|
 | 0.15 s | 3.8–4.2 dB | 2.9–3.3 dB | 1.1–1.2 dB/s |
 | 1 s | 2.4–3.0 dB | 1.4–1.9 dB | 0.6 dB/s |
-| **2.5 s (default)** | **1.6–2.2 dB** | **1.1–1.2 dB** | **0.3–0.4 dB/s** |
+| 2.5 s | 1.6–2.2 dB | 1.1–1.2 dB | 0.3–0.4 dB/s |
 | 5 s | 1.1–1.7 dB | 1.0–1.2 dB | 0.2 dB/s |
 
-**The cost is a slow response to a large, sudden need**, typically the commentator starting after a pause, or a bed surge. The 3 s window takes a second or more to register a change, and a 2.5 s attack takes about that long again to follow it. Where 6+ dB was needed, the default applied 2–6.5 dB on average. That is the trade made for a relaxed mix. 1 s is the setting to reach for if onsets are being covered for too long.
+Against the speech level, which holds still within and between sentences, 1 s lands on the target on average (at real levels, −0.2 and +0.1 LU on the two sections, where 2.5 s fell 0.6–0.9 LU short). It still moves less than 2.5 s did with the old reading, and it responds faster to a large, sudden need, such as the commentator starting after a pause or a bed surge.
 
 **How it got here.** The control law has been a feedback loop, then a three-stage feed-forward cascade, and is now one loop. Each step is worth knowing so it is not reverted:
 
 - **Feedback to feed-forward** (§4): measuring the gained Bed made the control see its own effect three seconds late. Every attempt to tune that topology traded windup and pumping against sluggishness.
 - **The cascade.** Three stages added in dB: the slow stage on the 3 s window, plus a mid stage on the 400 ms window (a ±6 dB trim, attack 150 ms / release 600 ms) and a fast stage on a ~50 ms K-weighted detector (a positive-only +4 dB trim, attack 5 ms / release 400 ms). It responded within 0.1 s. But both trim stages were quick to grab and slow to let go, so on a fluctuating bed they peak-followed. A balance needing ~2 dB got 4.1–4.8 dB on average, with the gain travelling 6.6–8.3 dB/s. A dead band ("Tolerance") on the trims and switching the fast stage off each helped. Making the mid stage symmetric did not, because the fast stage filled the gap. Neither removed the cause, and the result was harder to judge by ear than one honest loop. Both trim stages were removed, and the 50 ms detector with them.
-- **Reading COM quickly is wrong.** This was tried in the cascade. At short windows a speech signal's "level" is its syllable envelope, so the gain tracked vowels. And a 3 s window over speech-with-gaps reads COM systematically quieter than a 400 ms window during speech, so stages on different windows disagreed by a constant offset. One window on both sides measures one quantity: the programme balance.
+- **Reading COM quickly is wrong.** This was tried in the cascade. At short windows a speech signal's "level" is its syllable envelope, so the gain tracked vowels. The same experiment showed the other half of the problem, which was only addressed later: a 3 s window over speech-with-gaps reads COM systematically quieter than the speech itself. The answer was neither window, but integrating only while voice is detected (above).
 - **The control tick is gone.** The loop used to step once per ~100 ms tick, because querying `ebur128`'s windows was expensive. With the windows O(1), stepping per sub-chunk costs nothing, and a tick only made the gain move in 100 ms jumps.
 
 A short lookahead delay ahead of the gain was also implemented, evaluated on real material and removed. A lookahead costs exactly its own length in latency, and keeping the signal path strictly unbuffered preserves the zero-added-latency property the OB-van deployment depends on (§7).
@@ -187,7 +208,7 @@ Both are deliberately **fixed rather than exposed**. They are properties of spee
 
 Applied in `AutomixProcessor` (that is where COM's measured level lives), so every wrapper inherits it identically, and the **gated** flag is what both the state machine and the GUI indicator see — a lit LED while the guard band was suppressing detection would be a lie. Default −70 LUFS, effectively open: real programme audio sits far above it, so behaviour is unchanged until it is deliberately raised. Useful settings are typically 20–30 dB below the commentator's own momentary level; measured on real commentary (median −26 LUFS), a −40 LUFS gate removes about 10% of detections, which are the quiet tails and spill.
 
-**Two instances, one per side.** The COM detector gates the ratio/automix loop as before. The **IS detector** (`UI.md`'s "voice detector IS") is fed a **mono downmix of the dry Bed** — Silero is a mono model, and "is anyone speaking anywhere on the Bed" is a whole-Bed question, so averaging the channels is the right reduction. It is deliberately fed the *dry* Bed, before automix gain is applied, so IS detection never depends on how hard the mixer happens to be ducking (which would close an unwanted second feedback path). Together the two booleans select the automix state (§5.1), which is what makes the interview-passthrough and over-voice cases possible at all. Each wrapper owns both instances and passes both into `AutomixProcessor::maybe_run_control_step(com_voice_active, is_voice_active)`. COM fails **open** (treated as always voiced if the detector couldn't be constructed, matching pre-VAD behavior); IS fails **closed** (treated as never voiced), which simply leaves the ordinary duck/release states in play rather than inventing an interview/over-voice state.
+**Two instances, one per side.** The COM detector selects the ducking states, and also decides **when the commentator's level is measured**: COM's loudness is integrated only while its (gated) flag is up, so pauses never count as quiet speech (§5.2). The **IS detector** (`UI.md`'s "voice detector IS") is fed a **mono downmix of the dry Bed** — Silero is a mono model, and "is anyone speaking anywhere on the Bed" is a whole-Bed question, so averaging the channels is the right reduction. It is deliberately fed the *dry* Bed, before automix gain is applied, so IS detection never depends on how hard the mixer happens to be ducking (which would close an unwanted second feedback path). Together the two booleans select the automix state (§5.1), which is what makes the interview-passthrough and over-voice cases possible at all. Each wrapper owns both instances and passes both into `AutomixProcessor::maybe_run_control_step(com_voice_active, is_voice_active)`. COM fails **open** (treated as always voiced if the detector couldn't be constructed, matching pre-VAD behavior); IS fails **closed** (treated as never voiced), which simply leaves the ordinary duck/release states in play rather than inventing an interview/over-voice state.
 
 **The IS detector can be switched off** (`is-voice-detect` in the VST3, `COMIS_IS_VOICE_DETECT=0` offline). Off is treated exactly like a detector that never finds voice, the same as its fail-closed case: only the ordinary duck and release states remain. Interview passthrough and over-voice become unreachable, and the detector is no longer fed. It is for programme where the Bed's "voice" is not worth protecting, such as crowd chants or sung music, so the faster recovery and the higher over-voice ducking would be wrong. The GUI marks it the same way as COM's guard band, with a cross through the IS lamp, and greys out the over-voice ratio, which then has nothing to do.
 

@@ -2,7 +2,7 @@ use ebur128::Error as Ebur128Error;
 
 use crate::automix::{
     apply_ramped_gain_per_channel, AutomixEngine, AutomixEngineConfig, KWeightedLoudnessMeter,
-    LoudnessSnapshot, MixState, MAX_BED_CHANNELS,
+    LoudnessSnapshot, MixState, SpeechLoudness, MAX_BED_CHANNELS,
 };
 use crate::loudness::{BedLayout, ConfigError, Ebur128Meter};
 
@@ -46,6 +46,12 @@ pub struct AutomixProcessor {
     /// the two are tested against.
     bed_meter: KWeightedLoudnessMeter,
     dialogue_meter: KWeightedLoudnessMeter,
+    /// How loud the commentator is **while speaking** - the COM side of the ratio. See
+    /// [`SpeechLoudness`] for why the 3s short-term window is the wrong reading here.
+    com_speech: SpeechLoudness,
+    /// COM frames fed since the last `com_speech` update; it takes one reading per 100ms hop.
+    dialogue_frames_since_hop: usize,
+    hop_frames: usize,
     automix_engine: AutomixEngine,
 
     /// The gain actually applied to the most recent sample **of each channel**, so the next
@@ -92,6 +98,9 @@ impl AutomixProcessor {
             sample_rate,
             bed_meter: KWeightedLoudnessMeter::new(bed_map, sample_rate),
             dialogue_meter: KWeightedLoudnessMeter::new(&Ebur128Meter::dialogue_channel_map(), sample_rate),
+            com_speech: SpeechLoudness::for_commentary(),
+            dialogue_frames_since_hop: 0,
+            hop_frames: (sample_rate as f64 * SpeechLoudness::HOP_SECONDS).round().max(1.0) as usize,
             automix_engine: AutomixEngine::new(automix_config),
             current_gain: [1.0; MAX_BED_CHANNELS],
             automix_enabled: true,
@@ -128,6 +137,7 @@ impl AutomixProcessor {
     /// this side - the caller forwards its own buffer untouched.
     pub fn feed_dialogue(&mut self, dry_dialogue: &[f32]) -> Result<(), Ebur128Error> {
         self.dialogue_meter.push_frames(dry_dialogue);
+        self.dialogue_frames_since_hop += dry_dialogue.len();
         Ok(())
     }
 
@@ -151,7 +161,12 @@ impl AutomixProcessor {
 
             let loudness = LoudnessSnapshot {
                 bed_short_term_lufs: self.bed_meter.short_term_loudness_db(),
-                dialogue_short_term_lufs: self.dialogue_meter.short_term_loudness_db(),
+                // The commentator's level while speaking; COM short-term only stands in until the
+                // first utterance has been measured.
+                dialogue_short_term_lufs: self
+                    .com_speech
+                    .level_lufs()
+                    .unwrap_or_else(|| self.dialogue_meter.short_term_loudness_db()),
             };
             self.control_ratio_lu = loudness.dialogue_short_term_lufs - loudness.bed_short_term_lufs;
 
@@ -193,6 +208,14 @@ impl AutomixProcessor {
             com_voice_active && self.dialogue_meter.momentary_loudness_db() >= self.com_gate_lufs;
         self.is_voice_active = is_voice_active;
         self.mix_state = MixState::from_vad(self.com_voice_active, self.is_voice_active);
+
+        // One speech-level reading per 100ms hop of COM fed since the last one, with the voice
+        // flag after the guard band - so crosstalk the gate rejects is never measured as the
+        // commentator either.
+        while self.dialogue_frames_since_hop >= self.hop_frames {
+            self.dialogue_frames_since_hop -= self.hop_frames;
+            self.com_speech.push(self.dialogue_meter.momentary_loudness_db(), self.com_voice_active);
+        }
     }
 
     // ---- metering ----------------------------------------------------------------------------
@@ -212,8 +235,8 @@ impl AutomixProcessor {
         self.com_voice_active
     }
 
-    /// The COM/IS ratio the gain loop is actually achieving: the dry ratio plus whatever
-    /// reduction is currently applied. This is the number to compare against the target, and it is
+    /// The COM/IS ratio the gain loop is actually achieving: the dry ratio (COM's speech level
+    /// against Bed short-term) plus whatever reduction is currently applied. This is the number to compare against the target, and it is
     /// meaningful in a way the old feedback design's equivalent was not - there, the measured ratio
     /// already contained the reduction, so "ratio vs target" and "how much more to do" were the
     /// same quantity observed three seconds late.

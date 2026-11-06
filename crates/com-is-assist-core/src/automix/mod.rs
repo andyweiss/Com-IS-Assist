@@ -6,6 +6,7 @@ mod gain_ramp;
 mod gain_loop;
 mod mix_state;
 mod processor;
+mod speech_loudness;
 
 pub use automix_engine::{
     AutomixEngine, AutomixEngineConfig, AutomixResult, DuckDepth, LoudnessSnapshot, MAX_BED_CHANNELS,
@@ -17,3 +18,4 @@ pub use dialogue_mix::mix_dialogue_into_bed;
 pub use envelope_detector::EnvelopeDetector;
 pub use gain_ramp::apply_ramped_gain_per_channel;
 pub use processor::AutomixProcessor;
+pub use speech_loudness::SpeechLoudness;

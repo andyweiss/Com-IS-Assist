@@ -1,16 +1,15 @@
 use super::envelope_detector::EnvelopeDetector;
 
-/// Default **Attack**: how quickly the reduction moves toward a larger answer, as a one-pole time
-/// constant on the 3s short-term detector.
+/// Default **Attack**: how quickly the reduction moves toward a larger answer.
 ///
-/// Long on purpose. A follower that is quick to grab and slow to let go sits *above* a fluctuating
-/// input - it rides the peaks - so the reduction it applies exceeds what the programme balance
-/// needs, by an amount that depends on how much the Bed fluctuates rather than on how much ducking
-/// is called for. Measured on real broadcast programme needing ~1.9 dB: 150ms applied 4.2 dB, 1s
-/// applied 3.0 dB, 2.5s applied 2.2 dB, with the gain travelling 0.3-0.4 dB/s. With attack close to
-/// release the follower averages instead of peak-holding. See `Specs/TechnicalConcept.md` section
-/// 5.2.
-pub const DEFAULT_ATTACK_SECONDS: f64 = 2.5;
+/// A follower that is quicker to grab than to let go sits *above* a fluctuating input - it rides
+/// the peaks - so the shorter the attack, the more the reduction exceeds what the balance needs.
+/// How much that matters depends on how much the *reference* fluctuates. Against COM's 3s
+/// short-term reading, which swings with every pause in the speech, it took 2.5s to stop
+/// over-ducking. Against COM's speech-gated level (`SpeechLoudness`), which holds still within and
+/// between sentences, 1s lands on the target on average while still moving less than 2.5s did
+/// before. See `Specs/TechnicalConcept.md` section 5.2.
+pub const DEFAULT_ATTACK_SECONDS: f64 = 1.0;
 /// Default **Release**: how quickly the reduction lets go once ducking stops or less is needed.
 pub const DEFAULT_RELEASE_SECONDS: f64 = 3.0;
 
@@ -64,7 +63,7 @@ impl Default for GainLoopConfig {
 /// The gain computer: one feed-forward loop.
 ///
 /// It is fed the reduction the programme balance requires, derived **feed-forward** from the dry
-/// signals on the 3s short-term window (see `Specs/TechnicalConcept.md` section 5.2). Because
+/// signals - the commentator's speech-gated level against the Bed's 3s short-term window (see `Specs/TechnicalConcept.md` section 5.2). Because
 /// reducing the Bed by 1 dB raises the COM/IS ratio by exactly 1 LU, `required = target_ratio −
 /// (COM − BED)` is the complete answer - there is no loop to converge, which is what removes the
 /// windup and pumping the earlier feedback design kept producing. Attack and Release smooth the

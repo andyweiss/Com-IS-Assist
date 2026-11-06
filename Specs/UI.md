@@ -37,9 +37,11 @@ The version is the GitHub release tag for a released build; a build made locally
 # Attack and Release
 How quickly the mixer ducks (Attack) and how quickly it recovers (Release), set separately.
 
-The leveling is one control loop. It follows the balance between commentary and bed as measured over 3 seconds, and holds the bed where the IS voice ratio asks. **Attack** is how quickly it moves when more ducking is needed: 2.5 s by default, 0.1-10 s. **Release** is how quickly it lets go: 3 s by default, 0.4-12 s. The defaults sit in the middle of each control.
+The leveling is one control loop. It compares how loud the commentator is **while speaking** with how loud the bed is over the last 3 seconds, and holds the bed where the IS voice ratio asks. **Attack** is how quickly it moves when more ducking is needed: 1 s by default, 0.1-10 s. **Release** is how quickly it lets go: 3 s by default, 0.4-12 s. The defaults sit in the middle of each control.
 
-The long default attack is deliberate. With a short attack the loop grabs every swell in the bed and is slow to let go, so a mix that only needs a little ducking gets considerably more, and the gain keeps moving. At a few seconds it averages instead: on real broadcast programme needing about 2 dB, a 2.5 s attack applied about 2 dB, where 150 ms applied about 4 dB. The price is that a big, sudden change, such as the commentator starting after a pause, takes a few seconds to be fully ducked. Around 1 s is the setting to try if that is too slow.
+The commentator's level is measured only while voice is detected. It ignores the gaps between words, holds through pauses, and each new sentence starts from the level of the last one, so it barely moves within a sentence. An earlier version used a plain 3-second average, which also counted the pauses. That read the commentator too quiet, so the bed was ducked too far, and it rose and fell within every sentence, so the gain did too.
+
+Don't make Attack much shorter than the default. With a short attack the loop grabs every swell in the bed and is slow to let go, so the bed is ducked more than the balance needs and the gain keeps moving. Longer is calmer, at the cost of a slower response to a big, sudden change, such as the commentator starting after a pause.
 
 The pause tolerance that keeps the bed down through sentence gaps is fixed in real time, so recovery stays cushioned even at a short Release.
 

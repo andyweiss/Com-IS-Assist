@@ -207,8 +207,8 @@ fn main() {
     };
     let variants = [
         ("attack 0.15s / release 3s", times(0.15, 3.0)),
-        ("attack 1s / release 3s", times(1.0, 3.0)),
-        ("attack 2.5s / release 3s (default)", AutomixEngineConfig::default()),
+        ("attack 1s / release 3s (default)", AutomixEngineConfig::default()),
+        ("attack 2.5s / release 3s", times(2.5, 3.0)),
         ("attack 5s / release 3s", times(5.0, 3.0)),
     ];
     for gain_db in com_gains {

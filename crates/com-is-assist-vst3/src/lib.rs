@@ -747,10 +747,10 @@ const GAP_BEFORE_RATIO: f32 = BAR_TO_BAR_GAP - SCALE_SPAN - RATIO_SIDE_SLACK;
 /// After the Ratio column (Ratio -> COM).
 const GAP_AFTER_RATIO: f32 = BAR_TO_BAR_GAP - RATIO_SIDE_SLACK;
 
-/// Range of the Attack control, in ms. Long at the top because the loop reads the 3s short-term
-/// window and a short attack on it rides the peaks of a fluctuating Bed (see
-/// `com_is_assist_core::automix::DEFAULT_ATTACK_SECONDS`); the useful settings are seconds, and
-/// 100ms is kept at the bottom only as the "as quick as it goes" end.
+/// Range of the Attack control, in ms. The useful settings are around a second and longer - a
+/// short attack rides the peaks of a fluctuating Bed and ducks more than the balance needs (see
+/// `com_is_assist_core::automix::DEFAULT_ATTACK_SECONDS`) - so 100ms is kept at the bottom only as
+/// the "as quick as it goes" end.
 const ATTACK_MS_MIN: f32 = 100.0;
 const ATTACK_MS_MAX: f32 = 10_000.0;
 /// Range of the Release control, in seconds.
@@ -1261,7 +1261,7 @@ const PARAMETER_HELP: &[(&str, &str)] = &[
     ("IS voice ratio", "How far the commentary should sit above the bed while the commentator alone is talking. Higher means the bed ducks further."),
     ("Over-voice ratio", "The same, for when there is voice on the bed too - an interview under the commentary needs more headroom to stay intelligible. An absolute target, not an offset."),
     ("Max gain reduction", "A hard floor on how far the bed may ever be pushed down, whatever the ratios ask for."),
-    ("Attack", "How quickly the bed is ducked when it needs to come down. A few seconds keeps the ducking to what the balance actually needs; much shorter follows every swell of the bed and ducks more than needed."),
+    ("Attack", "How quickly the bed is ducked when it needs to come down. Around a second keeps the ducking to what the balance actually needs; much shorter follows every swell of the bed and ducks more than needed, longer is calmer but slower to catch a big change."),
     ("Release", "How quickly the bed recovers once it may come back up. Longer keeps the bed down through pauses in the commentary; shorter brings it back sooner."),
     ("Voice detect gate", "A level below which voice on the commentary channel is ignored, so bed spill in the commentary mic cannot duck the bed against its own bleed. Set it 20-30 dB under the commentator's normal level - the shaded area on the COM meter shows where it is off."),
     ("IS voice detect", "Voice detection on the bed. On, voice on the bed makes the bed recover faster, and commentary over it uses the over-voice ratio. Switch it off for crowd chants or sung music the detector mistakes for voice - the bed lamp then shows a cross and the over-voice ratio greys out."),
@@ -1981,7 +1981,7 @@ mod tests {
         assert_eq!(params.overvoice_ratio.default_plain_value(), 13.0);
         assert_eq!(params.max_gain_reduction_db.default_plain_value(), 24.0);
         assert_eq!(params.com_gate_lufs.default_plain_value(), -32.0);
-        assert_eq!(params.attack_ms.default_plain_value(), 2500.0);
+        assert_eq!(params.attack_ms.default_plain_value(), 1000.0);
         assert_eq!(params.release_s.default_plain_value(), 3.0);
         assert!(params.is_voice_detect.default_plain_value());
         // Centre-only: Dialogue is not spread into L/R unless asked for.

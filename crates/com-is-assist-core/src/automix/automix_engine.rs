@@ -43,7 +43,7 @@ pub struct AutomixEngineConfig {
     /// momentary level.
     pub com_gate_lufs: f64,
     /// **Attack**, in seconds: the time constant with which the reduction moves toward a larger
-    /// answer. Default 2.5s - see [`DEFAULT_ATTACK_SECONDS`] for why it is long.
+    /// answer. Default 1s - see [`DEFAULT_ATTACK_SECONDS`].
     pub attack_seconds: f64,
     /// **Release**, in seconds: the time constant with which the reduction lets go. Default 3s.
     ///
@@ -174,13 +174,18 @@ impl Default for AutomixEngineConfig {
     }
 }
 
-/// The loudness readings one step works from, both measured **feed-forward on the dry signals** on
-/// R128's 3s short-term window - see [`AutomixEngine::step`].
+/// The loudness readings one step works from, both measured **feed-forward on the dry signals** -
+/// see [`AutomixEngine::step`].
 ///
-/// Short-term on *both* sides, deliberately. Reading either side faster was tried, in the
-/// three-stage cascade this replaced: COM read quickly tracks the syllable envelope of speech, and a quickly-read Bed
-/// on a fluctuating programme gets peak-followed, so the mixer reduces more than the balance needs
-/// and keeps moving. One window on both sides measures one quantity - the programme balance.
+/// The Bed is read on R128's 3s short-term window. COM is read as the commentator's level **while
+/// speaking** (`SpeechLoudness`, supplied by `AutomixProcessor`): the 3s window over speech-with-
+/// gaps also averages in the pauses, so it read COM too low - too much reduction - and swung within
+/// every sentence - too much movement. The field keeps its name; it is the COM reference, however
+/// it is measured.
+///
+/// Reading either side *faster* was tried, in the three-stage cascade this replaced: COM read
+/// quickly tracks the syllable envelope of speech, and a quickly-read Bed on a fluctuating
+/// programme gets peak-followed, so the mixer reduces more than the balance needs and keeps moving.
 #[derive(Debug, Clone, Copy)]
 pub struct LoudnessSnapshot {
     pub bed_short_term_lufs: f64,
