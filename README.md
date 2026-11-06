@@ -1,6 +1,6 @@
 # Com-IS-Assist
 
-![UI](https://github.com/andyweiss/Com-IS-Assist/blob/main/docs/PluginUI.png "UI")
+![UI](https://github.com/andyweiss/Com-IS-Assist/blob/main/docs/UI_v2.3.png "UI")
 
 A realtime broadcast mix assist/ automixer that ducks an International Sound "Bed" (2.0, 5.1, 5.1.4 or 7.1.2) against a Dialogue "Com" (mono commentary) channel, based on a measured COM/IS loudness ratio. The concept follows Jonas Engel's bachelor thesis at Hochschule Darmstadt, and the reference implementation it grew out of is included under `Specs/Ressouces/Com-IS Plugin/` (a Reaper JSFX loudness meter, LGPL-licensed, Copyright Cockos Incorporated / Jonas Engel).
 
